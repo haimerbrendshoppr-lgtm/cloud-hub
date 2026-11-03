@@ -86,6 +86,7 @@ import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 from types import SimpleNamespace as _NS
