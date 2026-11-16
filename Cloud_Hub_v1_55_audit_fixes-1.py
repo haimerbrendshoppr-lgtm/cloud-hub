@@ -533,6 +533,24 @@ CREATE TABLE IF NOT EXISTS favorites (
     customer_telegram_id BIGINT NOT NULL, product_id BIGINT NOT NULL REFERENCES products(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(customer_telegram_id, product_id)
 );
+CREATE TABLE IF NOT EXISTS gift_certificates (
+    id BIGSERIAL PRIMARY KEY, code TEXT NOT NULL UNIQUE,
+    face_value NUMERIC(12,2) NOT NULL CHECK(face_value>0),
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','redeemed','cancelled')),
+    issued_by BIGINT, redeemed_by BIGINT REFERENCES customers(id), redeemed_order_id BIGINT UNIQUE REFERENCES orders(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), redeemed_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS referral_codes (
+    customer_id BIGINT PRIMARY KEY REFERENCES customers(id) ON DELETE CASCADE,
+    code TEXT NOT NULL UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS referral_relationships (
+    referred_customer_id BIGINT PRIMARY KEY REFERENCES customers(id) ON DELETE RESTRICT,
+    referrer_customer_id BIGINT NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    reward_order_id BIGINT UNIQUE REFERENCES orders(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), rewarded_at TIMESTAMPTZ,
+    CHECK(referred_customer_id<>referrer_customer_id)
+);
 CREATE TABLE IF NOT EXISTS loyalty_accounts (
     customer_id BIGINT PRIMARY KEY REFERENCES customers(id), available NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK(available>=0),
     pending NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK(pending>=0), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -734,6 +752,7 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_compensation_bonuses NUMERI
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_slot_id BIGINT REFERENCES delivery_slots(id);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS nova_poshta_tracking_status TEXT NOT NULL DEFAULT '';
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS nova_poshta_updated_at TIMESTAMPTZ;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS gift_certificate_code TEXT NOT NULL DEFAULT '';
 
 
 
@@ -1035,6 +1054,7 @@ def list_catalog(category_id: Optional[int] = None, limit: int = 50,
     with db_cursor() as cur:
         cur.execute(
             f"""SELECT p.id product_id,p.category_id,p.brand_id,p.name,p.description,b.name brand,
+                       (SELECT pm.id FROM product_media pm WHERE pm.product_id=p.id ORDER BY pm.sort_order,pm.id LIMIT 1) photo_id,
                        v.id variant_id,v.sku,v.variant_name,v.price,v.stock_qty-v.reserved_qty available
                 FROM products p JOIN product_variants v ON v.product_id=p.id
                 LEFT JOIN brands b ON b.id=p.brand_id {where}
@@ -1382,7 +1402,7 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
                   delivery_quote_id: Optional[int] = None, city: str = "",
                   delivery_branch: str = "", bonus_amount: Decimal = Decimal("0.00"),
                   delivery_slot_id: Optional[int] = None, np_city_ref: str = "",
-                  np_warehouse_ref: str = "") -> dict:
+                  np_warehouse_ref: str = "", gift_certificate_code: str = "") -> dict:
     """Atomic checkout with age/consent gates, stock reservation and snapshots.
 
     Courier quote must already be accepted. Nova Poshta freight is deliberately
@@ -1462,7 +1482,18 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
             bonus_account = cur.fetchone()
             if not bonus_account or Decimal(str(bonus_account["available"])) < bonus_value:
                 raise ValueError("Недостатньо доступних бонусів. Оновіть баланс і спробуйте ще раз.")
-        grand_total = gross_total - bonus_value
+        certificate = None
+        certificate_used = Decimal("0.00")
+        certificate_remainder = Decimal("0.00")
+        certificate_code = str(gift_certificate_code or "").strip().upper()
+        if certificate_code:
+            cur.execute("SELECT id,face_value,state FROM gift_certificates WHERE code=%s FOR UPDATE", (certificate_code,))
+            certificate = cur.fetchone()
+            if not certificate or certificate["state"] != "active":
+                raise ValueError("Сертифікат не знайдено або його вже використано.")
+            certificate_used = min(Decimal(str(certificate["face_value"])), items_total - bonus_value)
+            certificate_remainder = Decimal(str(certificate["face_value"])) - certificate_used
+        grand_total = gross_total - bonus_value - certificate_used
         order_number = "CH-" + datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:8].upper()
         cur.execute("""INSERT INTO orders(order_number,customer_id,customer_name_snapshot,phone_snapshot,
                        telegram_id_snapshot,status,city,delivery_branch,delivery_address,delivery_type,
@@ -1483,6 +1514,27 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
                      (np_city_ref or "").strip()[:80] or None,
                      (np_warehouse_ref or "").strip()[:80] or None))
         order_id = int(cur.fetchone()["id"])
+        if certificate:
+            cur.execute("UPDATE orders SET gift_certificate_code=%s WHERE id=%s", (certificate_code, order_id))
+            cur.execute("""UPDATE gift_certificates SET state='redeemed',redeemed_by=%s,redeemed_order_id=%s,redeemed_at=NOW()
+                           WHERE id=%s AND state='active'""", (customer_id, order_id, certificate["id"]))
+            if cur.rowcount != 1:
+                raise RuntimeError("Сертифікат уже використано в іншому замовленні.")
+            if certificate_remainder > 0:
+                cur.execute("INSERT INTO loyalty_accounts(customer_id) VALUES(%s) ON CONFLICT DO NOTHING", (customer_id,))
+                cert_key = f"certificate:{certificate['id']}:remainder"
+                cur.execute("""INSERT INTO loyalty_transactions(customer_id,order_id,transaction_type,amount,state,reason,actor_telegram_id,idempotency_key)
+                               VALUES(%s,%s,'certificate_remainder',%s,'available','Залишок сертифіката зараховано бонусами',%s,%s)
+                               RETURNING id""", (customer_id, order_id, certificate_remainder, customer_telegram_id, cert_key))
+                cert_tx_id = int(cur.fetchone()["id"])
+                cur.execute("""INSERT INTO loyalty_lots(customer_id,source_transaction_id,original_amount,remaining_amount,state,available_at,expires_at)
+                               VALUES(%s,%s,%s,%s,'available',NOW(),NOW()+INTERVAL '1 year')""",
+                            (customer_id, cert_tx_id, certificate_remainder, certificate_remainder))
+                cur.execute("UPDATE loyalty_accounts SET available=available+%s,updated_at=NOW() WHERE customer_id=%s",
+                            (certificate_remainder, customer_id))
+            cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data,reason)
+                           VALUES(%s,'customer','gift_certificate.redeemed','order',%s,%s::jsonb,'Customer checkout')""",
+                        (customer_telegram_id, str(order_id), json_dumps({"code": certificate_code, "used": certificate_used, "remainder_bonus": certificate_remainder})))
         if delivery_type == "nova_poshta":
             # Queue is committed atomically with the order. The API call happens later,
             # so a Nova Poshta outage can never roll back a valid Cloud Hub order.
@@ -1556,16 +1608,18 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
             enqueue_notification(cur, rid, "orders", order_payload, f"order:{order_id}:created:{rid}")
         return {"id": order_id, "order_number": order_number, "items_total": items_total,
                 "delivery_total": delivery_total, "grand_total": grand_total,
-                "pending_bonus": pending_bonus, "bonus_redeemed": bonus_value, "duplicate": False}
+                "pending_bonus": pending_bonus, "bonus_redeemed": bonus_value,
+                "certificate_redeemed": certificate_used,
+                "certificate_remainder_bonus": certificate_remainder, "duplicate": False}
 
 
 
 def _create_order_pending_bonus_tx(cur, order: dict) -> Decimal:
-    """Create pending 2% bonus at order creation; idempotent by order."""
+    """Create pending 1% bonus at order creation; idempotent by order."""
     customer_id=order.get("customer_id")
     if not customer_id:
         return Decimal("0.00")
-    amount=(Decimal(str(order.get("items_total") or 0))*Decimal("0.02")).quantize(
+    amount=(Decimal(str(order.get("items_total") or 0))*Decimal("0.01")).quantize(
         Decimal("0.01"),rounding=ROUND_HALF_UP)
     if amount<=0:
         return Decimal("0.00")
@@ -1578,7 +1632,7 @@ def _create_order_pending_bonus_tx(cur, order: dict) -> Decimal:
     cur.execute(
         """INSERT INTO loyalty_transactions(customer_id,order_id,transaction_type,amount,state,reason,
            actor_telegram_id,idempotency_key)
-           VALUES(%s,%s,'earn',%s,'pending','2%% від суми товарів у створеному замовленні',NULL,%s)
+            VALUES(%s,%s,'earn',%s,'pending','1%% від суми товарів у створеному замовленні',NULL,%s)
            RETURNING id""",(customer_id,order["id"],amount,key))
     tx_id=int(cur.fetchone()["id"])
     cur.execute("""INSERT INTO loyalty_lots(customer_id,source_transaction_id,original_amount,
@@ -1616,14 +1670,14 @@ def _cancel_pending_order_bonuses_tx(cur, order_id: int, customer_id: Optional[i
 
 
 def _award_order_bonuses_tx(cur, order: dict, actor: Optional[Staff] = None) -> Decimal:
-    """Issue pending 2% bonus inside the caller's payment/order transaction."""
+    """Issue pending 1% bonus inside the caller's payment/order transaction."""
     if order.get("payment_status") != "paid":
         raise ValueError("Бонуси можна нарахувати лише після підтвердження фактичної оплати.")
     customer_id = order.get("customer_id")
     if not customer_id:
         return Decimal("0.00")
     amount = (
-        Decimal(str(order.get("paid_amount") or 0)) * Decimal("0.02")
+        Decimal(str(order.get("paid_amount") or 0)) * Decimal("0.01")
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if amount <= 0:
         return Decimal("0.00")
@@ -1670,7 +1724,7 @@ def _award_order_bonuses_tx(cur, order: dict, actor: Optional[Staff] = None) -> 
                (customer_id,order_id,transaction_type,amount,state,reason,
                 actor_telegram_id,idempotency_key)
                VALUES(%s,%s,'earn',%s,'pending',
-                      '2%% від фактично оплаченої суми після погашення бонусного боргу',
+            '1%% від фактично оплаченої суми після погашення бонусного боргу',
                       %s,%s) RETURNING id""",
             (customer_id, order["id"], net_amount,
              actor.telegram_id if actor else None, key),
@@ -1757,7 +1811,7 @@ def record_cod_payment(order_id: int, paid_amount: Decimal, actor: Staff,
 
 
 def award_order_bonuses(order_id: int, actor: Optional[Staff] = None) -> Decimal:
-    """Idempotently issue pending 2% bonus for an already-paid order."""
+    """Idempotently issue pending 1% bonus for an already-paid order."""
     with db_cursor() as cur:
         cur.execute(
             """SELECT id,customer_id,paid_amount,payment_status
@@ -2510,7 +2564,35 @@ def update_order_status(order_id: int, new_status: str, actor: Staff) -> tuple[b
                 cur.execute("UPDATE loyalty_accounts SET pending=GREATEST(0,pending-%s),available=available+%s,updated_at=NOW() WHERE customer_id=%s",
                             (bonus_total,bonus_total,customer_row['customer_id']))
                 cur.execute("UPDATE loyalty_transactions SET state='available' WHERE order_id=%s AND transaction_type='earn' AND state='pending'", (order_id,))
+            if customer_row:
+                _award_referral_rewards_tx(cur, int(customer_row["customer_id"]), order_id, actor)
     return True, f"Статус змінено: {STATUS_LABELS[old_status]} → {STATUS_LABELS[new_status]}."
+
+
+def _award_referral_rewards_tx(cur, referred_customer_id: int, order_id: int, actor: Optional[Staff] = None) -> None:
+    """Grant the referrer and referred customer 50 bonuses after a delivered order."""
+    cur.execute("""SELECT referrer_customer_id FROM referral_relationships
+                   WHERE referred_customer_id=%s AND reward_order_id IS NULL FOR UPDATE""", (referred_customer_id,))
+    relationship = cur.fetchone()
+    if not relationship:
+        return
+    reward = Decimal("50.00")
+    referrer_id = int(relationship["referrer_customer_id"])
+    for customer_id, label in ((referrer_id, "referrer"), (referred_customer_id, "referred")):
+        cur.execute("INSERT INTO loyalty_accounts(customer_id) VALUES(%s) ON CONFLICT DO NOTHING", (customer_id,))
+        key = f"referral:order:{order_id}:{label}:{customer_id}"
+        cur.execute("""INSERT INTO loyalty_transactions(customer_id,order_id,transaction_type,amount,state,reason,actor_telegram_id,idempotency_key)
+                       VALUES(%s,%s,'referral_reward',%s,'available','Нагорода за запрошення друга після отримання замовлення',%s,%s)
+                       ON CONFLICT(idempotency_key) DO NOTHING RETURNING id""",
+                    (customer_id, order_id, reward, actor.telegram_id if actor else None, key))
+        created = cur.fetchone()
+        if created:
+            cur.execute("""INSERT INTO loyalty_lots(customer_id,source_transaction_id,original_amount,remaining_amount,state,available_at,expires_at)
+                           VALUES(%s,%s,%s,%s,'available',NOW(),NOW()+INTERVAL '1 year')""",
+                        (customer_id, created["id"], reward, reward))
+            cur.execute("UPDATE loyalty_accounts SET available=available+%s,updated_at=NOW() WHERE customer_id=%s", (reward, customer_id))
+    cur.execute("""UPDATE referral_relationships SET reward_order_id=%s,rewarded_at=NOW()
+                   WHERE referred_customer_id=%s AND reward_order_id IS NULL""", (order_id, referred_customer_id))
 
 
 def json_dumps(value: Any) -> str:
@@ -4587,7 +4669,23 @@ def cmd_start(message):
             reply_markup=main_menu(staff),
         )
         return
-    upsert_customer(message.from_user)
+    customer_id = upsert_customer(message.from_user)
+    # Deep-link referrals are attributed once per new customer; self-referrals and
+    # attempts to replace an existing inviter are ignored.
+    try:
+        parts = (message.text or "").strip().split(maxsplit=1)
+        payload = parts[1].strip() if len(parts) > 1 else ""
+        referral_match = re.fullmatch(r"ref_([A-Z0-9]{8,24})", payload, re.IGNORECASE)
+        if referral_match:
+            with db_cursor() as cur:
+                cur.execute("SELECT customer_id FROM referral_codes WHERE code=upper(%s)", (referral_match.group(1),))
+                referral = cur.fetchone()
+                if referral and int(referral["customer_id"]) != int(customer_id):
+                    cur.execute("""INSERT INTO referral_relationships(referred_customer_id,referrer_customer_id)
+                                   VALUES(%s,%s) ON CONFLICT(referred_customer_id) DO NOTHING""",
+                                (customer_id, int(referral["customer_id"])))
+    except Exception:
+        log.exception("Referral attribution failed during /start")
     # Persist first-run delivery in PostgreSQL so repeated /start commands do not
     # resend the channel invitation. Marketing messages remain opt-in only.
     first_launch = False
@@ -5210,7 +5308,7 @@ def reverse_order_bonus_for_return(
     cur, customer_id: int, order_id: int, return_id: int,
     return_value: Decimal, actor_telegram_id: int
 ) -> Decimal:
-    """Reverse 2% of returned item value, consuming unspent bonus first.
+    """Reverse the earned-bonus share for returned item value.
 
     If some earned bonus was already spent, the shortfall becomes a non-negative
     loyalty debt and offsets future earnings. No customer's balance is made negative.
@@ -5226,7 +5324,10 @@ def reverse_order_bonus_for_return(
     order = cur.fetchone()
     if not order or Decimal(str(order["items_total"] or 0)) <= 0:
         return Decimal("0.00")
-    target = (return_value * Decimal("0.02")).quantize(Decimal("0.01"))
+    cur.execute("""SELECT COALESCE(SUM(amount),0) AS earned FROM loyalty_transactions
+                   WHERE order_id=%s AND transaction_type='earn' AND amount>0""", (order_id,))
+    earned = Decimal(str((cur.fetchone() or {}).get("earned") or 0))
+    target = (return_value * earned / Decimal(str(order["items_total"]))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if target <= 0:
         return Decimal("0.00")
     cur.execute("INSERT INTO loyalty_accounts(customer_id) VALUES(%s) ON CONFLICT DO NOTHING", (customer_id,))
@@ -5282,7 +5383,7 @@ def reverse_order_bonus_for_return(
             actor_telegram_id,idempotency_key,reason)
            VALUES(%s,%s,%s,'return_reversal',%s,%s,%s,%s,%s)""",
         (customer_id, order_id, return_id, target, debt_created, actor_telegram_id,
-         key, "Сторнування 2% бонусів за повернені товари"),
+                    key, "Сторнування 1% бонусів за повернені товари"),
     )
     cur.execute(
         """INSERT INTO loyalty_transactions
@@ -10538,6 +10639,7 @@ def fallback(message):
 # ---------------------------------------------------------------------------
 
 miniapp = Flask("cloudhub_miniapp")
+miniapp.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 MINIAPP_HTML = r"""<!doctype html>
 <html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -10547,7 +10649,7 @@ MINIAPP_HTML = r"""<!doctype html>
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(ellipse at 50% -15%,#39205f 0%,#17102a 42%,var(--bg) 78%);color:#fbf8ff;font:15px system-ui,-apple-system,sans-serif;padding:0 0 92px;min-height:100vh}
 header{position:sticky;top:0;background:rgba(17,11,32,.86);backdrop-filter:blur(18px);z-index:3;padding:16px;border-bottom:1px solid rgba(177,137,255,.18)}h1{font-size:23px;letter-spacing:.2px;margin:0 0 3px;background:linear-gradient(100deg,#fff 15%,#c9a8ff 65%,#ef9edb);-webkit-background-clip:text;background-clip:text;color:transparent}small,.muted{color:var(--muted)}main{padding:14px;max-width:760px;margin:auto}
 .chips{display:flex;gap:8px;overflow:auto;padding:12px 0;scrollbar-width:none}.chip,button{border:1px solid var(--line);border-radius:14px;padding:11px 14px;background:linear-gradient(145deg,#281c43,#1b1430);color:#f8f2ff;font:inherit;transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease}.chip:active,button:active{transform:scale(.97)}.chip.active,.primary{background:linear-gradient(110deg,var(--accent2),var(--accent));border-color:#b89aff;color:white;font-weight:750;box-shadow:0 5px 20px var(--glow)}
-.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.card,.panel{background:linear-gradient(150deg,rgba(43,30,68,.96),rgba(26,19,45,.98));border:1px solid rgba(177,137,255,.2);border-radius:19px;padding:12px;min-width:0;margin:10px 0;box-shadow:0 8px 24px rgba(0,0,0,.13)}.card{animation:rise .28s ease both}.card h3{font-size:15px;margin:7px 0}.price{font-weight:850;margin:8px 0;color:#e7d7ff}.card button{width:100%;background:linear-gradient(120deg,#34234f,#29203f);border-color:#574076}.bottom{position:fixed;bottom:0;left:0;right:0;background:rgba(20,14,36,.94);backdrop-filter:blur(18px);border-top:1px solid rgba(177,137,255,.22);padding:10px 14px calc(10px + env(safe-area-inset-bottom));display:flex;gap:8px;z-index:4}.bottom button{flex:1;padding:12px 8px}.search,input,textarea,select{width:100%;background:#19122b;border:1px solid #44315f;border-radius:13px;padding:12px;color:white;font:inherit;margin:5px 0;outline:none}.search:focus,input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--glow)}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.card,.panel{background:linear-gradient(150deg,rgba(43,30,68,.96),rgba(26,19,45,.98));border:1px solid rgba(177,137,255,.2);border-radius:19px;padding:12px;min-width:0;margin:10px 0;box-shadow:0 8px 24px rgba(0,0,0,.13)}.card{animation:rise .28s ease both}.card h3{font-size:15px;margin:7px 0}.product-photo{height:142px;border-radius:13px;background:linear-gradient(145deg,#201631,#302044);display:grid;place-items:center;overflow:hidden;color:var(--muted);font-size:12px}.product-photo img{display:none;width:100%;height:100%;object-fit:contain}.product-photo.loaded img{display:block}.product-photo.loaded span{display:none}.price{font-weight:850;margin:8px 0;color:#e7d7ff}.card button{width:100%;background:linear-gradient(120deg,#34234f,#29203f);border-color:#574076}.bottom{position:fixed;bottom:0;left:0;right:0;background:rgba(20,14,36,.94);backdrop-filter:blur(18px);border-top:1px solid rgba(177,137,255,.22);padding:10px 14px calc(10px + env(safe-area-inset-bottom));display:flex;gap:8px;z-index:4}.bottom button{flex:1;padding:12px 8px}.search,input,textarea,select{width:100%;background:#19122b;border:1px solid #44315f;border-radius:13px;padding:12px;color:white;font:inherit;margin:5px 0;outline:none}.search:focus,input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--glow)}
 .notice{padding:14px;border:1px solid rgba(177,137,255,.24);border-radius:16px;color:#e7def5;margin:10px 0;background:linear-gradient(145deg,rgba(48,32,75,.9),rgba(27,19,46,.95))}.row{display:flex;justify-content:space-between;gap:8px;align-items:center}.hidden{display:none!important}.banner{display:block;border:1px solid rgba(231,189,112,.28);border-radius:15px;overflow:hidden;margin:10px 0;background:linear-gradient(110deg,#30204b,#21172f);color:white;text-decoration:none;box-shadow:0 5px 18px rgba(0,0,0,.14)}.banner img{width:100%;height:104px;object-fit:cover;display:block}.banner div{padding:9px 12px}.banner b{font-size:14px;color:#f1d59d}.banner p{font-size:12px;margin:3px 0;color:#cbbddd}.formgrid{display:grid;gap:8px}.check{display:flex;gap:8px;align-items:flex-start;color:var(--muted);font-size:13px}.check input{width:auto;margin-top:3px;accent-color:var(--accent)}
 .success-wrap{text-align:center;padding:26px 14px 20px;animation:rise .35s ease both}.success-mark{width:82px;height:82px;margin:4px auto 16px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#7549d5,#a36cff);box-shadow:0 0 0 9px rgba(151,92,255,.11),0 0 34px rgba(151,92,255,.3);animation:pop .48s cubic-bezier(.2,1.5,.5,1) both}.success-mark svg{width:43px;height:43px;stroke:#fff;stroke-width:4;fill:none;stroke-linecap:round;stroke-linejoin:round}.success-mark path{stroke-dasharray:40;stroke-dashoffset:40;animation:draw .48s .25s ease forwards}.success-wrap h2{margin:8px 0;color:#f5eaff}.success-wrap .thanks{color:#e6c4ed;font-size:14px}.success-order{font-size:13px;color:var(--gold);letter-spacing:.4px;margin:10px 0}.success-wrap .notice{text-align:left}
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes pop{0%{transform:scale(.55);opacity:0}100%{transform:scale(1);opacity:1}}@keyframes draw{to{stroke-dashoffset:0}}
@@ -10555,20 +10657,25 @@ header{position:sticky;top:0;background:rgba(17,11,32,.86);backdrop-filter:blur(
 </style></head><body>
 <header><h1>Cloud Hub</h1><small>Магазин · каталог · замовлення</small></header><main>
 <div id="banners"></div><input id="search" class="search" placeholder="Пошук товарів…"><div id="categories" class="chips"></div><div id="products" class="grid"></div><div id="catalogBanners"></div>
-<section id="cart" class="hidden"></section><section id="orders" class="hidden"></section><section id="adminBanners" class="hidden panel"></section><div id="status" class="notice hidden"></div>
-</main><nav class="bottom"><button id="shopBtn" class="primary">Каталог</button><button id="cartBtn">Кошик <span id="cartCount">0</span></button><button id="ordersBtn">Замовлення</button></nav>
+<section id="cart" class="hidden"></section><section id="orders" class="hidden"></section><section id="favorites" class="hidden"></section><section id="loyaltyPanel" class="hidden panel"></section><section id="adminBanners" class="hidden panel"></section><section id="ownerPanel" class="hidden panel"></section><section id="staffPanel" class="hidden panel"></section><div id="status" class="notice hidden"></div>
+</main><nav class="bottom"><button id="shopBtn" class="primary">Каталог</button><button id="favoritesBtn">Обране</button><button id="loyaltyBtn">Бонуси</button><button id="cartBtn">Кошик <span id="cartCount">0</span></button><button id="ordersBtn">Замовлення</button></nav>
 <script>
 const tg=window.Telegram?.WebApp;tg?.ready();tg?.expand();
-const headers={'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''};let category=null,products=[],cart=[],canManageBanners=false,banners=[],npCityRef="",npWarehouseRef="",checkoutKey="";
+const headers={'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''};let category=null,products=[],cart=[],favorites=new Set(),canManageBanners=false,canManageOwner=false,canManageCatalog=false,canEditCatalog=false,canViewCustomers=false,canViewOrders=false,canUpdateOrders=false,banners=[],npCityRef="",npWarehouseRef="",checkoutKey="",photoObserver=null;const photoUrls=new Map(),photoRequests=new Map();
 const $=id=>document.getElementById(id);function money(v){return new Intl.NumberFormat('uk-UA',{maximumFractionDigits:2}).format(Number(v||0))+' грн'}
 function msg(t){$('status').textContent=t;$('status').classList.remove('hidden');$('status').animate([{opacity:.65,transform:'translateY(5px)'},{opacity:1,transform:'translateY(0)'}],{duration:220,easing:'ease-out'})}
 async function api(path,opts={}){let r=await fetch(path,{...opts,headers:{...headers,...(opts.headers||{})}});let d=await r.json();if(!r.ok)throw Error(d.error||'Помилка запиту');return d}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function hideSections(){['cart','orders','adminBanners'].forEach(x=>$(x).classList.add('hidden'));$('products').classList.remove('hidden');$('categories').classList.remove('hidden');$('search').classList.remove('hidden')}
+function hideSections(){['cart','orders','favorites','loyaltyPanel','adminBanners','ownerPanel','staffPanel'].forEach(x=>$(x).classList.add('hidden'));$('products').classList.remove('hidden');$('categories').classList.remove('hidden');$('search').classList.remove('hidden')}
 function bannerMarkup(slot){return banners.filter(b=>b.active&&(b.placement||'home_top')===slot).map(b=>`<a class="banner" href="${esc(b.link_url||'#')}" ${b.link_url?'target="_blank" rel="noopener"':''}>${b.image_url?`<img src="${esc(b.image_url)}" alt="${esc(b.title)}">`:''}<div><b>${esc(b.title)}</b><p>${esc(b.body||'')}</p></div></a>`).join('')}
 function renderBanners(){ $('banners').innerHTML=bannerMarkup('home_top');$('catalogBanners').innerHTML=bannerMarkup('catalog_bottom'); }
-function renderProducts(){hideSections();let q=$('search').value.toLowerCase();let arr=products.filter(p=>(!category||p.category_id===category)&&(`${p.name} ${p.brand||''} ${p.sku||''} ${p.variant_name||''}`).toLowerCase().includes(q));$('products').innerHTML=arr.map(p=>`<article class="card"><small>${esc(p.brand||'')}</small><h3>${esc(p.name)} ${esc(p.variant_name||'')}</h3><small>SKU: ${esc(p.sku)} · В наявності: ${p.available}</small><div class="price">${money(p.price)}</div><button onclick="add(${p.variant_id})">Додати в кошик</button></article>`).join('')||'<div class="notice">Нічого не знайдено</div>'}
-async function load(){try{let d=await api('/api/miniapp/bootstrap');products=d.products;canManageBanners=d.can_manage_banners;banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі</button>'+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();await loadCart();if(canManageBanners)renderBannerAdmin()}catch(e){msg(e.message)}}
+function productCards(arr){let html=arr.map(p=>`<article class="card"><div class="product-photo">${p.photo_id?`<img data-photo-id="${p.photo_id}" alt="${esc(p.name)}" loading="lazy">`:'<span>Фото поки немає</span>'}</div><small>${esc(p.brand||'')}</small><h3>${esc(p.name)} ${esc(p.variant_name||'')}</h3><small>SKU: ${esc(p.sku)} · В наявності: ${p.available}</small><div class="price">${money(p.price)}</div><button onclick="toggleFavorite(${p.product_id})">${favorites.has(Number(p.product_id))?'♥ Обране':'♡ В обране'}</button><button onclick="add(${p.variant_id})">Додати в кошик</button></article>`).join('');setTimeout(loadProductPhotos,0);return html}
+function loadProductPhotos(){if(photoObserver)photoObserver.disconnect();if(!('IntersectionObserver'in window))return;photoObserver=new IntersectionObserver(entries=>{for(const entry of entries){if(!entry.isIntersecting)continue;let img=entry.target;photoObserver.unobserve(img);let id=img.dataset.photoId;if(photoUrls.has(id)){img.src=photoUrls.get(id);img.parentElement.classList.add('loaded');continue}let request=photoRequests.get(id);if(!request){request=fetch(`/api/miniapp/products/${encodeURIComponent(id)}/photo`,{headers:{'X-Telegram-Init-Data':tg?.initData||''}}).then(r=>r.ok?r.blob():null).then(blob=>{if(!blob)return null;let url=URL.createObjectURL(blob);photoUrls.set(id,url);return url}).catch(()=>null);photoRequests.set(id,request)}request.then(url=>{if(url&&img.isConnected){img.src=url;img.parentElement.classList.add('loaded')}})}},{rootMargin:'120px'});document.querySelectorAll('img[data-photo-id]').forEach(img=>photoObserver.observe(img))}
+function renderProducts(){hideSections();let q=$('search').value.toLowerCase();let arr=products.filter(p=>(!category||p.category_id===category)&&(`${p.name} ${p.brand||''} ${p.sku||''} ${p.variant_name||''}`).toLowerCase().includes(q));$('products').innerHTML=productCards(arr)||'<div class="notice">Нічого не знайдено</div>'}
+async function load(){try{let d=await api('/api/miniapp/bootstrap');products=d.products;favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі</button>'+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();await loadCart();if(canManageBanners)renderBannerAdmin();if(canManageOwner)renderOwnerEntry();if(canManageCatalog||canViewCustomers||canViewOrders)renderStaffEntry()}catch(e){msg(e.message)}}
+async function toggleFavorite(productId){try{let add=!favorites.has(Number(productId));let d=await api('/api/miniapp/favorites',{method:'POST',body:JSON.stringify({product_id:productId,active:add})});favorites=new Set((d.product_ids||[]).map(Number));if(!$('favorites').classList.contains('hidden'))await loadFavorites();else renderProducts()}catch(e){msg(e.message)}}
+async function loadFavorites(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('favorites').classList.remove('hidden');try{let d=await api('/api/miniapp/favorites');favorites=new Set((d.product_ids||[]).map(Number));$('favorites').innerHTML='<h2>Обране</h2>'+ (d.items.length?productCards(d.items):'<div class="notice">В обраному поки немає товарів</div>')}catch(e){$('favorites').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function loadLoyalty(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('loyaltyPanel').classList.remove('hidden');try{let d=await api('/api/miniapp/profile');let share=d.referral_link?`<a class="banner" href="https://t.me/share/url?url=${encodeURIComponent(d.referral_link)}&text=${encodeURIComponent('Приєднуйся до Cloud Hub за моїм посиланням')}" target="_blank" rel="noopener"><div><b>Запросити друга</b><p>Після першого отриманого замовлення ви обоє отримаєте по 50 бонусів. Код: ${esc(d.referral_code)}</p></div></a>`:`<div class="notice">Код запрошення: ${esc(d.referral_code||'')}. Якщо посилання ще не готове, поділіться кодом із другом.</div>`;$('loyaltyPanel').innerHTML=`<h2>Бонусна карта</h2><div class="grid"><div class="card"><small>Доступно</small><h3>${money(d.bonus_available||0)}</h3></div><div class="card"><small>Нарахуємо після отримання</small><h3>${money(d.bonus_pending||0)}</h3></div></div><div class="notice">Картка: <b>${esc(d.loyalty_card_number||'—')}</b><br>1 бонус = 1 грн. Бонусами можна оплатити до 100% вартості товарів.</div>${share}<button onclick="loadOwnerDashboard()" ${canManageOwner?'':'class="hidden"'}>Панель власника</button>`}catch(e){$('loyaltyPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 function setCat(id,el){category=id;document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));el.classList.add('active');renderProducts()}
 async function add(id){try{await api('/api/miniapp/cart',{method:'POST',body:JSON.stringify({variant_id:id,quantity:1})});await loadCart();msg('Додано до кошика')}catch(e){msg(e.message)}}
 async function loadCart(){try{let d=await api('/api/miniapp/cart');cart=d.items;$('cartCount').textContent=cart.reduce((a,x)=>a+x.quantity,0)}catch(e){}}
@@ -10578,14 +10685,30 @@ async function suggestCities(){clearTimeout(cityTimer);cityTimer=setTimeout(asyn
 async function chooseCity(i){let c=(window._npCities||[])[i];if(!c)return;$('npCity').value=c.name;npCityRef=c.ref;$('cityChoices').innerHTML='';npWarehouseRef='';$('branchChoices').innerHTML='';suggestBranches()}
 async function suggestBranches(){clearTimeout(branchTimer);branchTimer=setTimeout(async()=>{if(!npCityRef)return;try{let d=await api('/api/miniapp/np/branches?city_ref='+encodeURIComponent(npCityRef));$('branchChoices').innerHTML=(d.items||[]).slice(0,80).map((x,i)=>`<button type="button" onclick="chooseBranch(${i})">${esc(x.name)}</button>`).join('');window._npBranches=d.items||[]}catch(e){$('branchChoices').textContent='Довідник недоступний. Введіть відділення вручну.'}},200)}
 function chooseBranch(i){let b=(window._npBranches||[])[i];if(!b)return;$('npBranch').value=b.name;npWarehouseRef=b.ref;$('branchChoices').innerHTML=''}
-async function checkoutForm(){let d=await api('/api/miniapp/profile');checkoutKey=(window.crypto?.randomUUID?crypto.randomUUID():('ch_'+Date.now()+'_'+Math.random().toString(16).slice(2)));$('cart').innerHTML=`<h2>Оформлення замовлення</h2><div class="formgrid"><input id="buyerName" placeholder="Ім’я та прізвище" value="${esc(d.full_name||'')}"><input id="buyerPhone" placeholder="Телефон +380…" value="${esc(d.phone||'')}"><input id="npCity" placeholder="Місто Нової пошти (можна вручну)" autocomplete="off"><div id="cityChoices"></div><input id="npBranch" placeholder="Відділення або поштомат (можна вручну)" autocomplete="off"><div id="branchChoices"></div><small>Можна вибрати місто й відділення з довідника Нової пошти або ввести вручну. Якщо API не працює, замовлення все одно оформлюється.</small><label class="check"><input type="checkbox" id="privacyOk"> Погоджуюся з обробкою даних, необхідних для оформлення та доставки замовлення.</label><button onclick="submitOrder()" class="primary">Підтвердити замовлення</button><button onclick="showCart()">Назад до кошика</button></div>`;$('npCity').addEventListener('input',()=>{npCityRef='';npWarehouseRef='';suggestCities()});$('npBranch').addEventListener('input',()=>{npWarehouseRef='';suggestBranches()})}
-async function submitOrder(){let body={name:$('buyerName').value,phone:$('buyerPhone').value,city:$('npCity').value,branch:$('npBranch').value,city_ref:npCityRef,warehouse_ref:npWarehouseRef,privacy_accepted:$('privacyOk').checked,idempotency_key:checkoutKey};try{let d=await api('/api/miniapp/checkout',{method:'POST',body:JSON.stringify(body)});$('cart').innerHTML=`<div class="success-wrap"><div class="success-mark"><svg viewBox="0 0 48 48"><path d="M10 25l9 9L38 14"/></svg></div><h2>Дякуємо за замовлення!</h2><div class="thanks">Ваше замовлення успішно оформлено</div><div class="success-order">${esc(d.order_number)}</div><div class="notice"><b>До сплати: ${money(d.grand_total)}</b><br>Нова пошта: ${esc(body.city)} / ${esc(body.branch)}<br>ТТН створюється автоматично. Якщо сервіс перевізника тимчасово недоступний, замовлення вже збережене, а ТТН буде оброблена окремо.</div><button class="primary" onclick="loadOrders()">Мої замовлення</button><button onclick="renderProducts()">Повернутися до каталогу</button></div>`;await loadCart()}catch(e){msg(e.message)}}
-async function loadOrders(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small></div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
-function renderBannerAdmin(){ $('adminBanners').innerHTML=`<h3>Керування банерами</h3><p class="muted">Банери відображаються компактно: на головній, у каталозі або в кошику.</p><div id="bannerRows">${banners.map((b,i)=>bannerRow(b,i)).join('')}</div><button onclick="addBannerRow()">Додати банер</button><button class="primary" onclick="saveBanners()">Зберегти банери</button>`;let btn=document.createElement('button');btn.textContent='Банери (адмін)';btn.onclick=()=>{$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('cart').classList.add('hidden');$('orders').classList.add('hidden');$('adminBanners').classList.remove('hidden')};$('banners').after(btn)}
+async function checkoutForm(){let d=await api('/api/miniapp/profile');checkoutKey=(window.crypto?.randomUUID?crypto.randomUUID():('ch_'+Date.now()+'_'+Math.random().toString(16).slice(2)));$('cart').innerHTML=`<h2>Оформлення замовлення</h2><div class="formgrid"><input id="buyerName" placeholder="Ім’я та прізвище" value="${esc(d.full_name||'')}"><input id="buyerPhone" placeholder="Телефон +380…" value="${esc(d.phone||'')}"><div class="notice">Доступно бонусів: <b>${money(d.bonus_available||0)}</b>. Можна покрити ними до 100% вартості товарів.</div><input id="bonusAmount" type="number" min="0" step="0.01" max="${Number(d.bonus_available||0)}" value="0" placeholder="Списати бонусів"><input id="certificateCode" maxlength="40" placeholder="Сертифікат (за наявності)"><input id="npCity" placeholder="Місто Нової пошти (можна вручну)" autocomplete="off"><div id="cityChoices"></div><input id="npBranch" placeholder="Відділення або поштомат (можна вручну)" autocomplete="off"><div id="branchChoices"></div><small>Якщо номінал сертифіката більший за вартість товарів після бонусів, залишок зарахуємо на бонусний рахунок.</small><small>Можна вибрати місто й відділення з довідника Нової пошти або ввести вручну. Якщо API не працює, замовлення все одно оформлюється.</small><label class="check"><input type="checkbox" id="privacyOk"> Погоджуюся з обробкою даних, необхідних для оформлення та доставки замовлення.</label><button onclick="submitOrder()" class="primary">Підтвердити замовлення</button><button onclick="showCart()">Назад до кошика</button></div>`;$('npCity').addEventListener('input',()=>{npCityRef='';npWarehouseRef='';suggestCities()});$('npBranch').addEventListener('input',()=>{npWarehouseRef='';suggestBranches()})}
+async function submitOrder(){let body={name:$('buyerName').value,phone:$('buyerPhone').value,city:$('npCity').value,branch:$('npBranch').value,city_ref:npCityRef,warehouse_ref:npWarehouseRef,bonus_amount:$('bonusAmount').value,certificate_code:$('certificateCode').value,privacy_accepted:$('privacyOk').checked,idempotency_key:checkoutKey};try{let d=await api('/api/miniapp/checkout',{method:'POST',body:JSON.stringify(body)});$('cart').innerHTML=`<div class="success-wrap"><div class="success-mark"><svg viewBox="0 0 48 48"><path d="M10 25l9 9L38 14"/></svg></div><h2>Дякуємо за замовлення!</h2><div class="thanks">Ваше замовлення успішно оформлено</div><div class="success-order">${esc(d.order_number)}</div><div class="notice"><b>До сплати: ${money(d.grand_total)}</b><br>Нова пошта: ${esc(body.city)} / ${esc(body.branch)}${Number(d.certificate_remainder_bonus||0)>0?`<br>Залишок сертифіката зараховано бонусами: ${money(d.certificate_remainder_bonus)}`:''}<br>ТТН створюється автоматично. Якщо сервіс перевізника тимчасово недоступний, замовлення вже збережене, а ТТН буде оброблена окремо.</div><button class="primary" onclick="loadOrders()">Мої замовлення</button><button onclick="renderProducts()">Повернутися до каталогу</button></div>`;await loadCart()}catch(e){msg(e.message)}}
+async function loadOrders(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small>${o.ttn?`<div class="notice">ТТН: <b>${esc(o.ttn)}</b><br>Статус Нової пошти: ${esc(o.tracking_status||'Ще не оновлювався')}<br><small>Оновлено: ${esc(o.tracking_updated_at||'—')}</small><button onclick="refreshTracking('${esc(o.order_number)}')">Оновити статус доставки</button></div>`:''}${o.status_history?.length?`<details><summary>Історія статусів</summary><ul>${o.status_history.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></details>`:''}</div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function refreshTracking(orderNumber){try{let d=await api('/api/miniapp/orders/refresh-tracking',{method:'POST',body:JSON.stringify({order_number:orderNumber})});msg(d.tracking_status||'Статус доставки оновлено');loadOrders()}catch(e){msg(e.message)}}
+function renderBannerAdmin(){ $('adminBanners').innerHTML=`<h3>Керування банерами</h3><p class="muted">Банери відображаються компактно: на головній, у каталозі або в кошику.</p><div id="bannerRows">${banners.map((b,i)=>bannerRow(b,i)).join('')}</div><button onclick="addBannerRow()">Додати банер</button><button class="primary" onclick="saveBanners()">Зберегти банери</button>`;let btn=document.createElement('button');btn.textContent='Банери (адмін)';btn.onclick=()=>{hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('adminBanners').classList.remove('hidden')};$('banners').after(btn)}
+function renderOwnerEntry(){if(document.getElementById('ownerBtn'))return;let btn=document.createElement('button');btn.id='ownerBtn';btn.textContent='Панель власника';btn.onclick=loadOwnerDashboard;$('banners').after(btn)}
+function renderStaffEntry(){if(document.getElementById('staffToolsBtn'))return;let btn=document.createElement('button');btn.id='staffToolsBtn';btn.textContent='Керування магазином';btn.onclick=loadStaffTools;$('banners').after(btn)}
+async function loadStaffTools(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML=`<h2>Керування магазином</h2><div class="formgrid">${canManageCatalog?'<button onclick="loadStaffCatalog()">Товари, ціни й залишки</button>':''}${canViewCustomers?'<button onclick="searchStaffCustomers()">Картки клієнтів</button>':''}${canViewOrders?'<button onclick="loadStaffOrders()">Замовлення</button>':''}</div>${canEditCatalog?'<details class="card"><summary>Створити товар</summary><input id="newProductName" placeholder="Назва товару"><input id="newProductSku" placeholder="Унікальний SKU"><input id="newProductPrice" type="number" min="0" step="0.01" placeholder="Ціна, грн"><input id="newProductStock" type="number" min="0" step="1" placeholder="Початковий залишок"><textarea id="newProductDescription" placeholder="Опис"></textarea><button onclick="createStaffProduct()">Створити товар</button></details>':''}<div id="staffContent"></div>`}
+async function createStaffProduct(){try{let d=await api('/api/miniapp/staff/catalog',{method:'POST',body:JSON.stringify({name:$('newProductName').value,sku:$('newProductSku').value,price:$('newProductPrice').value,stock:$('newProductStock').value,description:$('newProductDescription').value})});msg(`Товар створено (#${d.product_id}). Додайте фото в редагуванні.`);await loadStaffCatalog()}catch(e){msg(e.message)}}
+async function loadStaffCatalog(){try{let q=prompt('Пошук за назвою або SKU')||'';let d=await api('/api/miniapp/staff/catalog?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(p=>`<article class="card" data-product="${p.product_id}" data-variant="${p.variant_id}"><input data-field="name" value="${esc(p.name)}" placeholder="Назва"><textarea data-field="description" placeholder="Опис">${esc(p.description||'')}</textarea><input data-field="sku" value="${esc(p.sku)}" placeholder="SKU"><input data-field="price" type="number" min="0" step="0.01" value="${Number(p.price)}" placeholder="Ціна"><div class="notice">Залишок: ${p.stock_qty} · зарезервовано: ${p.reserved_qty}</div>${canEditCatalog?`<input data-field="reason" placeholder="Причина зміни назви/ціни"><button onclick="saveStaffProduct(this)">Зберегти товар</button><label>Нове фото <input data-field="photo" type="file" accept="image/png,image/jpeg,image/webp"></label><button onclick="uploadStaffPhoto(this)">Замінити фото</button><div class="formgrid"><input data-field="delta" type="number" step="1" placeholder="Зміна залишку (+/-)"><input data-field="stockReason" placeholder="Причина коригування"><button onclick="adjustStaffStock(this)">Змінити залишок</button></div>`:''}<small>${p.active?'Активний':'Неактивний'} · ${p.manually_hidden?'Прихований':''}</small></article>`).join('')||'<div class="notice">Товари не знайдені.</div>'}catch(e){msg(e.message)}}
+async function saveStaffProduct(btn){let c=btn.closest('[data-product]');try{await api(`/api/miniapp/staff/catalog/${c.dataset.product}`,{method:'PUT',body:JSON.stringify({variant_id:c.dataset.variant,name:c.querySelector('[data-field=name]').value,description:c.querySelector('[data-field=description]').value,sku:c.querySelector('[data-field=sku]').value,price:c.querySelector('[data-field=price]').value,reason:c.querySelector('[data-field=reason]').value})});msg('Товар збережено');await loadStaffCatalog()}catch(e){msg(e.message)}}
+async function uploadStaffPhoto(btn){let c=btn.closest('[data-product]'),file=c.querySelector('[data-field=photo]').files[0];if(!file){msg('Оберіть файл фото');return}let form=new FormData();form.append('photo',file);try{let r=await fetch(`/api/miniapp/staff/catalog/${c.dataset.product}/photo`,{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:form}),d=await r.json();if(!r.ok)throw Error(d.error||'Помилка завантаження');msg('Фото додано до товару');await loadStaffCatalog()}catch(e){msg(e.message)}}
+async function adjustStaffStock(btn){let c=btn.closest('[data-product]');try{let d=await api(`/api/miniapp/staff/catalog/variants/${c.dataset.variant}/stock`,{method:'POST',body:JSON.stringify({delta:c.querySelector('[data-field=delta]').value,reason:c.querySelector('[data-field=stockReason]').value})});msg(`Залишок оновлено: ${d.stock_qty}`);await loadStaffCatalog()}catch(e){msg(e.message)}}
+async function searchStaffCustomers(){let q=prompt('Картка клієнта: ім’я, телефон, номер картки або Telegram ID')||'';if(q.trim().length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(c=>`<button class="card" onclick="openStaffCustomer(${c.id})"><b>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</b><br><small>${esc(c.phone||'Немає телефону')} · картка ${esc(c.loyalty_card_number||'—')}</small><br><small>Бонуси ${money(c.bonus_available)} · замовлень ${c.order_count} · на суму ${money(c.lifetime_value)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
+async function openStaffCustomer(id){try{let d=await api(`/api/miniapp/staff/customers/${id}`),c=d.customer;$('staffContent').innerHTML=`<button onclick="searchStaffCustomers()">← До пошуку</button><div class="card"><h3>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</h3><p>Телефон: ${esc(c.phone||'—')}<br>Telegram: ${esc(c.telegram_id||'—')} · @${esc(c.username||'—')}<br>Картка: ${esc(c.loyalty_card_number||'—')}<br>Доступні бонуси: ${money(c.bonus_available)} · Очікують: ${money(c.bonus_pending)}</p><h4>Замовлення</h4>${d.orders.map(o=>`<div class="notice">${esc(o.order_number)} · ${esc(o.status)} · ${money(o.grand_total)} · ${esc(o.created_at||'')}</div>`).join('')||'Немає замовлень'}<h4>Бонусний журнал</h4>${d.loyalty.map(x=>`<div class="notice">${esc(x.transaction_type)} ${money(x.amount)} · ${esc(x.state)} · ${esc(x.reason||'')}</div>`).join('')||'Операцій немає'}</div>`}catch(e){msg(e.message)}}
+async function loadStaffOrders(){try{let q=prompt('Пошук за номером, клієнтом, телефоном або ТТН')||'';let d=await api('/api/miniapp/staff/orders?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(o=>`<article class="card"><b>${esc(o.order_number)}</b> · ${esc(o.status)}<p>${esc(o.customer_name)} · ${esc(o.phone)}<br>${esc(o.city)}, ${esc(o.delivery_branch)}<br>Сума: ${money(o.grand_total)} · сплачено: ${money(o.paid_amount)}<br>ТТН: ${esc(o.ttn||'—')}</p>${canUpdateOrders?`<select data-order-status="${o.id}"><option value="new">Прийнято</option><option value="confirmed">Підтверджено</option><option value="packing">Збирається</option><option value="packed">Зібрано</option><option value="ready_to_ship">Готове до відправлення</option><option value="shipped">Відправлено</option><option value="delivered">Отримано</option><option value="completed">Завершено</option><option value="cancelled">Скасовано</option><option value="problem">Потрібна перевірка</option></select><button onclick="updateStaffOrder(${o.id})">Зберегти статус</button>`:''}</article>`).join('')||'<div class="notice">Замовлень не знайдено.</div>'}catch(e){msg(e.message)}}
+async function updateStaffOrder(id){try{let status=document.querySelector(`[data-order-status="${id}"]`).value;await api(`/api/miniapp/staff/orders/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус замовлення оновлено');await loadStaffOrders()}catch(e){msg(e.message)}}
+async function loadOwnerDashboard(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Панель власника</h2><div class="notice">Завантажую статистику…</div>';try{let d=await api('/api/miniapp/admin/dashboard');$('ownerPanel').innerHTML=`<h2>Статистика магазину</h2><div class="grid"><div class="card"><small>Замовлень сьогодні</small><h3>${d.orders_today}</h3></div><div class="card"><small>Сума замовлень сьогодні</small><h3>${money(d.order_value_today)}</h3></div><div class="card"><small>Оплачено сьогодні</small><h3>${money(d.paid_today)}</h3></div><div class="card"><small>Замовлень за місяць</small><h3>${d.orders_month}</h3></div><div class="card"><small>Сума замовлень за місяць</small><h3>${money(d.order_value_month)}</h3></div><div class="card"><small>Оплачено за місяць</small><h3>${money(d.paid_month)}</h3></div><div class="card"><small>Середнє замовлення</small><h3>${money(d.average_order)}</h3></div><div class="card"><small>Отримано замовлень цього місяця</small><h3>${d.delivered_month}</h3></div><div class="card"><small>Клієнтів</small><h3>${d.customers}</h3></div><div class="card"><small>Очікують обробки</small><h3>${d.pending_orders}</h3></div><div class="card"><small>Бонусне зобов’язання</small><h3>${money(d.bonus_liability)}</h3></div><div class="card"><small>Активні сертифікати</small><h3>${d.active_certificates} · ${money(d.active_certificate_value)}</h3></div><div class="card"><small>Запрошено друзів</small><h3>${d.referrals_rewarded} / ${d.referrals}</h3></div></div><h3>Коригування бонусів</h3><div class="formgrid"><input id="loyaltyLookup" placeholder="Картка, телефон або Telegram ID"><select id="loyaltyOperation"><option value="earn">Нарахувати</option><option value="redeem">Списати</option></select><input id="loyaltyAmount" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума"><input id="loyaltyReason" maxlength="250" placeholder="Обов’язкова причина"><button class="primary" onclick="adjustLoyalty()">Застосувати коригування</button></div><small>Операція записується в бонусний журнал та аудит.</small><h3>Випуск сертифіката</h3><div class="formgrid"><input id="certCode" maxlength="40" placeholder="Код або залиште порожнім для генерації"><input id="certValue" type="number" min="0.01" max="100000" step="0.01" placeholder="Номінал, грн"><button onclick="createCertificate()">Створити сертифікат</button></div>`}catch(e){$('ownerPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function adjustLoyalty(){try{let body={customer_lookup:$('loyaltyLookup').value,operation:$('loyaltyOperation').value,amount:$('loyaltyAmount').value,reason:$('loyaltyReason').value};let d=await api('/api/miniapp/admin/loyalty-adjust',{method:'POST',body:JSON.stringify(body)});msg(`Бонуси оновлено. Баланс: ${money(d.available)}`);loadOwnerDashboard()}catch(e){msg(e.message)}}
+async function createCertificate(){try{let d=await api('/api/miniapp/admin/certificates',{method:'POST',body:JSON.stringify({code:$('certCode').value,face_value:$('certValue').value})});msg(`Сертифікат ${d.code} створено на ${money(d.face_value)}`);loadOwnerDashboard()}catch(e){msg(e.message)}}
 function bannerRow(b={},i=Date.now()){return `<div class="card" data-banner><select data-k="placement"><option value="home_top" ${(!b.placement||b.placement==='home_top')?'selected':''}>Головна: верхній банер</option><option value="catalog_bottom" ${b.placement==='catalog_bottom'?'selected':''}>Каталог: між блоками / внизу</option><option value="cart_top" ${b.placement==='cart_top'?'selected':''}>Кошик: верхній банер</option><option value="bot_welcome" ${b.placement==='bot_welcome'?'selected':''}>Telegram-бот: привітання</option></select><input data-k="title" placeholder="Заголовок" value="${esc(b.title||'')}"><input data-k="body" placeholder="Текст" value="${esc(b.body||'')}"><input data-k="image_url" placeholder="URL зображення (необов’язково)" value="${esc(b.image_url||'')}"><input data-k="link_url" placeholder="Посилання (необов’язково)" value="${esc(b.link_url||'')}"><label class="check"><input data-k="active" type="checkbox" ${b.active?'checked':''}> Активний</label><button onclick="this.parentElement.remove()">Видалити</button></div>`}
 function addBannerRow(){ $('bannerRows').insertAdjacentHTML('beforeend',bannerRow({active:true})) }
 async function saveBanners(){let rows=[...document.querySelectorAll('[data-banner]')].map(el=>{let o={};el.querySelectorAll('[data-k]').forEach(x=>o[x.dataset.k]=x.type==='checkbox'?x.checked:x.value);return o});try{let d=await api('/api/miniapp/admin/banners',{method:'PUT',body:JSON.stringify({banners:rows})});banners=d.banners;renderBanners();msg('Банери збережено')}catch(e){msg(e.message)}}
-$('search').addEventListener('input',renderProducts);$('shopBtn').onclick=()=>renderProducts();$('cartBtn').onclick=showCart;$('ordersBtn').onclick=loadOrders;load();
+$('search').addEventListener('input',renderProducts);$('shopBtn').onclick=()=>renderProducts();$('favoritesBtn').onclick=loadFavorites;$('loyaltyBtn').onclick=loadLoyalty;$('cartBtn').onclick=showCart;$('ordersBtn').onclick=loadOrders;load();
 </script></main></body></html>"""
 
 
@@ -10605,7 +10728,8 @@ def _miniapp_auth_user():
         raise PermissionError("Недійсні дані Telegram-сесії.")
     try:
         auth_date = int(data.get("auth_date", "0"))
-        if abs(time.time() - auth_date) > 86400:
+        # Keep stolen/replayed Telegram initData useful for no more than one hour.
+        if auth_date > time.time() + 60 or time.time() - auth_date > 3600:
             raise PermissionError("Сесія Mini App застаріла. Перезапустіть її з Telegram.")
         user = json.loads(data.get("user", "{}"))
         uid = int(user["id"])
@@ -10641,20 +10765,109 @@ def miniapp_bootstrap():
         upsert_customer(user)
         categories = list_root_categories()
         products = list_catalog(limit=100)
+        with db_cursor() as cur:
+            cur.execute("SELECT product_id FROM favorites WHERE customer_telegram_id=%s ORDER BY created_at DESC", (user.id,))
+            favorite_product_ids = [int(row["product_id"]) for row in cur.fetchall()]
         staff = get_staff(user.id)
         can_manage = bool(staff and staff.active and staff.can("catalog.update"))
-        if can_manage:
+        can_manage_owner = bool(staff and staff.active and staff.role == "owner")
+        if staff and staff.active:
             with db_cursor() as cur:
                 cur.execute("SELECT state FROM staff_security_state WHERE telegram_id=%s", (user.id,))
                 sec = cur.fetchone()
-            can_manage = not sec or sec.get("state") == "active"
+            security_active = not sec or sec.get("state") == "active"
+            can_manage = can_manage and security_active
+            can_manage_owner = can_manage_owner and security_active
+            if not security_active:
+                staff = None
         banners = _miniapp_get_banners(active_only=True)
-        return jsonify({"categories": categories, "products": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in products], "banners": banners, "can_manage_banners": can_manage})
+        return jsonify({"categories": categories, "products": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in products], "favorite_product_ids": favorite_product_ids, "banners": banners, "can_manage_banners": can_manage, "can_manage_owner": can_manage_owner, "can_manage_catalog": bool(staff and staff.active and staff.can("catalog.read")), "can_edit_catalog": bool(staff and staff.active and staff.can("catalog.update")), "can_view_customers": bool(staff and staff.active and staff.can("customers.read")), "can_view_orders": bool(staff and staff.active and staff.can("orders.read")), "can_update_orders": bool(staff and staff.active and staff.can("orders.update"))})
     except PermissionError as exc:
         return jsonify({"error": str(exc)}), 401
     except Exception:
         log.exception("Mini App bootstrap failed")
         return jsonify({"error": "Не вдалося завантажити каталог."}), 500
+
+
+@miniapp.get("/api/miniapp/products/<int:media_id>/photo")
+def miniapp_product_photo(media_id: int):
+    try:
+        _miniapp_auth_user()
+        with db_cursor() as cur:
+            cur.execute("SELECT telegram_file_id,disk_path FROM product_media WHERE id=%s", (media_id,))
+            media = cur.fetchone()
+        if not media:
+            return jsonify({"error": "Фото товару не знайдено."}), 404
+        content = b""
+        source_path = str(media.get("disk_path") or "").strip()
+        if source_path:
+            data_root = os.path.realpath(CONFIG.data_dir)
+            disk_path = os.path.realpath(source_path if os.path.isabs(source_path) else os.path.join(data_root, source_path))
+            if os.path.commonpath((data_root, disk_path)) != data_root or not os.path.isfile(disk_path):
+                return jsonify({"error": "Файл фото недоступний."}), 404
+            with open(disk_path, "rb") as image_file:
+                content = image_file.read(8 * 1024 * 1024 + 1)
+            content_type = {".png":"image/png", ".webp":"image/webp", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(os.path.splitext(disk_path)[1].lower(), "application/octet-stream")
+        elif media.get("telegram_file_id"):
+            file_info = bot.get_file(media["telegram_file_id"])
+            file_url = f"https://api.telegram.org/file/bot{CONFIG.bot_token}/{urllib.parse.quote(file_info.file_path, safe='/')}"
+            with urllib.request.urlopen(file_url, timeout=15) as response:
+                content = response.read(8 * 1024 * 1024 + 1)
+            extension = os.path.splitext(file_info.file_path)[1].lower()
+            content_type = {".png":"image/png", ".webp":"image/webp", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension, "image/jpeg")
+        else:
+            return jsonify({"error": "Для фото не задане джерело."}), 404
+        if not content or len(content) > 8 * 1024 * 1024:
+            return jsonify({"error": "Файл фото порожній або завеликий."}), 413
+        return Response(content, mimetype=content_type, headers={"Cache-Control":"private, max-age=1800", "X-Content-Type-Options":"nosniff"})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except Exception:
+        log.exception("Mini App product photo retrieval failed: media_id=%s", media_id)
+        return jsonify({"error": "Не вдалося завантажити фото товару."}), 502
+
+
+@miniapp.route("/api/miniapp/favorites", methods=["GET", "POST"])
+def miniapp_favorites():
+    try:
+        user = _miniapp_auth_user()
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            product_id = int(body.get("product_id", 0))
+            active = bool(body.get("active"))
+            if product_id <= 0:
+                return jsonify({"error": "Оберіть коректний товар."}), 400
+            with db_cursor() as cur:
+                if active:
+                    cur.execute("SELECT id FROM products WHERE id=%s AND active=TRUE AND manually_hidden=FALSE AND archived_at IS NULL", (product_id,))
+                    if not cur.fetchone():
+                        return jsonify({"error": "Товар більше недоступний."}), 404
+                    cur.execute("INSERT INTO favorites(customer_telegram_id,product_id) VALUES(%s,%s) ON CONFLICT DO NOTHING", (user.id, product_id))
+                else:
+                    cur.execute("DELETE FROM favorites WHERE customer_telegram_id=%s AND product_id=%s", (user.id, product_id))
+        with db_cursor() as cur:
+            cur.execute("SELECT product_id FROM favorites WHERE customer_telegram_id=%s ORDER BY created_at DESC", (user.id,))
+            product_ids = [int(row["product_id"]) for row in cur.fetchall()]
+            if product_ids:
+                cur.execute("""SELECT p.id product_id,p.category_id,p.brand_id,p.name,p.description,b.name brand,
+                                      v.id variant_id,v.sku,v.variant_name,v.price,v.stock_qty-v.reserved_qty available
+                               FROM favorites f JOIN products p ON p.id=f.product_id
+                               JOIN product_variants v ON v.product_id=p.id
+                               LEFT JOIN brands b ON b.id=p.brand_id
+                               WHERE f.customer_telegram_id=%s AND p.active=TRUE AND p.manually_hidden=FALSE
+                                 AND p.archived_at IS NULL AND v.active=TRUE AND v.stock_qty-v.reserved_qty>0
+                               ORDER BY f.created_at DESC,p.name,v.variant_name LIMIT 100""", (user.id,))
+                items = list(cur.fetchall())
+            else:
+                items = []
+        return jsonify({"product_ids": product_ids, "items": [{k: _miniapp_json_value(v) for k, v in row.items()} for row in items]})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App favorites failed")
+        return jsonify({"error": "Не вдалося оновити обране."}), 500
 
 
 @miniapp.route("/api/miniapp/cart", methods=["GET", "POST"])
@@ -10718,13 +10931,41 @@ def _miniapp_require_banner_manager(user):
     return staff
 
 
+_MINIAPP_BOT_USERNAME_CACHE = None
+
+
+def _miniapp_bot_username() -> str:
+    global _MINIAPP_BOT_USERNAME_CACHE
+    if _MINIAPP_BOT_USERNAME_CACHE is None:
+        try:
+            _MINIAPP_BOT_USERNAME_CACHE = str(getattr(bot.get_me(), "username", "") or "")
+        except Exception:
+            log.exception("Unable to read Telegram bot username for referral link")
+            _MINIAPP_BOT_USERNAME_CACHE = ""
+    return _MINIAPP_BOT_USERNAME_CACHE
+
+
 @miniapp.get("/api/miniapp/profile")
 def miniapp_profile():
     try:
         user = _miniapp_auth_user(); cid = upsert_customer(user)
         with db_cursor() as cur:
-            cur.execute("SELECT full_name,phone FROM customers WHERE id=%s", (cid,)); row = cur.fetchone()
-        return jsonify({"full_name": (row or {}).get("full_name") or "", "phone": (row or {}).get("phone") or ""})
+            referral_code = "REF" + uuid.uuid4().hex[:12].upper()
+            cur.execute("INSERT INTO referral_codes(customer_id,code) VALUES(%s,%s) ON CONFLICT(customer_id) DO NOTHING", (cid, referral_code))
+            cur.execute("SELECT code FROM referral_codes WHERE customer_id=%s", (cid,))
+            referral = cur.fetchone()
+            cur.execute("""SELECT c.full_name,c.phone,COALESCE(la.available,0) bonus_available,
+                                  COALESCE(la.pending,0) bonus_pending,c.loyalty_card_number
+                           FROM customers c LEFT JOIN loyalty_accounts la ON la.customer_id=c.id WHERE c.id=%s""", (cid,)); row = cur.fetchone()
+        row = row or {}
+        username = _miniapp_bot_username()
+        referral_code = str((referral or {}).get("code") or "")
+        referral_link = f"https://t.me/{username}?start=ref_{referral_code}" if username and referral_code else ""
+        return jsonify({"full_name": row.get("full_name") or "", "phone": row.get("phone") or "",
+                        "bonus_available": _miniapp_json_value(row.get("bonus_available") or 0),
+                        "bonus_pending": _miniapp_json_value(row.get("bonus_pending") or 0),
+                        "loyalty_card_number": row.get("loyalty_card_number") or "",
+                        "referral_code": referral_code, "referral_link": referral_link})
     except PermissionError as exc: return jsonify({"error": str(exc)}), 401
     except Exception:
         log.exception("Mini App profile failed"); return jsonify({"error":"Не вдалося завантажити профіль."}),500
@@ -10739,6 +10980,14 @@ def miniapp_checkout():
         phone = normalize_phone(str(body.get("phone") or ""))
         city = " ".join(str(body.get("city") or "").split())[:100]
         branch = " ".join(str(body.get("branch") or "").split())[:160]
+        certificate_code = " ".join(str(body.get("certificate_code") or "").split()).upper()[:40]
+        raw_bonus = str(body.get("bonus_amount") or "0").strip().replace(",", ".")
+        try:
+            bonus_amount = Decimal(raw_bonus).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        except Exception:
+            return jsonify({"error": "Вкажіть коректну суму списання бонусів."}), 400
+        if bonus_amount < 0 or bonus_amount > Decimal("100000.00"):
+            return jsonify({"error": "Сума списання бонусів має бути від 0 до 100000."}), 400
         idem = str(body.get("idempotency_key") or "").strip()
         if not name: return jsonify({"error":"Вкажіть ім’я та прізвище отримувача."}),400
         if not 10 <= len(phone) <= 15: return jsonify({"error":"Перевірте номер телефону."}),400
@@ -10756,15 +11005,21 @@ def miniapp_checkout():
         warehouse_ref = str(body.get("warehouse_ref") or "")[:80]
         result = checkout_cart(user.id, customer_id, name, phone, "nova_poshta", idem,
                                city=city, delivery_branch=branch,
-                               np_city_ref=city_ref, np_warehouse_ref=warehouse_ref)
+                               np_city_ref=city_ref, np_warehouse_ref=warehouse_ref,
+                               bonus_amount=bonus_amount, gift_certificate_code=certificate_code)
         if result.get("duplicate"):
             with db_cursor() as cur:
-                cur.execute("SELECT grand_total FROM orders WHERE id=%s", (result["id"],))
+                cur.execute("""SELECT o.grand_total,
+                                  COALESCE((SELECT SUM(amount) FROM loyalty_transactions
+                                            WHERE order_id=o.id AND transaction_type='certificate_remainder'),0) AS certificate_remainder_bonus
+                               FROM orders o WHERE o.id=%s""", (result["id"],))
                 saved = cur.fetchone()
             if saved:
                 result["grand_total"] = saved["grand_total"]
+                result["certificate_remainder_bonus"] = saved["certificate_remainder_bonus"]
         return jsonify({"id": result["id"], "order_number": result["order_number"],
                         "grand_total": _miniapp_json_value(result.get("grand_total", 0)),
+                        "certificate_remainder_bonus": _miniapp_json_value(result.get("certificate_remainder_bonus", 0)),
                         "duplicate": bool(result.get("duplicate"))})
     except PermissionError as exc: return jsonify({"error":str(exc)}),401
     except ValueError as exc: return jsonify({"error":str(exc)}),400
@@ -10777,15 +11032,65 @@ def miniapp_checkout():
 def miniapp_orders():
     try:
         user = _miniapp_auth_user()
+        labels = {"new":"Прийнято", "confirmed":"Підтверджено", "packing":"Збирається", "packed":"Зібрано", "ready_to_ship":"Готове до відправлення", "shipped":"Відправлено", "delivered":"Отримано", "completed":"Завершено", "cancelled":"Скасовано", "returned":"Повернення", "problem":"Потрібна перевірка"}
         with db_cursor() as cur:
-            cur.execute("""SELECT order_number,status,grand_total,city,delivery_branch,created_at
+            cur.execute("""SELECT id,order_number,status,grand_total,city,delivery_branch,created_at,ttn,
+                                  nova_poshta_tracking_status,nova_poshta_updated_at
                            FROM orders WHERE telegram_id_snapshot=%s ORDER BY created_at DESC,id DESC LIMIT 50""", (user.id,))
             rows = list(cur.fetchall())
-        labels = {"new":"Прийнято", "confirmed":"Підтверджено", "processing":"В обробці", "packed":"Збирається", "shipped":"Відправлено", "delivered":"Отримано", "cancelled":"Скасовано", "problem":"Потрібна перевірка"}
-        return jsonify({"items":[{"order_number":r["order_number"],"status":r["status"],"status_label":labels.get(r["status"],r["status"]),"grand_total":_miniapp_json_value(r["grand_total"]),"delivery_summary":("Нова пошта: "+str(r["city"])+", "+str(r["delivery_branch"])),"created_at":_miniapp_json_value(r["created_at"])} for r in rows]})
+            order_ids = [int(r["id"]) for r in rows]
+            history_by_order = {}
+            if order_ids:
+                cur.execute("""SELECT entity_id,before_data,after_data,created_at FROM audit_log
+                               WHERE entity_type='order' AND action='order.status_changed'
+                                 AND entity_id=ANY(%s) ORDER BY created_at""", ([str(x) for x in order_ids],))
+                for event in cur.fetchall():
+                    before = event.get("before_data") or {}
+                    after = event.get("after_data") or {}
+                    label = f"{labels.get(before.get('status'), before.get('status',''))} → {labels.get(after.get('status'), after.get('status',''))} · {event['created_at'].astimezone(ZoneInfo(CONFIG.timezone)).strftime('%d.%m.%Y %H:%M')}"
+                    history_by_order.setdefault(str(event["entity_id"]), []).append(label)
+        return jsonify({"items":[{"order_number":r["order_number"],"status":r["status"],"status_label":labels.get(r["status"],r["status"]),"grand_total":_miniapp_json_value(r["grand_total"]),"delivery_summary":("Нова пошта: "+str(r["city"])+", "+str(r["delivery_branch"])),"created_at":_miniapp_json_value(r["created_at"]),"ttn":r.get("ttn") or "","tracking_status":r.get("nova_poshta_tracking_status") or "","tracking_updated_at":_miniapp_json_value(r.get("nova_poshta_updated_at")),"status_history":history_by_order.get(str(r["id"]),[])} for r in rows]})
     except PermissionError as exc: return jsonify({"error":str(exc)}),401
     except Exception:
         log.exception("Mini App order history failed"); return jsonify({"error":"Не вдалося завантажити замовлення."}),500
+
+
+@miniapp.post("/api/miniapp/orders/refresh-tracking")
+def miniapp_refresh_tracking():
+    try:
+        user = _miniapp_auth_user()
+        body = request.get_json(silent=True) or {}
+        order_number = " ".join(str(body.get("order_number") or "").split())[:80]
+        if not order_number:
+            return jsonify({"error": "Не вказано номер замовлення."}), 400
+        with db_cursor() as cur:
+            cur.execute("SELECT id,ttn,phone_snapshot FROM orders WHERE order_number=%s AND telegram_id_snapshot=%s", (order_number, user.id))
+            order = cur.fetchone()
+        if not order:
+            return jsonify({"error": "Замовлення не знайдено."}), 404
+        ttn = str(order.get("ttn") or "").strip()
+        if not ttn:
+            return jsonify({"error": "Для цього замовлення ТТН ще не створена."}), 409
+        documents = [{"DocumentNumber": ttn, "Phone": normalize_phone(order.get("phone_snapshot") or "")}]
+        result = _np_api("TrackingDocument", "getStatusDocuments", {"Documents": documents}, timeout=15)
+        records = result.get("data") or []
+        if not records or not records[0].get("Status"):
+            return jsonify({"error": "Нова пошта поки не повернула статус для цієї ТТН."}), 502
+        status = " ".join(str(records[0]["Status"]).split())[:300]
+        with db_cursor() as cur:
+            cur.execute("""UPDATE orders SET nova_poshta_tracking_status=%s,nova_poshta_updated_at=NOW(),updated_at=NOW()
+                           WHERE id=%s AND telegram_id_snapshot=%s""", (status, order["id"], user.id))
+            cur.execute("""INSERT INTO audit_log(action,entity_type,entity_id,after_data,reason)
+                           VALUES('nova_poshta.tracking_refreshed','order',%s,%s::jsonb,'Customer requested tracking refresh')""",
+                        (str(order["id"]), json_dumps({"status": status})))
+        return jsonify({"tracking_status": status, "updated_at": datetime.now(timezone.utc).isoformat()})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except NovaPoshtaAPIError as exc:
+        return jsonify({"error": str(exc)}), 502
+    except Exception:
+        log.exception("Mini App tracking refresh failed")
+        return jsonify({"error": "Не вдалося оновити статус Нової пошти. Спробуйте пізніше."}), 502
 
 
 @miniapp.put("/api/miniapp/admin/banners")
@@ -10815,6 +11120,450 @@ def miniapp_save_banners():
     except PermissionError as exc: return jsonify({"error":str(exc)}),403
     except Exception:
         log.exception("Mini App banner save failed"); return jsonify({"error":"Не вдалося зберегти банери."}),500
+
+
+def _miniapp_require_owner(user):
+    staff = get_staff(user.id)
+    if not staff or not staff.active or staff.role != "owner":
+        raise PermissionError("Панель доступна лише власнику магазину.")
+    with db_cursor() as cur:
+        cur.execute("SELECT state FROM staff_security_state WHERE telegram_id=%s", (user.id,))
+        state = cur.fetchone()
+    if state and state.get("state") != "active":
+        raise PermissionError("Доступ власника тимчасово заблокований.")
+    return staff
+
+
+def _miniapp_require_staff(user, permission: str):
+    """Authenticate Mini App staff actions using the same roles and security locks as the bot."""
+    staff = get_staff(user.id)
+    if not staff or not staff.active or not staff.can(permission):
+        raise PermissionError("Недостатньо прав для цієї дії.")
+    with db_cursor() as cur:
+        cur.execute("SELECT state FROM staff_security_state WHERE telegram_id=%s", (user.id,))
+        state = cur.fetchone()
+    if state and state.get("state") != "active":
+        raise PermissionError("Доступ працівника тимчасово призупинений.")
+    return staff
+
+
+@miniapp.get("/api/miniapp/staff/catalog")
+def miniapp_staff_catalog():
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_staff(user, "catalog.read")
+        query = " ".join((request.args.get("q") or "").split())[:100]
+        with db_cursor() as cur:
+            cur.execute("""SELECT p.id product_id,p.name,p.description,p.active,p.manually_hidden,
+                                  v.id variant_id,v.sku,v.variant_name,v.price,v.stock_qty,v.reserved_qty,v.active variant_active,
+                                  (SELECT id FROM product_media pm WHERE pm.product_id=p.id ORDER BY sort_order,id LIMIT 1) media_id
+                           FROM products p JOIN product_variants v ON v.product_id=p.id
+                           WHERE p.archived_at IS NULL AND (%s='' OR p.name ILIKE %s OR v.sku ILIKE %s)
+                           ORDER BY p.name,v.variant_name LIMIT 200""", (query, f"%{query}%", f"%{query}%"))
+            rows = list(cur.fetchall())
+        return jsonify({"items": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in rows],
+                        "can_edit": bool(get_staff(user.id).can("catalog.update"))})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App staff catalog failed")
+        return jsonify({"error": "Не вдалося завантажити товари."}), 500
+
+
+@miniapp.post("/api/miniapp/staff/catalog")
+def miniapp_staff_create_product():
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "catalog.update")
+        body = request.get_json(silent=True) or {}
+        name = " ".join(str(body.get("name") or "").split())[:180]
+        sku = " ".join(str(body.get("sku") or "").split())[:80]
+        price = Decimal(str(body.get("price") or "0").replace(",", ".")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        stock = int(body.get("stock") or 0)
+        description = str(body.get("description") or "").strip()[:4000]
+        category_raw = body.get("category_id")
+        category_id = int(category_raw) if category_raw not in (None, "") else None
+        product_id = create_product(name, sku, price, stock, description, category_id, actor=actor)
+        return jsonify({"ok": True, "product_id": product_id}), 201
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App product creation failed")
+        return jsonify({"error": "Не вдалося створити товар."}), 500
+
+
+@miniapp.put("/api/miniapp/staff/catalog/<int:product_id>")
+def miniapp_staff_update_product(product_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "catalog.update")
+        body = request.get_json(silent=True) or {}
+        name = " ".join(str(body.get("name") or "").split())[:180]
+        description = str(body.get("description") or "").strip()[:4000]
+        variant_id = int(body.get("variant_id") or 0)
+        sku = " ".join(str(body.get("sku") or "").split())[:80]
+        price = Decimal(str(body.get("price") or "0").replace(",", ".")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        reason = " ".join(str(body.get("reason") or "").split())[:250]
+        if not name or not sku or price < 0 or len(reason) < 3:
+            return jsonify({"error": "Вкажіть назву, SKU, коректну ціну та причину зміни."}), 400
+        with db_cursor() as cur:
+            cur.execute("SELECT id,name,description FROM products WHERE id=%s AND archived_at IS NULL FOR UPDATE", (product_id,))
+            old_product = cur.fetchone()
+            if not old_product:
+                return jsonify({"error": "Товар не знайдено."}), 404
+            cur.execute("SELECT id,price,sku FROM product_variants WHERE id=%s AND product_id=%s FOR UPDATE", (variant_id, product_id))
+            variant = cur.fetchone()
+            if not variant:
+                return jsonify({"error": "Варіант товару не знайдено."}), 404
+            cur.execute("SELECT id FROM product_variants WHERE sku=%s AND id<>%s", (sku, variant_id))
+            if cur.fetchone():
+                return jsonify({"error": "Такий SKU вже використовується."}), 409
+            cur.execute("UPDATE products SET name=%s,description=%s,updated_at=NOW() WHERE id=%s", (name, description, product_id))
+            cur.execute("UPDATE product_variants SET sku=%s,price=%s,updated_at=NOW() WHERE id=%s", (sku, price, variant_id))
+            if Decimal(str(variant["price"])) != price:
+                cur.execute("INSERT INTO price_history(variant_id,old_price,new_price,actor_telegram_id,reason) VALUES(%s,%s,%s,%s,%s)",
+                            (variant_id, variant["price"], price, actor.telegram_id, reason))
+            cur.execute("INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,before_data,after_data,reason) VALUES(%s,%s,'catalog.product_updated','product',%s,%s::jsonb,%s::jsonb,%s)",
+                        (actor.telegram_id, actor.role, str(product_id), json_dumps({"name": old_product["name"], "description": old_product["description"], "variant_id": variant_id, "sku": variant["sku"], "price": str(variant["price"])}), json_dumps({"name": name, "description": description, "sku": sku, "price": str(price)}), reason))
+        return jsonify({"ok": True})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App product update failed")
+        return jsonify({"error": "Не вдалося зберегти товар."}), 500
+
+
+@miniapp.post("/api/miniapp/staff/catalog/<int:product_id>/photo")
+def miniapp_staff_replace_product_photo(product_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "catalog.update")
+        uploaded = request.files.get("photo")
+        if not uploaded or not uploaded.filename:
+            return jsonify({"error": "Оберіть файл зображення."}), 400
+        ext = os.path.splitext(uploaded.filename)[1].lower()
+        allowed = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+        if ext not in allowed or uploaded.mimetype not in {allowed[ext], "application/octet-stream"}:
+            return jsonify({"error": "Дозволені JPG, PNG або WEBP."}), 400
+        content = uploaded.stream.read(8 * 1024 * 1024 + 1)
+        if not content or len(content) > 8 * 1024 * 1024:
+            return jsonify({"error": "Фото має бути до 8 МБ."}), 413
+        valid_image = content.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n")) or (content.startswith(b"RIFF") and content[8:12] == b"WEBP")
+        if not valid_image:
+            return jsonify({"error": "Файл не схожий на підтримуване зображення."}), 400
+        media_dir = os.path.realpath(os.path.join(CONFIG.data_dir, "product-media"))
+        os.makedirs(media_dir, exist_ok=True)
+        filename = f"{product_id}-{uuid.uuid4().hex}{ext}"
+        target = os.path.join(media_dir, filename)
+        with open(target, "wb") as photo_file:
+            photo_file.write(content)
+        with db_cursor() as cur:
+            cur.execute("SELECT id FROM products WHERE id=%s AND archived_at IS NULL FOR UPDATE", (product_id,))
+            if not cur.fetchone():
+                os.remove(target)
+                return jsonify({"error": "Товар не знайдено."}), 404
+            cur.execute("UPDATE product_media SET sort_order=sort_order+1 WHERE product_id=%s", (product_id,))
+            cur.execute("INSERT INTO product_media(product_id,disk_path,sort_order) VALUES(%s,%s,0) RETURNING id", (product_id, target))
+            media_id = int(cur.fetchone()["id"])
+            cur.execute("INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data) VALUES(%s,%s,'catalog.photo_replaced','product',%s,%s::jsonb)", (actor.telegram_id, actor.role, str(product_id), json_dumps({"media_id": media_id, "filename": filename})))
+        return jsonify({"ok": True, "media_id": media_id})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App product photo upload failed")
+        return jsonify({"error": "Не вдалося завантажити фото."}), 500
+
+
+@miniapp.get("/api/miniapp/staff/customers")
+def miniapp_staff_customers():
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_staff(user, "customers.read")
+        query = " ".join((request.args.get("q") or "").split())[:100]
+        if len(query) < 2:
+            return jsonify({"items": []})
+        pattern = f"%{query}%"
+        with db_cursor() as cur:
+            cur.execute("""SELECT c.id,c.telegram_id,c.username,c.first_name,c.last_name,c.full_name,c.phone,
+                                  c.loyalty_card_number,c.created_at,COALESCE(la.available,0) bonus_available,
+                                  COALESCE(la.pending,0) bonus_pending,COUNT(o.id) order_count,
+                                  COALESCE(SUM(o.grand_total) FILTER(WHERE o.status<>'cancelled'),0) lifetime_value
+                           FROM customers c LEFT JOIN loyalty_accounts la ON la.customer_id=c.id
+                           LEFT JOIN orders o ON o.customer_id=c.id
+                           WHERE c.full_name ILIKE %s OR c.phone ILIKE %s OR c.loyalty_card_number ILIKE %s OR c.telegram_id::text ILIKE %s
+                           GROUP BY c.id,la.available,la.pending ORDER BY c.updated_at DESC LIMIT 50""", (pattern, pattern, pattern, pattern))
+            rows = list(cur.fetchall())
+        return jsonify({"items": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in rows]})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App customer search failed")
+        return jsonify({"error": "Не вдалося знайти клієнтів."}), 500
+
+
+@miniapp.post("/api/miniapp/staff/catalog/variants/<int:variant_id>/stock")
+def miniapp_staff_adjust_stock(variant_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "inventory.adjust")
+        body = request.get_json(silent=True) or {}
+        delta = int(body.get("delta") or 0)
+        reason = " ".join(str(body.get("reason") or "").split())[:250]
+        if not delta or len(reason) < 3:
+            return jsonify({"error": "Вкажіть ненульову зміну залишку та причину."}), 400
+        new_stock = adjust_inventory(variant_id, delta, actor, reason)
+        return jsonify({"ok": True, "stock_qty": new_stock})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App inventory adjustment failed")
+        return jsonify({"error": "Не вдалося скоригувати залишок."}), 500
+
+
+@miniapp.get("/api/miniapp/staff/customers/<int:customer_id>")
+def miniapp_staff_customer_card(customer_id: int):
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_staff(user, "customers.read")
+        with db_cursor() as cur:
+            cur.execute("""SELECT c.id,c.telegram_id,c.username,c.first_name,c.last_name,c.full_name,c.phone,
+                                  c.loyalty_card_number,c.created_at,c.updated_at,
+                                  COALESCE(la.available,0) bonus_available,COALESCE(la.pending,0) bonus_pending
+                           FROM customers c LEFT JOIN loyalty_accounts la ON la.customer_id=c.id WHERE c.id=%s""", (customer_id,))
+            customer = cur.fetchone()
+            if not customer:
+                return jsonify({"error": "Клієнта не знайдено."}), 404
+            cur.execute("""SELECT order_number,status,grand_total,paid_amount,city,delivery_branch,ttn,created_at
+                           FROM orders WHERE customer_id=%s ORDER BY created_at DESC LIMIT 30""", (customer_id,))
+            orders = list(cur.fetchall())
+            cur.execute("""SELECT transaction_type,amount,state,reason,created_at FROM loyalty_transactions
+                           WHERE customer_id=%s ORDER BY created_at DESC LIMIT 30""", (customer_id,))
+            ledger = list(cur.fetchall())
+        return jsonify({"customer": {k: _miniapp_json_value(v) for k,v in customer.items()},
+                        "orders": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in orders],
+                        "loyalty": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in ledger]})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App customer card failed")
+        return jsonify({"error": "Не вдалося завантажити картку клієнта."}), 500
+
+
+@miniapp.get("/api/miniapp/staff/orders")
+def miniapp_staff_orders():
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_staff(user, "orders.read")
+        query = " ".join((request.args.get("q") or "").split())[:100]
+        pattern = f"%{query}%"
+        with db_cursor() as cur:
+            cur.execute("""SELECT o.id,o.order_number,o.customer_name_snapshot customer_name,o.phone_snapshot phone,
+                                  o.status,o.grand_total,o.paid_amount,o.city,o.delivery_branch,o.ttn,o.created_at,
+                                  o.telegram_id_snapshot
+                           FROM orders o WHERE (%s='' OR o.order_number ILIKE %s OR o.customer_name_snapshot ILIKE %s
+                             OR o.phone_snapshot ILIKE %s OR o.ttn ILIKE %s)
+                           ORDER BY o.created_at DESC LIMIT 100""", (query, pattern, pattern, pattern, pattern))
+            rows = list(cur.fetchall())
+        return jsonify({"items": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in rows]})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App staff orders failed")
+        return jsonify({"error": "Не вдалося завантажити замовлення."}), 500
+
+
+@miniapp.put("/api/miniapp/staff/orders/<int:order_id>/status")
+def miniapp_staff_update_order_status(order_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "orders.update")
+        body = request.get_json(silent=True) or {}
+        status = str(body.get("status") or "").strip().lower()
+        if not status:
+            return jsonify({"error": "Оберіть новий статус."}), 400
+        changed, message = update_order_status(order_id, status, actor)
+        if not changed:
+            return jsonify({"error": message}), 400
+        return jsonify({"ok": changed, "message": message})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App order status update failed")
+        return jsonify({"error": "Не вдалося змінити статус замовлення."}), 500
+
+
+@miniapp.get("/api/miniapp/admin/dashboard")
+def miniapp_owner_dashboard():
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_owner(user)
+        tz = ZoneInfo(CONFIG.timezone)
+        now = datetime.now(tz)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        month_start = day_start.replace(day=1)
+        with db_cursor() as cur:
+            cur.execute("""SELECT
+                COUNT(*) FILTER (WHERE created_at >= %s) AS orders_today,
+                COALESCE(SUM(grand_total) FILTER (WHERE created_at >= %s AND status <> 'cancelled'),0) AS order_value_today,
+                COALESCE(SUM(paid_amount) FILTER (WHERE created_at >= %s),0) AS paid_today,
+                COUNT(*) FILTER (WHERE created_at >= %s) AS orders_month,
+                COALESCE(SUM(grand_total) FILTER (WHERE created_at >= %s AND status <> 'cancelled'),0) AS order_value_month,
+                COALESCE(SUM(paid_amount) FILTER (WHERE created_at >= %s),0) AS paid_month,
+                COUNT(*) FILTER (WHERE status IN ('new','confirmed','packing','packed','ready_to_ship','shipped','problem')) AS pending_orders
+                FROM orders""", (day_start, day_start, day_start, month_start, month_start, month_start))
+            orders = cur.fetchone() or {}
+            cur.execute("SELECT COUNT(*) AS customers FROM customers")
+            customers = int((cur.fetchone() or {}).get("customers", 0))
+            cur.execute("""SELECT COUNT(*) FILTER(WHERE status IN ('delivered','completed')) AS delivered_month
+                           FROM orders WHERE created_at >= %s""", (month_start,))
+            delivered_month = int((cur.fetchone() or {}).get("delivered_month", 0))
+            cur.execute("SELECT COALESCE(SUM(available+pending),0) AS bonus_liability FROM loyalty_accounts")
+            bonus_liability = (cur.fetchone() or {}).get("bonus_liability", 0)
+            cur.execute("SELECT COUNT(*) AS active_count,COALESCE(SUM(face_value),0) AS active_value FROM gift_certificates WHERE state='active'")
+            certs = cur.fetchone() or {}
+            cur.execute("SELECT COUNT(*) AS referrals,COUNT(*) FILTER(WHERE reward_order_id IS NOT NULL) AS rewarded FROM referral_relationships")
+            referrals = cur.fetchone() or {}
+            cur.execute("""SELECT COALESCE(AVG(grand_total),0) AS average_order
+                           FROM orders WHERE created_at >= %s AND status<>'cancelled'""", (month_start,))
+            average_order = (cur.fetchone() or {}).get("average_order", 0)
+        return jsonify({key: _miniapp_json_value(value) for key, value in {
+            **orders, "customers": customers, "delivered_month": delivered_month,
+            "bonus_liability": bonus_liability, "active_certificates": int(certs.get("active_count", 0)),
+            "active_certificate_value": certs.get("active_value", 0),
+            "referrals": int(referrals.get("referrals", 0)),
+            "referrals_rewarded": int(referrals.get("rewarded", 0)),
+            "average_order": average_order,
+        }.items()})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App owner dashboard failed")
+        return jsonify({"error": "Не вдалося завантажити статистику магазину."}), 500
+
+
+@miniapp.post("/api/miniapp/admin/loyalty-adjust")
+def miniapp_owner_loyalty_adjust():
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_owner(user)
+        body = request.get_json(silent=True) or {}
+        lookup = " ".join(str(body.get("customer_lookup") or "").split())[:100]
+        operation = str(body.get("operation") or "").strip().lower()
+        reason = " ".join(str(body.get("reason") or "").split())[:250]
+        amount = Decimal(str(body.get("amount") or "0").replace(",", ".")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if operation not in {"earn", "redeem"}:
+            return jsonify({"error": "Оберіть нарахування або списання."}), 400
+        if amount <= 0 or amount > Decimal("100000.00"):
+            return jsonify({"error": "Сума має бути від 0.01 до 100000.00."}), 400
+        if len(reason) < 3:
+            return jsonify({"error": "Вкажіть причину коригування (щонайменше 3 символи)."}), 400
+        if not lookup:
+            return jsonify({"error": "Вкажіть бонусну картку, телефон або Telegram ID."}), 400
+        with db_cursor() as cur:
+            cur.execute("SELECT id,telegram_id,loyalty_card_number FROM customers WHERE upper(loyalty_card_number)=upper(%s) FOR UPDATE", (lookup,))
+            customer = cur.fetchone()
+            if not customer and lookup.isdigit():
+                cur.execute("SELECT id,telegram_id,loyalty_card_number FROM customers WHERE telegram_id=%s FOR UPDATE", (int(lookup),))
+                customer = cur.fetchone()
+            if not customer:
+                digits = normalize_phone(lookup)
+                if 10 <= len(digits) <= 15:
+                    cur.execute("""SELECT id,telegram_id,loyalty_card_number FROM customers
+                                   WHERE regexp_replace(COALESCE(phone,''),'[^0-9]','','g')=%s FOR UPDATE""", (digits,))
+                    matches = list(cur.fetchall())
+                    if len(matches) > 1:
+                        return jsonify({"error": "За цим телефоном кілька профілів. Знайдіть потрібну картку."}), 409
+                    customer = matches[0] if matches else None
+            if not customer:
+                return jsonify({"error": "Клієнта не знайдено за карткою, телефоном або Telegram ID."}), 404
+            customer_id = int(customer["id"])
+            cur.execute("INSERT INTO loyalty_accounts(customer_id) VALUES(%s) ON CONFLICT DO NOTHING", (customer_id,))
+            cur.execute("SELECT available,pending FROM loyalty_accounts WHERE customer_id=%s FOR UPDATE", (customer_id,))
+            account = cur.fetchone()
+            if operation == "redeem" and Decimal(str(account["available"] or 0)) < amount:
+                return jsonify({"error": "Недостатньо доступних бонусів для списання."}), 400
+            idem = f"miniapp-manual-loyalty:{uuid.uuid4().hex}"
+            if operation == "earn":
+                cur.execute("""INSERT INTO loyalty_transactions(customer_id,transaction_type,amount,state,reason,actor_telegram_id,idempotency_key)
+                               VALUES(%s,'manual_earn',%s,'available',%s,%s,%s) RETURNING id""",
+                            (customer_id, amount, reason, actor.telegram_id, idem))
+                tx_id = int(cur.fetchone()["id"])
+                cur.execute("""INSERT INTO loyalty_lots(customer_id,source_transaction_id,original_amount,remaining_amount,state,expires_at)
+                               VALUES(%s,%s,%s,%s,'available',NOW()+INTERVAL '1 year')""", (customer_id, tx_id, amount, amount))
+                cur.execute("UPDATE loyalty_accounts SET available=available+%s,updated_at=NOW() WHERE customer_id=%s", (amount, customer_id))
+            else:
+                remaining = amount
+                cur.execute("""SELECT id,remaining_amount FROM loyalty_lots WHERE customer_id=%s AND state='available' AND remaining_amount>0
+                               ORDER BY expires_at,id FOR UPDATE""", (customer_id,))
+                for lot in cur.fetchall():
+                    if remaining <= 0: break
+                    use = min(remaining, Decimal(str(lot["remaining_amount"])))
+                    left = Decimal(str(lot["remaining_amount"])) - use
+                    cur.execute("UPDATE loyalty_lots SET remaining_amount=%s,state=%s WHERE id=%s", (left, "spent" if left == 0 else "available", lot["id"]))
+                    remaining -= use
+                if remaining > 0:
+                    raise RuntimeError("Баланс і бонусні партії не збігаються. Списання скасовано.")
+                cur.execute("""INSERT INTO loyalty_transactions(customer_id,transaction_type,amount,state,reason,actor_telegram_id,idempotency_key)
+                               VALUES(%s,'manual_redeem',%s,'completed',%s,%s,%s)""", (customer_id, -amount, reason, actor.telegram_id, idem))
+                cur.execute("UPDATE loyalty_accounts SET available=available-%s,updated_at=NOW() WHERE customer_id=%s", (amount, customer_id))
+            cur.execute("""INSERT INTO loyalty_adjustments(customer_id,adjustment_type,amount,actor_telegram_id,idempotency_key,reason)
+                           VALUES(%s,'manual_correction',%s,%s,%s,%s)""", (customer_id, amount, actor.telegram_id, f"{idem}:adjustment", reason))
+            cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data,reason)
+                           VALUES(%s,%s,%s,'customer',%s,%s::jsonb,%s)""",
+                        (actor.telegram_id, actor.role, f"loyalty.manual_{operation}", str(customer_id),
+                         json_dumps({"card_number": customer.get("loyalty_card_number"), "amount": str(amount)}), reason))
+            cur.execute("SELECT available,pending FROM loyalty_accounts WHERE customer_id=%s", (customer_id,))
+            updated = cur.fetchone()
+        return jsonify({"customer_id": customer_id, "available": _miniapp_json_value(updated["available"]),
+                        "pending": _miniapp_json_value(updated["pending"]), "operation": operation})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App owner loyalty adjustment failed")
+        return jsonify({"error": "Не вдалося виконати коригування бонусів."}), 500
+
+
+@miniapp.post("/api/miniapp/admin/certificates")
+def miniapp_owner_create_certificate():
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_owner(user)
+        body = request.get_json(silent=True) or {}
+        amount = Decimal(str(body.get("face_value") or "0").replace(",", ".")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if amount <= 0 or amount > Decimal("100000.00"):
+            return jsonify({"error": "Номінал має бути від 0.01 до 100000.00 грн."}), 400
+        code = " ".join(str(body.get("code") or "").split()).upper()
+        if not code:
+            code = "CHG-" + uuid.uuid4().hex[:12].upper()
+        if not re.fullmatch(r"[A-Z0-9-]{4,40}", code):
+            return jsonify({"error": "Код має містити 4–40 латинських літер, цифр або дефісів."}), 400
+        with db_cursor() as cur:
+            cur.execute("INSERT INTO gift_certificates(code,face_value,issued_by) VALUES(%s,%s,%s) ON CONFLICT(code) DO NOTHING RETURNING id",
+                        (code, amount, actor.telegram_id))
+            created = cur.fetchone()
+            if not created:
+                return jsonify({"error": "Сертифікат із таким кодом уже існує."}), 409
+            cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data,reason)
+                           VALUES(%s,%s,'gift_certificate.issued','gift_certificate',%s,%s::jsonb,'Owner issued certificate')""",
+                        (actor.telegram_id, actor.role, str(created["id"]), json_dumps({"code": code, "face_value": str(amount)})))
+        return jsonify({"code": code, "face_value": _miniapp_json_value(amount)})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App certificate creation failed")
+        return jsonify({"error": "Не вдалося створити сертифікат."}), 500
 
 
 @miniapp.get("/api/miniapp/np/cities")
@@ -10959,11 +11708,12 @@ def _np_create_ttn_for_order(order_id: int) -> dict:
         if paid_amount != Decimal("0.00"):
             raise NovaPoshtaAPIError("Виявлена часткова оплата, але облік часткових оплат у CRM не підтримується. ТТН не створено.")
         control_amount = grand_total
-    if grand_total <= 0:
+    declared_value = grand_total if grand_total > 0 else Decimal(str(order["items_total"] or 0)).quantize(Decimal("0.01"))
+    if declared_value <= 0:
         raise NovaPoshtaAPIError("Оголошена вартість відправлення має бути більшою за нуль.")
-    if grand_total != grand_total.quantize(Decimal("1")):
+    if declared_value != declared_value.quantize(Decimal("1")):
         raise NovaPoshtaAPIError(
-            "Сума замовлення містить копійки, а параметр API Нової пошти для оголошеної/контрольованої суми очікує цілі гривні. ТТН не створено, щоб не змінити суму."
+            "Сума для декларації Нової пошти містить копійки, а API очікує цілі гривні. ТТН не створено, щоб не змінити суму."
         )
     # Packing profile is selected by total physical units, not distinct SKU count.
     # Boundaries are intentionally non-overlapping: 1–7, 8–19, 20+.
@@ -11012,7 +11762,7 @@ def _np_create_ttn_for_order(order_id: int) -> dict:
         "ServiceType": "WarehouseWarehouse",
         "SeatsAmount": "1",
         "Description": "Ароматичні добавки",
-        "Cost": str(max(1, int(grand_total.quantize(Decimal("1"), rounding=ROUND_HALF_UP)))),
+        "Cost": str(max(1, int(declared_value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)))),
         "CitySender": CONFIG.nova_poshta_sender_city_ref,
         "Sender": CONFIG.nova_poshta_sender_ref,
         "SenderAddress": CONFIG.nova_poshta_sender_address_ref,
