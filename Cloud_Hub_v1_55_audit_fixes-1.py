@@ -600,6 +600,23 @@ CREATE TABLE IF NOT EXISTS loyalty_lots (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_loyalty_lots_fifo ON loyalty_lots(customer_id,state,expires_at,id);
+CREATE TABLE IF NOT EXISTS miniapp_arcade_profiles (
+    customer_telegram_id BIGINT PRIMARY KEY,
+    total_score INTEGER NOT NULL DEFAULT 0 CHECK(total_score>=0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS miniapp_arcade_sessions (
+    id BIGSERIAL PRIMARY KEY,
+    customer_telegram_id BIGINT NOT NULL,
+    score INTEGER NOT NULL DEFAULT 0 CHECK(score>=0),
+    lost BOOLEAN NOT NULL DEFAULT FALSE,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_arcade_one_active_session
+    ON miniapp_arcade_sessions(customer_telegram_id) WHERE completed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_arcade_recent_losses
+    ON miniapp_arcade_sessions(customer_telegram_id,completed_at DESC) WHERE lost=TRUE;
 CREATE TABLE IF NOT EXISTS support_tickets (
     id BIGSERIAL PRIMARY KEY, customer_telegram_id BIGINT NOT NULL, order_id BIGINT REFERENCES orders(id),
     subject TEXT NOT NULL DEFAULT 'Звернення', status TEXT NOT NULL DEFAULT 'new'
@@ -10822,11 +10839,14 @@ header{position:sticky;top:0;background:rgba(17,11,32,.86);backdrop-filter:blur(
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes pop{0%{transform:scale(.55);opacity:0}100%{transform:scale(1);opacity:1}}@keyframes draw{to{stroke-dashoffset:0}}
 @media(min-width:600px){.banner img{height:128px}}
 .brand-row{display:flex;align-items:center;gap:12px}.brand-row h1{margin:0;animation:brandGlow 5s ease-in-out infinite alternate}.cloud-logo{width:54px;height:44px;padding:5px;flex:0 0 54px;border:0;background:transparent;box-shadow:none}.cloud-logo svg{width:100%;height:100%;fill:none;stroke:#e9d8ff;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;filter:drop-shadow(0 0 5px #9b65ff);animation:cloudGlow 4s ease-in-out infinite alternate}header{position:sticky;overflow:visible}#snowfallFx{position:absolute;left:0;right:0;top:76px;height:0;pointer-events:none;z-index:9}.snowflake{position:absolute;top:0;color:#fff;font-size:14px;animation:snowfall 2.4s ease-in forwards}@keyframes snowfall{to{transform:translateY(135px) rotate(270deg);opacity:0}}@keyframes brandGlow{from{text-shadow:0 0 3px #9b65ff}to{text-shadow:0 0 9px #b87cff,0 0 16px #8c5bff}}@keyframes cloudGlow{from{stroke:#e9d8ff;filter:drop-shadow(0 0 3px #7654ed)}to{stroke:#c9a5ff;filter:drop-shadow(0 0 9px #ab63ff)}}.card{animation:rise .22s ease-out both}.product-photo img{width:100%;height:100%;object-fit:contain;transition:transform .25s ease,filter .25s ease}.product-photo img:hover{transform:scale(1.04);filter:drop-shadow(0 5px 10px #0005)}.product-photo.photo-missing:after{content:'Фото тимчасово недоступне';font-size:12px;color:var(--muted);padding:8px}.bottom button.active{animation:pop .2s ease-out}.ops-group{padding:14px;margin:12px 0;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#211735,#171126)}.crm-result{text-align:left;width:100%;animation:rise .18s ease-out}.support-fab{animation:supportPulse 3s ease-in-out infinite}@keyframes supportPulse{50%{box-shadow:0 0 18px #9b65ff99}}body.staff-mode .bottom{display:none}body.staff-mode{padding-bottom:28px}#staffPanel button,#ownerPanel button{min-height:44px}@media(max-width:380px){.cart-row{grid-template-columns:54px minmax(0,1fr);gap:8px}.cart-photo{width:54px;height:54px}.cart-price{grid-column:2}.bottom{padding-left:8px;padding-right:8px;gap:4px}}
-</style><style>.sale-price{color:#ff536b!important}.sale-price del{color:#b8accb;font-size:.8em}.product-photo{width:min(100%,260px);height:min(80vw,260px);aspect-ratio:1/1;background:#100d18;margin-left:auto;margin-right:auto}.product-photo img{object-fit:contain}.cart-row{display:grid;grid-template-columns:56px minmax(0,1fr);gap:10px;align-items:center}.cart-row .cart-photo{width:56px;height:56px;min-width:56px;flex:0 0 56px;margin:0;border-radius:10px}.cart-row .cart-info{min-width:0}.cart-row .cart-price{grid-column:2}.product-dialog{position:fixed;inset:0;z-index:1200;background:#100b20;overflow-y:auto;padding:0}.product-detail{width:100%;min-height:100dvh;border:0;border-radius:0;padding:calc(12px + env(safe-area-inset-top)) 18px calc(18px + env(safe-area-inset-bottom));overflow:visible;animation:rise .22s ease-out}.detail-photo{display:block;width:min(82vw,34vh,460px);height:min(82vw,34vh,460px);aspect-ratio:1/1;max-height:34vh;object-fit:contain;border-radius:18px;background:#100d18;margin:8px auto}.dialog-close{position:sticky;top:8px;float:right;z-index:2;width:44px!important;height:44px;padding:8px!important;border-radius:50%}.product-detail h2{clear:both;font-size:22px;margin:8px 0}.product-detail .price{font-size:22px}.product-detail button{min-height:44px;margin-top:8px}.detail-quantity{display:flex;align-items:center;justify-content:center;gap:18px;margin:10px 0}.detail-quantity button{width:48px!important;height:48px;padding:6px;font-size:22px}</style></head><body>
+</style><style>.sale-price{color:#ff536b!important}.sale-price del{color:#b8accb;font-size:.8em}.product-photo{width:min(100%,260px);height:min(80vw,260px);aspect-ratio:1/1;background:#100d18;margin-left:auto;margin-right:auto}.product-photo img{object-fit:contain}.cart-row{display:grid;grid-template-columns:56px minmax(0,1fr);gap:10px;align-items:center}.cart-row .cart-photo{width:56px;height:56px;min-width:56px;flex:0 0 56px;margin:0;border-radius:10px}.cart-row .cart-info{min-width:0}.cart-row .cart-price{grid-column:2}.product-dialog{position:fixed;inset:0;z-index:1200;background:#100b20;overflow-y:auto;padding:0}.product-detail{width:100%;min-height:100dvh;border:0;border-radius:0;padding:calc(12px + env(safe-area-inset-top)) 18px calc(18px + env(safe-area-inset-bottom));overflow:visible;animation:rise .22s ease-out}.detail-photo{display:block;width:min(82vw,34vh,460px);height:min(82vw,34vh,460px);aspect-ratio:1/1;max-height:34vh;object-fit:contain;border-radius:18px;background:#100d18;margin:8px auto}.dialog-close{position:sticky;top:8px;float:right;z-index:2;width:44px!important;height:44px;padding:8px!important;border-radius:50%}.product-detail h2{clear:both;font-size:22px;margin:8px 0}.product-detail .price{font-size:22px}.product-detail button{min-height:44px;margin-top:8px}.detail-quantity{display:flex;align-items:center;justify-content:center;gap:18px;margin:10px 0}.detail-quantity button{width:48px!important;height:48px;padding:6px;font-size:22px}</style><style>
+.game-fab{position:fixed;left:16px;bottom:calc(82px + env(safe-area-inset-bottom));z-index:5;width:52px;height:52px;padding:0;border-radius:50%;font-size:23px;background:linear-gradient(140deg,#6846cb,#a669ff);box-shadow:0 6px 24px #8856ff70;animation:supportPulse 3s ease-in-out infinite}.game-overlay{display:none;position:fixed;inset:0;z-index:1300;background:radial-gradient(ellipse at top,#30204e,#100b20 72%);padding:calc(12px + env(safe-area-inset-top)) 16px calc(14px + env(safe-area-inset-bottom));flex-direction:column;overflow:hidden}.game-overlay.open{display:flex}.game-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.game-top h2{margin:4px 0;font-size:20px}.game-close{width:42px;height:42px;padding:5px;border-radius:50%}.game-hud{display:flex;justify-content:space-between;gap:8px;margin:12px 0}.game-hud span{border:1px solid var(--line);border-radius:13px;padding:8px 12px;background:#211735;font-weight:700}.game-stage{position:relative;flex:1;min-height:180px;border:1px solid #6844a1;border-radius:22px;overflow:hidden;background:linear-gradient(#151026,#241638);touch-action:none;box-shadow:inset 0 0 32px #9b65ff18}.game-stage canvas{display:block;width:100%;height:100%;touch-action:none}.game-card{margin:auto;width:min(100%,430px);padding:20px;border:1px solid #604389;border-radius:22px;background:#1b1430eF;text-align:center;box-shadow:0 14px 50px #0006}.game-card h3{font-size:23px;margin:2px 0 8px}.game-card p{color:var(--muted);line-height:1.5}.game-start{width:100%;font-weight:800}.game-result{position:absolute;inset:0;display:grid;place-items:center;padding:18px;background:#100b20c9;backdrop-filter:blur(7px)}.game-tip{text-align:center;color:var(--muted);font-size:13px;margin:10px 0 0}.game-overlay .notice{margin:10px 0}
+</style></head><body>
 <header><div class="brand-row"><button id="cloudLogo" class="cloud-logo" aria-label="Cloud Hub" onclick="startSnowfall()"><svg viewBox="0 0 64 44" aria-hidden="true"><path d="M17 37h32a11 11 0 0 0 1-22A18 18 0 0 0 16 19a9 9 0 0 0 1 18Z"/></svg></button><div><h1>Cloud Hub</h1><small>Магазин · каталог · замовлення</small></div></div><button id="webLogout" class="hidden" onclick="webLogout()">Log out</button><div id="snowfallFx"></div></header><main>
 <div id="banners"></div><input id="search" class="search" placeholder="Пошук товарів…"><div id="categories" class="chips"></div><div id="products" class="grid"></div><div id="catalogBanners"></div>
 <section id="cart" class="hidden"></section><section id="orders" class="hidden"></section><section id="favorites" class="hidden"></section><section id="loyaltyPanel" class="hidden panel"></section><section id="supportPanel" class="hidden panel"></section><section id="adminBanners" class="hidden panel"></section><section id="ownerPanel" class="hidden panel"></section><section id="staffPanel" class="hidden panel"></section><div id="status" class="notice hidden"></div>
-</main><button id="supportFab" class="support-fab" aria-label="Чат підтримки" title="Чат підтримки">💬</button><nav class="bottom"><button id="shopBtn" class="primary">Каталог</button><button id="favoritesBtn">Обране</button><button id="loyaltyBtn">Бонуси</button><button id="cartBtn">Кошик <span id="cartCount">0</span></button><button id="ordersBtn">Замовлення</button></nav>
+</main><button id="gameFab" class="game-fab" aria-label="Mini game Cloud Hub" title="Let us play?">&#127918;</button><button id="supportFab" class="support-fab" aria-label="Чат підтримки" title="Чат підтримки">💬</button><nav class="bottom"><button id="shopBtn" class="primary">Каталог</button><button id="favoritesBtn">Обране</button><button id="loyaltyBtn">Бонуси</button><button id="cartBtn">Кошик <span id="cartCount">0</span></button><button id="ordersBtn">Замовлення</button></nav>
+<div id="gameOverlay" class="game-overlay" aria-hidden="true"><div class="game-top"><div><h2>&#9729;&#65039; &#x0425;&#x043C;&#x0430;&#x0440;&#x043E;&#x043B;&#x043E;&#x0432;</h2><small>&#x041B;&#x043E;&#x0432;&#x0438;&#x0020;&#x0441;&#x044F;&#x0439;&#x0432;&#x043E;&#x002C;&#x0020;&#x0443;&#x043D;&#x0438;&#x043A;&#x0430;&#x0439;&#x0020;&#x043F;&#x0435;&#x0440;&#x0435;&#x0448;&#x043A;&#x043E;&#x0434;</small></div><button id="gameClose" class="game-close" aria-label="&#x0417;&#x0430;&#x043A;&#x0440;&#x0438;&#x0442;&#x0438;&#x0020;&#x0433;&#x0440;&#x0443;">&#10005;</button></div><div class="game-hud"><span>&#10024; <b id="gameScore">0</b></span><span>&#10084;&#65039; <b id="gameLives">3</b></span><span>&#9201; <b id="gameTime">45</b></span></div><div id="gameStage" class="game-stage"><canvas id="gameCanvas"></canvas><div id="gameResult" class="game-result"><div class="game-card"><h3 id="gameTitle">&#x0425;&#x043C;&#x0430;&#x0440;&#x043E;&#x043B;&#x043E;&#x0432;</h3><p id="gameMessage">&#x041B;&#x043E;&#x0432;&#x0438;&#x0020;&#x0441;&#x0432;&#x0456;&#x0442;&#x043B;&#x0456;&#x0020;&#x0445;&#x043C;&#x0430;&#x0440;&#x0438;&#x043D;&#x043A;&#x0438;&#x0020;&#x043F;&#x0430;&#x043B;&#x044C;&#x0446;&#x0435;&#x043C;&#x0020;&#x0430;&#x0431;&#x043E;&#x0020;&#x043C;&#x0438;&#x0448;&#x043A;&#x043E;&#x044E;&#x002E;&#x0020;&#x0427;&#x0435;&#x0440;&#x0432;&#x043E;&#x043D;&#x0456;&#x0020;&#x0456;&#x0441;&#x043A;&#x0440;&#x0438;&#x0020;&#x0437;&#x0430;&#x0431;&#x0438;&#x0440;&#x0430;&#x044E;&#x0442;&#x044C;&#x0020;&#x0436;&#x0438;&#x0442;&#x0442;&#x044F;&#x002E;&#x0020;&#x041E;&#x0447;&#x043A;&#x0438;&#x0020;&#x0442;&#x0430;&#x0020;&#x0440;&#x0435;&#x043A;&#x043E;&#x0440;&#x0434;&#x0020;&#x2014;&#x0020;&#x043B;&#x0438;&#x0448;&#x0435;&#x0020;&#x0434;&#x043B;&#x044F;&#x0020;&#x0440;&#x043E;&#x0437;&#x0432;&#x0430;&#x0433;&#x0438;&#x002C;&#x0020;&#x0431;&#x0435;&#x0437;&#x0020;&#x043E;&#x0431;&#x043C;&#x0456;&#x043D;&#x0443;&#x0020;&#x043D;&#x0430;&#x0020;&#x0433;&#x0440;&#x043E;&#x0448;&#x0456;&#x0020;&#x0447;&#x0438;&#x0020;&#x0442;&#x043E;&#x0432;&#x0430;&#x0440;&#x0438;&#x002E;</p><div id="gameProfile" class="notice">&#x0417;&#x0430;&#x0432;&#x0430;&#x043D;&#x0442;&#x0430;&#x0436;&#x0443;&#x044E;&#x0020;&#x0442;&#x0432;&#x0456;&#x0439;&#x0020;&#x0440;&#x0430;&#x0445;&#x0443;&#x043D;&#x043E;&#x043A;&#x2026;</div><button id="gameStart" class="primary game-start">&#x041F;&#x043E;&#x0447;&#x0430;&#x0442;&#x0438;&#x0020;&#x0433;&#x0440;&#x0443;</button></div></div></div><p class="game-tip">&#x0420;&#x0443;&#x0445;&#x0430;&#x0439;&#x0020;&#x043A;&#x043E;&#x0448;&#x0438;&#x043A;&#x0020;&#x0443;&#x043D;&#x0438;&#x0437;&#x0443;&#x0020;&#x0435;&#x043A;&#x0440;&#x0430;&#x043D;&#x0430;&#x0020;&#x00B7;&#x0020;&#x0442;&#x0440;&#x0438;&#x0020;&#x0437;&#x0456;&#x0442;&#x043A;&#x043D;&#x0435;&#x043D;&#x043D;&#x044F;&#x0020;&#x2014;&#x0020;&#x043F;&#x0440;&#x043E;&#x0433;&#x0440;&#x0430;&#x0448;</p></div>
 <script>
 const tg=window.Telegram?.WebApp;tg?.ready();tg?.expand();
 const headers={'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''};const inTelegram=Boolean(tg?.initData);let authenticated=inTelegram,webSession=false;const GUEST_CART_KEY='cloudhub.guest-cart.v1';let guestCart=[];try{guestCart=JSON.parse(localStorage.getItem(GUEST_CART_KEY)||'[]');if(!Array.isArray(guestCart))guestCart=[]}catch(e){guestCart=[]}let category=null,products=[],popularProductIds=new Set(),cart=[],favorites=new Set(),canManageBanners=false,canManageOwner=false,canManageCatalog=false,canEditCatalog=false,canViewCustomers=false,canViewOrders=false,canUpdateOrders=false,canViewSupport=false,canReplySupport=false,canManageInventory=false,canConfirmInventory=false,banners=[],npCityRef="",npWarehouseRef="",checkoutKey="",photoObserver=null;const photoUrls=new Map(),photoRequests=new Map();
@@ -10958,7 +10978,15 @@ async function loadInventory(){hideSections();$('products').classList.add('hidde
 async function startInventory(){try{let d=await api('/api/miniapp/staff/inventory',{method:'POST',body:'{}'});await renderInventoryCount(d.count_id)}catch(e){msg(e.message)}}
 function loadStaffTools(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML=`<h2>Робоча панель</h2><section class="ops-group"><h3>Клієнти та замовлення</h3><div class="formgrid">${canViewCustomers?'<button onclick="searchStaffCustomers()">🔎 CRM · пошук клієнта</button>':''}${canViewOrders?'<button onclick="loadStaffOrders()">📦 Замовлення</button>':''}</div></section><section class="ops-group"><h3>Магазин і склад</h3><div class="formgrid">${canManageCatalog?'<button onclick="loadStaffCatalog()">🛍️ Товари й ціни</button>':''}${canManageInventory?'<button onclick="loadInventory()">📋 Інвентаризації</button>':''}</div></section><section class="ops-group"><h3>Зв’язок</h3><div class="formgrid">${canViewSupport?'<button onclick="loadStaffSupport()">💬 Чат підтримки</button>':''}</div></section><div id="staffContent"></div>`}
 async function loadCustomerSupport(archived=false){let panel=$('supportPanel');panel.innerHTML=`<h2>Чат підтримки</h2><div class="formgrid"><button onclick="loadCustomerSupport(false)">Активні</button><button onclick="loadCustomerSupport(true)">Архів</button></div><div class="notice">Тут лише ваші звернення до підтримки — товари й історія замовлень окремо.</div>`;try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));panel.innerHTML+=((d.items||[]).map(t=>`<article class="card"><b>Звернення #${t.id}</b> · ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Підтримка':'Ви'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${!archived&&t.status!=='closed'?`<textarea id="reply-${t.id}" maxlength="4000" placeholder="Напишіть відповідь"></textarea><button onclick="sendSupportMessage(${t.id})">Надіслати</button>`:''}</article>`).join('')||`<div class="notice">${archived?'Архів порожній':'Активних звернень немає'}</div>`)+(archived?'':'<div class="card"><h3>Нове звернення</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="Опишіть, чим допомогти"></textarea><button class="primary" onclick="sendSupportMessage(0)">Надіслати підтримці</button></div>')}catch(e){panel.innerHTML+='<div class="notice">'+esc(e.message)+'</div>'}}
-$('search').addEventListener('input',renderProducts);$('supportFab').onclick=openSupport;$('shopBtn').onclick=()=>renderProducts();$('favoritesBtn').onclick=loadFavorites;$('loyaltyBtn').onclick=loadLoyalty;$('cartBtn').onclick=showCart;$('ordersBtn').onclick=loadOrders;load();
+let arcadeSession=null,arcadeRun=null,arcadeRaf=0;
+async function openArcade(){const o=$('gameOverlay');o.classList.add('open');o.setAttribute('aria-hidden','false');document.body.style.overflow='hidden';$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid';$('gameTitle').textContent='Хмаролов';$('gameMessage').textContent='Лови світлі хмаринки пальцем або мишкою. Червоні іскри забирають життя. Очки та рекорд — лише для розваги, без обміну на гроші чи товари.';$('gameStart').disabled=true;$('gameProfile').textContent='Завантажую твій рахунок…';try{const d=await api('/api/miniapp/arcade/status');$('gameProfile').textContent=`Твій рахунок: ${d.total_score} очок · Спроб до ліміту: ${d.losses_left}/3 за 24 год.`;if(!d.losses_left){$('gameMessage').textContent=`Спроби на сьогодні закінчилися. Нові з’являться після ${new Date(d.reset_at).toLocaleTimeString('uk-UA',{hour:'2-digit',minute:'2-digit'})}. Рахунок збережено.`;$('gameStart').textContent='Спроби закінчилися';$('gameStart').disabled=true}else{$('gameStart').textContent='Почати гру';$('gameStart').disabled=false}}catch(e){$('gameProfile').textContent=e.message;$('gameMessage').textContent='Щоб рахунок і ліміт спроб зберігались, відкрий Cloud Hub у Telegram та запусти гру ще раз.';$('gameStart').textContent='Потрібен вхід через Telegram';$('gameStart').disabled=true}}
+function closeArcade(){if(arcadeRun)finishArcade(true);const o=$('gameOverlay');o.classList.remove('open');o.setAttribute('aria-hidden','true');document.body.style.overflow=''}
+function sizeArcadeCanvas(){const c=$('gameCanvas'),r=$('gameStage').getBoundingClientRect(),d=Math.min(devicePixelRatio||1,2);c.width=Math.max(1,Math.floor(r.width*d));c.height=Math.max(1,Math.floor(r.height*d));c.getContext('2d').setTransform(d,0,0,d,0,0)}
+async function startArcade(){if($('gameStart').disabled)return;$('gameStart').disabled=true;try{const d=await api('/api/miniapp/arcade/start',{method:'POST',body:'{}'});arcadeSession=d.session_id;arcadeRun={score:0,lives:3,time:45,last:0,spawn:0,items:[],playerX:0,done:false};$('gameResult').classList.add('hidden');$('gameResult').style.display='none';$('gameScore').textContent='0';$('gameLives').textContent='3';$('gameTime').textContent='45';sizeArcadeCanvas();arcadeRun.playerX=$('gameStage').getBoundingClientRect().width/2;arcadeRaf=requestAnimationFrame(drawArcade)}catch(e){msg(e.message);await openArcade()}}
+function finishArcade(lost){if(!arcadeRun||arcadeRun.done)return;arcadeRun.done=true;cancelAnimationFrame(arcadeRaf);const score=arcadeRun.score,session=arcadeSession;arcadeRun=null;api('/api/miniapp/arcade/finish',{method:'POST',body:JSON.stringify({session_id:session,score,lost})}).then(d=>{arcadeSession=null;$('gameTitle').textContent=lost?'Ще одна спроба — і реванш!':'Чудова гра!';$('gameMessage').textContent=`За цю гру: ${score} очок. Загальний рахунок: ${d.total_score}. ${lost?'Програшів за 24 години: '+(3-d.losses_left)+'/3.':'Цього раунду ти не програв — можна зіграти ще.'}`;$('gameProfile').textContent=`До ліміту програшів залишилося ${d.losses_left} з 3 за 24 год.`;$('gameStart').textContent=d.losses_left?'Зіграти ще':'Спроби закінчилися';$('gameStart').disabled=!d.losses_left;$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid'}).catch(e=>{arcadeSession=session;$('gameTitle').textContent='Результат не зберігся';$('gameMessage').textContent=e.message;$('gameStart').textContent='Спробувати зберегти';$('gameStart').disabled=false;$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid'})}
+function drawArcade(now){if(!arcadeRun)return;const g=arcadeRun,c=$('gameCanvas'),ctx=c.getContext('2d'),w=c.clientWidth,h=c.clientHeight;if(!g.last)g.last=now;const dt=Math.min(.05,(now-g.last)/1000);g.last=now;g.time-=dt;g.spawn-=dt;if(g.spawn<=0){g.items.push({x:18+Math.random()*Math.max(1,w-36),y:-18,r:10+Math.random()*5,v:115+Math.random()*95,bad:Math.random()<.24,spin:Math.random()*6});g.spawn=.48+Math.random()*.45}g.items.forEach(a=>{a.y+=a.v*dt;a.spin+=dt*3});const px=g.playerX,py=h-37;for(let i=g.items.length-1;i>=0;i--){const a=g.items[i];if(a.y+a.r>=py-13&&a.y-a.r<=py+12&&Math.abs(a.x-px)<34){if(a.bad){g.lives--;$('gameLives').textContent=g.lives}else{g.score+=10;$('gameScore').textContent=g.score}g.items.splice(i,1);if(g.lives<=0){finishArcade(true);return}}else if(a.y>h+25)g.items.splice(i,1)}if(g.time<=0){$('gameTime').textContent='0';finishArcade(false);return}$('gameTime').textContent=Math.ceil(g.time);ctx.clearRect(0,0,w,h);for(const a of g.items){ctx.save();ctx.translate(a.x,a.y);ctx.rotate(a.spin);ctx.shadowBlur=18;ctx.shadowColor=a.bad?'#ff4b70':'#bd92ff';ctx.fillStyle=a.bad?'#ff526f':'#dfc6ff';ctx.beginPath();if(a.bad){for(let k=0;k<8;k++){const rr=k%2?a.r*.48:a.r,ang=k*Math.PI/4;ctx.lineTo(Math.cos(ang)*rr,Math.sin(ang)*rr)}}else ctx.arc(0,0,a.r,0,Math.PI*2);ctx.closePath();ctx.fill();ctx.restore()}ctx.save();ctx.translate(px,py);ctx.shadowBlur=20;ctx.shadowColor='#a56bff';ctx.fillStyle='#a878ff';ctx.beginPath();ctx.moveTo(-31,-9);ctx.quadraticCurveTo(-24,10,0,10);ctx.quadraticCurveTo(24,10,31,-9);ctx.lineTo(25,4);ctx.lineTo(-25,4);ctx.closePath();ctx.fill();ctx.restore();arcadeRaf=requestAnimationFrame(drawArcade)}
+function moveArcadePointer(e){if(!arcadeRun)return;const r=$('gameStage').getBoundingClientRect();arcadeRun.playerX=Math.max(32,Math.min(r.width-32,e.clientX-r.left))}
+$('search').addEventListener('input',renderProducts);$('gameFab').onclick=openArcade;$('gameClose').onclick=closeArcade;$('gameStart').onclick=startArcade;$('gameCanvas').addEventListener('pointermove',moveArcadePointer);$('gameCanvas').addEventListener('pointerdown',moveArcadePointer);window.addEventListener('resize',()=>{if($('gameOverlay').classList.contains('open')&&arcadeRun)sizeArcadeCanvas()});$('supportFab').onclick=openSupport;$('shopBtn').onclick=()=>renderProducts();$('favoritesBtn').onclick=loadFavorites;$('loyaltyBtn').onclick=loadLoyalty;$('cartBtn').onclick=showCart;$('ordersBtn').onclick=loadOrders;load();
 </script></main></body></html>"""
 
 
@@ -11259,6 +11287,102 @@ def miniapp_product_photo(media_id: int):
     except Exception:
         log.exception("Mini App product photo retrieval failed: media_id=%s", media_id)
         return jsonify({"error": "Не вдалося завантажити фото товару."}), 502
+
+
+@miniapp.get("/api/miniapp/arcade/status")
+def miniapp_arcade_status():
+    try:
+        user = _miniapp_auth_user()
+        with db_cursor() as cur:
+            cur.execute("""INSERT INTO miniapp_arcade_profiles(customer_telegram_id) VALUES(%s)
+                           ON CONFLICT(customer_telegram_id) DO NOTHING""", (user.id,))
+            cur.execute("SELECT total_score FROM miniapp_arcade_profiles WHERE customer_telegram_id=%s", (user.id,))
+            profile = cur.fetchone() or {"total_score": 0}
+            cur.execute("""SELECT completed_at FROM miniapp_arcade_sessions
+                           WHERE customer_telegram_id=%s AND lost=TRUE
+                             AND completed_at>=NOW()-INTERVAL '24 hours'
+                           ORDER BY completed_at DESC LIMIT 3""", (user.id,))
+            losses = cur.fetchall()
+        reset_at = losses[-1]["completed_at"] + timedelta(hours=24) if len(losses) >= 3 else None
+        return jsonify({"total_score": int(profile["total_score"] or 0), "losses_24h": len(losses),
+                        "losses_left": max(0, 3-len(losses)), "reset_at": _miniapp_json_value(reset_at)})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except Exception:
+        log.exception("Mini App arcade status failed")
+        return jsonify({"error": "Не вдалося завантажити ігровий профіль."}), 500
+
+
+@miniapp.post("/api/miniapp/arcade/start")
+def miniapp_arcade_start():
+    try:
+        user = _miniapp_auth_user()
+        with db_cursor() as cur:
+            cur.execute("""INSERT INTO miniapp_arcade_profiles(customer_telegram_id) VALUES(%s)
+                           ON CONFLICT(customer_telegram_id) DO NOTHING""", (user.id,))
+            cur.execute("SELECT total_score FROM miniapp_arcade_profiles WHERE customer_telegram_id=%s FOR UPDATE", (user.id,))
+            profile = cur.fetchone()
+            cur.execute("""UPDATE miniapp_arcade_sessions SET lost=TRUE,completed_at=NOW()
+                           WHERE customer_telegram_id=%s AND completed_at IS NULL
+                             AND started_at<NOW()-INTERVAL '90 seconds'""", (user.id,))
+            cur.execute("""SELECT completed_at FROM miniapp_arcade_sessions
+                           WHERE customer_telegram_id=%s AND lost=TRUE
+                             AND completed_at>=NOW()-INTERVAL '24 hours'
+                           ORDER BY completed_at DESC LIMIT 3""", (user.id,))
+            losses = cur.fetchall()
+            if len(losses) >= 3:
+                reset_at = losses[-1]["completed_at"] + timedelta(hours=24)
+                return jsonify({"error": "Ліміт спроб на сьогодні вичерпано.", "losses_left": 0,
+                                "reset_at": _miniapp_json_value(reset_at)}), 429
+            cur.execute("""SELECT id FROM miniapp_arcade_sessions
+                           WHERE customer_telegram_id=%s AND completed_at IS NULL""", (user.id,))
+            active = cur.fetchone()
+            if active:
+                session_id = int(active["id"])
+            else:
+                cur.execute("INSERT INTO miniapp_arcade_sessions(customer_telegram_id) VALUES(%s) RETURNING id", (user.id,))
+                session_id = int(cur.fetchone()["id"])
+        return jsonify({"session_id": session_id, "total_score": int(profile["total_score"] or 0),
+                        "losses_left": max(0, 3-len(losses))})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except Exception:
+        log.exception("Mini App arcade session start failed")
+        return jsonify({"error": "Не вдалося розпочати гру."}), 500
+
+
+@miniapp.post("/api/miniapp/arcade/finish")
+def miniapp_arcade_finish():
+    try:
+        user = _miniapp_auth_user()
+        body = request.get_json(silent=True) or {}
+        session_id = int(body.get("session_id", 0))
+        score = int(body.get("score", -1))
+        lost = body.get("lost")
+        if session_id <= 0 or not 0 <= score <= 1000 or not isinstance(lost, bool):
+            return jsonify({"error": "Некоректний результат гри."}), 400
+        with db_cursor() as cur:
+            cur.execute("""UPDATE miniapp_arcade_sessions SET score=%s,lost=%s,completed_at=NOW()
+                           WHERE id=%s AND customer_telegram_id=%s AND completed_at IS NULL
+                           RETURNING id""", (score, lost, session_id, user.id))
+            if not cur.fetchone():
+                return jsonify({"error": "Ця ігрова сесія вже завершена або недоступна."}), 409
+            cur.execute("""UPDATE miniapp_arcade_profiles SET total_score=total_score+%s,updated_at=NOW()
+                           WHERE customer_telegram_id=%s RETURNING total_score""", (score, user.id))
+            profile = cur.fetchone()
+            cur.execute("""SELECT COUNT(*) AS n FROM miniapp_arcade_sessions
+                           WHERE customer_telegram_id=%s AND lost=TRUE
+                             AND completed_at>=NOW()-INTERVAL '24 hours'""", (user.id,))
+            losses = int(cur.fetchone()["n"] or 0)
+        return jsonify({"score": score, "total_score": int(profile["total_score"] or 0),
+                        "losses_left": max(0, 3-losses), "lost": lost})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except (ValueError, TypeError):
+        return jsonify({"error": "Некоректний результат гри."}), 400
+    except Exception:
+        log.exception("Mini App arcade session finish failed")
+        return jsonify({"error": "Не вдалося зберегти результат гри."}), 500
 
 
 @miniapp.route("/api/miniapp/favorites", methods=["GET", "POST"])
