@@ -1350,7 +1350,9 @@ def confirm_inventory_count(count_id: int, actor: Staff, reason: str) -> list[di
             raise ValueError('Спочатку потрібно внести фактичну кількість для кожного SKU.')
         report=[]
         for item in items:
-            cur.execute("SELECT stock_qty,reserved_qty FROM product_variants WHERE id=%s FOR UPDATE", (item['variant_id'],))
+            cur.execute("""SELECT v.stock_qty,v.reserved_qty,v.sku,p.name
+                           FROM product_variants v JOIN products p ON p.id=v.product_id
+                           WHERE v.id=%s FOR UPDATE OF v""", (item['variant_id'],))
             stock=cur.fetchone()
             if not stock:
                 raise ValueError('SKU видалено або не знайдено. Інвентаризацію не проведено.')
@@ -1374,7 +1376,8 @@ def confirm_inventory_count(count_id: int, actor: Staff, reason: str) -> list[di
                 cur.execute("UPDATE product_variants SET stock_qty=%s,updated_at=NOW() WHERE id=%s", (actual,item['variant_id']))
                 cur.execute("INSERT INTO inventory_movements(variant_id,movement_type,quantity_delta,reference_type,reference_id,reason,actor_telegram_id) VALUES(%s,'inventory_count',%s,'inventory_count',%s,%s,%s)",
                             (item['variant_id'],discrepancy,str(count_id),reason.strip(),actor.telegram_id))
-            report.append({'variant_id':item['variant_id'],'system_qty':system_qty,'actual_qty':actual,
+            report.append({'variant_id':item['variant_id'],'sku':stock['sku'],'product_name':stock['name'],
+                           'system_qty':system_qty,'actual_qty':actual,
                            'counted_qty':int(item['actual_qty']),'concurrent_delta':net_delta,'discrepancy':discrepancy})
         cur.execute("UPDATE inventory_counts SET status='confirmed',confirmed_by=%s,confirmed_at=NOW() WHERE id=%s", (actor.telegram_id,count_id))
         cur.execute("INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data,reason) VALUES(%s,%s,'inventory.count_confirmed','inventory_count',%s,%s::jsonb,%s)",
@@ -10899,10 +10902,49 @@ function startSnowfall(){let box=$('snowfallFx');if(!box)return;box.replaceChild
 async function webLogout(){try{await api('/api/miniapp/web-login/logout',{method:'POST',body:'{}'});window.location.reload()}catch(e){msg(e.message)}}
 function renderInventoryEntry(){if(document.getElementById('inventoryBtn'))return;let btn=document.createElement('button');btn.id='inventoryBtn';btn.textContent='Інвентаризація';btn.onclick=loadInventory;$('staffToolsBtn')?.after(btn)}
 async function loadInventory(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризація</h2><div class="notice">Створюю список товарів для перерахунку…</div>';try{let d=await api('/api/miniapp/staff/inventory',{method:'POST',body:'{}'});await renderInventoryCount(d.count_id)}catch(e){$('staffPanel').innerHTML='<h2>Інвентаризація</h2><div class="notice">'+esc(e.message)+'</div>'}}
-async function renderInventoryCount(id){try{let d=await api(`/api/miniapp/staff/inventory/${id}`);$('staffPanel').innerHTML=`<h2>Перерахунок залишків · #${id}</h2><div class="notice">Для кожного SKU внесіть фізичну кількість. Кнопки +/− зберігають результат одразу.</div><div id="inventoryRows">${d.items.map(x=>`<article class="card cart-row" data-inventory-variant="${x.variant_id}"><div class="product-photo cart-photo${x.photo_id?' loaded':''}">${x.photo_id?`<img data-photo-id="${x.photo_id}" alt="${esc(x.name)}">`:'☁'}</div><div class="cart-info"><h3>${esc(x.name)}</h3><small>${esc(x.sku)}</small><div class="cart-actions"><button onclick="inventoryStep(${id},${x.variant_id},-1)">−</button><input data-count-input="${x.variant_id}" type="number" min="0" step="1" value="${x.actual_qty??''}" onchange="saveInventoryItem(${id},${x.variant_id})" placeholder="Факт"><button onclick="inventoryStep(${id},${x.variant_id},1)">+</button></div></div></article>`).join('')}</div>${canConfirmInventory?`<input id="inventoryReason" maxlength="250" placeholder="Причина / примітка для журналу"><button class="primary" onclick="confirmInventory(${id})">Підтвердити й надіслати PDF власнику</button>`:'<div class="notice">Попросіть власника або адміністратора підтвердити зміни після перерахунку.</div>'}`;setTimeout(()=>document.querySelectorAll('#inventoryRows img[data-photo-id]').forEach(loadOnePhoto),0)}catch(e){msg(e.message)}}
+async function renderInventoryCount(id) {
+  try {
+    let d=await api('/api/miniapp/staff/inventory/'+id);
+    let completed=d.status==='confirmed';
+    let shortages=(d.items||[]).filter(x=>Number(x.discrepancy)<0);
+    let shortageUnits=shortages.reduce((sum,x)=>sum+Math.max(0,-Number(x.discrepancy)),0);
+    let summary='';
+    if(completed){
+      summary='<div class="notice"><b>Нестача: '+shortageUnits+' шт. у '+shortages.length+' SKU</b>';
+      if(shortages.length) summary+='<ul>'+shortages.map(x=>'<li>'+esc(x.name)+' · SKU '+esc(x.sku)+': бракує '+(-Number(x.discrepancy))+' шт. (система '+Number(x.system_qty_snapshot)+', факт '+Number(x.reconciled_qty)+')</li>').join('')+'</ul>';
+      else summary+='<p>Нестачі немає.</p>';
+      summary+='</div>';
+    } else {
+      summary='<div class="notice">Внесіть фактичну кількість кожного SKU. Очікувані залишки приховані до підтвердження.</div>';
+    }
+    let rows=(d.items||[]).map(x=>{
+      let photo=x.photo_id?'<img data-photo-id="'+Number(x.photo_id)+'" alt="'+esc(x.name)+'">':'☁';
+      let count=completed
+        ? '<small>Система: '+Number(x.system_qty_snapshot)+' · Факт: '+Number(x.reconciled_qty)+'</small><br><b>'+(Number(x.discrepancy)<0?'Не вистачає: '+(-Number(x.discrepancy))+' шт.':Number(x.discrepancy)>0?'Надлишок: '+Number(x.discrepancy)+' шт.':'Без розбіжності')+'</b>'
+        : '<div class="cart-actions"><button onclick="inventoryStep('+id+','+Number(x.variant_id)+',-1)">−</button><input data-count-input="'+Number(x.variant_id)+'" type="number" min="0" step="1" value="'+(x.actual_qty??'')+'" onchange="saveInventoryItem('+id+','+Number(x.variant_id)+')" placeholder="Факт"><button onclick="inventoryStep('+id+','+Number(x.variant_id)+',1)">+</button></div>';
+      return '<article class="card cart-row" data-inventory-variant="'+Number(x.variant_id)+'"><div class="product-photo cart-photo'+(x.photo_id?' loaded':'')+'">'+photo+'</div><div class="cart-info"><h3>'+esc(x.name)+'</h3><small>SKU: '+esc(x.sku)+'</small>'+count+'</div></article>';
+    }).join('');
+    let actions=!completed&&canConfirmInventory
+      ? '<input id="inventoryReason" maxlength="250" placeholder="Причина / примітка для журналу"><button class="primary" onclick="confirmInventory('+id+')">Підтвердити й надіслати PDF власнику</button>'
+      : !completed?'<div class="notice">Попросіть власника або адміністратора підтвердити зміни.</div>':'';
+    $('staffPanel').innerHTML='<h2>'+(completed?'Підсумок інвентаризації':'Перерахунок залишків')+' · #'+id+'</h2>'+summary+'<div id="inventoryRows">'+rows+'</div>'+actions;
+    setTimeout(()=>document.querySelectorAll('#inventoryRows img[data-photo-id]').forEach(loadOnePhoto),0);
+  } catch(e) { msg(e.message); }
+}
 async function saveInventoryItem(countId,variantId){let input=document.querySelector(`[data-count-input="${variantId}"]`);let value=input?.value;if(value===''||!Number.isInteger(Number(value))||Number(value)<0){msg('Вкажіть ціле число не менше нуля');return}try{await api(`/api/miniapp/staff/inventory/${countId}/item`,{method:'PUT',body:JSON.stringify({variant_id:variantId,actual_qty:Number(value)})})}catch(e){msg(e.message)}}
 async function inventoryStep(countId,variantId,delta){let input=document.querySelector(`[data-count-input="${variantId}"]`);if(!input)return;input.value=Math.max(0,Number(input.value||0)+delta);await saveInventoryItem(countId,variantId)}
-async function confirmInventory(countId){let reason=$('inventoryReason')?.value?.trim();if(!reason){msg('Вкажіть причину підтвердження');return}try{let d=await api(`/api/miniapp/staff/inventory/${countId}/confirm`,{method:'POST',body:JSON.stringify({reason})});$('staffPanel').innerHTML=`<h2>Інвентаризацію завершено</h2><div class="notice">Позицій: ${d.items}. PDF ${d.pdf_sent?'надіслано власнику в Telegram':'не вдалося надіслати власнику — перевірте логи бота'}.</div>`}catch(e){msg(e.message)}}
+async function confirmInventory(countId) {
+  let reason=$('inventoryReason')?.value?.trim();
+  if(!reason){msg('Вкажіть причину підтвердження');return}
+  try {
+    let d=await api('/api/miniapp/staff/inventory/'+countId+'/confirm',{method:'POST',body:JSON.stringify({reason})});
+    await renderInventoryCount(countId);
+    let note=document.createElement('div');
+    note.className='notice';
+    note.textContent=d.pdf_sent?'PDF зі звітом надіслано власнику в Telegram.':'Не вдалося надіслати PDF власнику — перевірте логи бота.';
+    $('staffPanel').append(note);
+  } catch(e) { msg(e.message); }
+}
 function renderAnalyticsEntry(){if(!document.getElementById('analyticsBtn')){let btn=document.createElement('button');btn.id='analyticsBtn';btn.textContent='Аналітика відвідувань';btn.onclick=()=>loadOwnerAnalytics('day');$('ownerBtn')?.after(btn)}if(!document.getElementById('replenishmentBtn')){let btn=document.createElement('button');btn.id='replenishmentBtn';btn.textContent='Рекомендації закупівлі';btn.onclick=loadReplenishment;$('analyticsBtn')?.after(btn)}}
 async function loadReplenishment(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">Рахую продажі та запас…</div>';try{let d=await api('/api/miniapp/admin/replenishment');$('ownerPanel').innerHTML=`<h2>Рекомендації закупівлі</h2><div class="notice">Попит рахується за останні 30 днів. Цільовий запас покриває 5 днів доставки, ще 5 днів до наступного циклу закупівлі та 2 дні резерву. Списання не враховуються.</div>${d.items.length?`<div class="grid">${d.items.map(x=>`<article class="card"><h3>${esc(x.product_name)}</h3><small>SKU: ${esc(x.sku)}</small><p>Продано: ${x.sold_units} за 30 днів · у наявності: ${x.available_qty}</p><p>Середнє: ${x.daily_velocity}/день</p><div class="price">Замовити: ${x.suggested_order_qty}</div></article>`).join('')}</div>`:'<div class="notice">За поточним запасом і продажами термінової закупівлі не потрібно.</div>'}`}catch(e){$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">'+esc(e.message)+'</div>'}}
 async function loadOwnerAnalytics(period='day'){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');try{let d=await api('/api/miniapp/admin/analytics?period='+encodeURIComponent(period));$('ownerPanel').innerHTML=`<h2>Аналітика · ${({day:'день',week:'тиждень',month:'місяць',year:'рік'})[period]}</h2><select id="analyticsPeriod" onchange="loadOwnerAnalytics(this.value)"><option value="day" ${period==='day'?'selected':''}>День</option><option value="week" ${period==='week'?'selected':''}>Тиждень</option><option value="month" ${period==='month'?'selected':''}>Місяць</option><option value="year" ${period==='year'?'selected':''}>Рік</option></select><div class="grid"><div class="card"><small>Унікальні відвідувачі сайту</small><h3>${d.visitors}</h3></div><div class="card"><small>Запуски бота</small><h3>${d.bot_starts}</h3></div><div class="card"><small>Переглядали категорії</small><h3>${d.category_visitors}</h3></div><div class="card"><small>Пошукали</small><h3>${d.search_visitors}</h3></div><div class="card"><small>Додали товар</small><h3>${d.adders} · натискань ${d.add_clicks}</h3></div><div class="card"><small>Відкрили кошик</small><h3>${d.cart_visitors}</h3></div><div class="card"><small>Почали оформлення</small><h3>${d.checkouts}</h3></div><div class="card"><small>Замовлення оформлено</small><h3>${d.buyers} · ${d.orders}</h3></div></div><h3>Де залишають сайт</h3><div class="notice">Відвідування → кошик: ${d.visitors?Math.round(d.cart_visitors/d.visitors*100):0}%<br>Кошик → оформлення: ${d.cart_visitors?Math.round(d.checkouts/d.cart_visitors*100):0}%<br>Оформлення → завершене замовлення: ${d.checkouts?Math.round(d.buyers/d.checkouts*100):0}%</div><small>Унікальні браузери рахуються анонімним випадковим ID; показники Mini App/сайту й запусків бота агреговані.</small>`}catch(e){$('ownerPanel').innerHTML='<h2>Аналітика</h2><div class="notice">'+esc(e.message)+'</div>'}}
@@ -11740,7 +11782,10 @@ def _miniapp_send_inventory_pdf(count_id: int, report: list[dict]) -> bool:
                                    ("FONTNAME",(0,0),(-1,-1),"CloudHubInventory"),("FONTSIZE",(0,0),(-1,-1),8),
                                    ("GRID",(0,0),(-1,-1),0.35,colors.HexColor("#cfc5dc")),("VALIGN",(0,0),(-1,-1),"TOP"),
                                    ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#f5f1fa")])]))
-        doc.build([Paragraph(f"Cloud Hub · інвентаризація #{count_id}",title),Spacer(1,10),table])
+        missing_skus=sum(1 for row in rows if int(row["discrepancy"])<0)
+        missing_units=sum(max(0,-int(row["discrepancy"])) for row in rows)
+        summary=Paragraph(f"\u041d\u0435\u0432\u0438\u0441\u0442\u0430\u0447\u0430: {missing_units} \u0448\u0442. \u0443 {missing_skus} SKU",body)
+        doc.build([Paragraph(f"Cloud Hub · інвентаризація #{count_id}",title),Spacer(1,10),summary,Spacer(1,8),table])
         buffer.seek(0)
         bot.send_document(CONFIG.owner_id,types.InputFile(buffer,f"cloudhub-inventory-{count_id}.pdf"),caption=f"Інвентаризацію #{count_id} завершено · {len(rows)} позицій")
         return True
@@ -11790,7 +11835,10 @@ def miniapp_staff_inventory_detail(count_id: int):
             cur.execute("SELECT status FROM inventory_counts WHERE id=%s",(count_id,));count=cur.fetchone()
             if not count:
                 return jsonify({"error":"Інвентаризацію не знайдено."}),404
-            cur.execute("""SELECT i.variant_id,i.actual_qty,v.sku,p.name,
+            cur.execute("""SELECT i.variant_id,i.actual_qty,i.system_qty_snapshot,i.discrepancy,
+                                  i.system_qty_snapshot+i.discrepancy AS reconciled_qty,
+                                  GREATEST(0,-COALESCE(i.discrepancy,0)) AS shortage_qty,
+                                  v.sku,p.name,
                                   (SELECT pm.id FROM product_media pm WHERE pm.product_id=p.id ORDER BY pm.sort_order,pm.id LIMIT 1) photo_id
                            FROM inventory_count_items i JOIN product_variants v ON v.id=i.variant_id
                            JOIN products p ON p.id=v.product_id WHERE i.count_id=%s ORDER BY p.name,v.sku""",(count_id,))
@@ -11827,8 +11875,17 @@ def miniapp_staff_inventory_confirm(count_id: int):
         if actor.role not in {"owner","admin"}:
             return jsonify({"error":"Підтвердити інвентаризацію може власник або адміністратор."}),403
         report=confirm_inventory_count(count_id,actor,reason)
+        shortages=[{"variant_id":int(x["variant_id"]),"sku":str(x["sku"]),
+                    "product_name":str(x["product_name"]),"system_qty":int(x["system_qty"]),
+                    "actual_qty":int(x["actual_qty"]),"shortage_qty":-int(x["discrepancy"])}
+                   for x in report if int(x["discrepancy"])<0]
+        shortage_units=sum(x["shortage_qty"] for x in shortages)
+        log.info("Mini App inventory count confirmed: count_id=%s shortage_skus=%s shortage_units=%s",
+                 count_id,len(shortages),shortage_units)
         pdf_sent=_miniapp_send_inventory_pdf(count_id,report)
-        return jsonify({"ok":True,"items":len(report),"pdf_sent":pdf_sent})
+        return jsonify({"ok":True,"items":len(report),"pdf_sent":pdf_sent,
+                        "shortage_skus":len(shortages),"shortage_units":shortage_units,
+                        "shortages":shortages})
     except PermissionError as exc:
         return jsonify({"error":str(exc)}),403
     except ValueError as exc:
