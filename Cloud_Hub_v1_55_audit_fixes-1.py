@@ -10801,7 +10801,7 @@ miniapp.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 MINIAPP_HTML = r"""<!doctype html>
 <html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="color-scheme" content="dark"><title>Cloud Hub</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
+<meta name="color-scheme" content="dark"><meta name="description" content="Каталог Cloud Hub: товари, наявність, актуальні ціни та оформлення замовлення онлайн."><meta name="robots" content="index,follow"><meta property="og:type" content="website"><meta property="og:site_name" content="Cloud Hub"><meta property="og:title" content="Cloud Hub — каталог"><meta property="og:description" content="Перегляньте каталог Cloud Hub, наявність товарів та актуальні ціни."><title>Cloud Hub — каталог товарів та онлайн-замовлення</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{color-scheme:dark;--bg:#100b20;--panel:#1b1430;--panel2:#241a40;--muted:#b8accd;--accent:#9b65ff;--accent2:#6e55ed;--pink:#ec83cf;--gold:#e7bd70;--line:#392956;--glow:rgba(151,92,255,.24)}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(ellipse at 50% -15%,#39205f 0%,#17102a 42%,var(--bg) 78%);color:#fbf8ff;font:15px system-ui,-apple-system,sans-serif;padding:0 0 92px;min-height:100vh}
@@ -10957,7 +10957,29 @@ def _miniapp_json_value(value):
 
 @miniapp.get("/miniapp")
 def miniapp_home():
-    return Response(MINIAPP_HTML, mimetype="text/html")
+    page = MINIAPP_HTML
+    try:
+        products = list_catalog(limit=1000)
+        elements = []
+        for row in products:
+            elements.append({
+                "@type": "Product",
+                "name": " ".join(x for x in (str(row.get("name") or ""), str(row.get("variant_name") or "")) if x),
+                "sku": str(row.get("sku") or ""),
+                "brand": {"@type": "Brand", "name": str(row.get("brand") or "Cloud Hub")},
+                "offers": {"@type": "Offer", "priceCurrency": "UAH", "price": str(row.get("price") or 0),
+                           "availability": "https://schema.org/InStock" if int(row.get("available") or 0) > 0 else "https://schema.org/OutOfStock",
+                           "url": request.url_root.rstrip("/") + "/miniapp"},
+            })
+        structured = {"@context": "https://schema.org", "@type": "ItemList", "name": "Cloud Hub — каталог",
+                      "numberOfItems": len(elements), "itemListElement": [
+                          {"@type": "ListItem", "position": i + 1, "item": item} for i, item in enumerate(elements)
+                      ]}
+        encoded = json.dumps(structured, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+        page = page.replace("</head>", f'<link rel="canonical" href="{html.escape(request.url_root.rstrip("/") + "/miniapp", quote=True)}"><script type="application/ld+json">{encoded}</script></head>', 1)
+    except Exception:
+        log.exception("Could not render Mini App SEO product metadata")
+    return Response(page, mimetype="text/html")
 
 
 @miniapp.post("/api/miniapp/web-login")
