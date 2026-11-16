@@ -610,6 +610,11 @@ CREATE TABLE IF NOT EXISTS support_messages (
     sender_telegram_id BIGINT NOT NULL, sender_type TEXT NOT NULL CHECK(sender_type IN ('customer','staff')),
     body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS order_reviews (
+    id BIGSERIAL PRIMARY KEY, order_id BIGINT NOT NULL UNIQUE REFERENCES orders(id) ON DELETE RESTRICT,
+    customer_telegram_id BIGINT NOT NULL, rating SMALLINT NOT NULL CHECK(rating BETWEEN 1 AND 5),
+    comment TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 CREATE TABLE IF NOT EXISTS delivery_slots (
     id BIGSERIAL PRIMARY KEY, slot_date DATE NOT NULL, starts_at TIMESTAMPTZ NOT NULL, ends_at TIMESTAMPTZ NOT NULL,
     tariff_code TEXT NOT NULL, capacity INTEGER NOT NULL DEFAULT 1 CHECK(capacity>0),
@@ -10908,6 +10913,7 @@ async function runCrmSearch(){let q=$('crmQuery').value.trim();if(q.length<2){ms
 async function loadInventory(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризації</h2><button class="primary" onclick="startInventory()">＋ Почати інвентаризацію</button><div class="notice">Історія та чернетки</div><div id="inventoryHistory">Завантажую…</div>';try{let d=await api('/api/miniapp/staff/inventory');$('inventoryHistory').innerHTML=(d.items||[]).map(x=>`<button class="card" onclick="renderInventoryCount(${x.id})"><b>#${x.id} · ${x.status==='confirmed'?'Завершена':x.status==='counting'?'У процесі':esc(x.status)}</b><br><small>${esc(x.created_at)} · Пораховано ${x.counted_count}/${x.sku_count}</small></button>`).join('')||'<div class="notice">Інвентаризацій ще немає.</div>'}catch(e){$('inventoryHistory').textContent=e.message}}
 async function startInventory(){try{let d=await api('/api/miniapp/staff/inventory',{method:'POST',body:'{}'});await renderInventoryCount(d.count_id)}catch(e){msg(e.message)}}
 function loadStaffTools(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML=`<h2>Робоча панель</h2><section class="ops-group"><h3>Клієнти та замовлення</h3><div class="formgrid">${canViewCustomers?'<button onclick="searchStaffCustomers()">🔎 CRM · пошук клієнта</button>':''}${canViewOrders?'<button onclick="loadStaffOrders()">📦 Замовлення</button>':''}</div></section><section class="ops-group"><h3>Магазин і склад</h3><div class="formgrid">${canManageCatalog?'<button onclick="loadStaffCatalog()">🛍️ Товари й ціни</button>':''}${canManageInventory?'<button onclick="loadInventory()">📋 Інвентаризації</button>':''}</div></section><section class="ops-group"><h3>Зв’язок</h3><div class="formgrid">${canViewSupport?'<button onclick="loadStaffSupport()">💬 Чат підтримки</button>':''}</div></section><div id="staffContent"></div>`}
+async function loadCustomerSupport(archived=false){let panel=$('supportPanel');panel.innerHTML=`<h2>Чат підтримки</h2><div class="formgrid"><button onclick="loadCustomerSupport(false)">Активні</button><button onclick="loadCustomerSupport(true)">Архів</button></div><div class="notice">Тут лише ваші звернення до підтримки — товари й історія замовлень окремо.</div>`;try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));panel.innerHTML+=((d.items||[]).map(t=>`<article class="card"><b>Звернення #${t.id}</b> · ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Підтримка':'Ви'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${!archived&&t.status!=='closed'?`<textarea id="reply-${t.id}" maxlength="4000" placeholder="Напишіть відповідь"></textarea><button onclick="sendSupportMessage(${t.id})">Надіслати</button>`:''}</article>`).join('')||`<div class="notice">${archived?'Архів порожній':'Активних звернень немає'}</div>`)+(archived?'':'<div class="card"><h3>Нове звернення</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="Опишіть, чим допомогти"></textarea><button class="primary" onclick="sendSupportMessage(0)">Надіслати підтримці</button></div>')}catch(e){panel.innerHTML+='<div class="notice">'+esc(e.message)+'</div>'}}
 $('search').addEventListener('input',renderProducts);$('supportFab').onclick=openSupport;$('shopBtn').onclick=()=>renderProducts();$('favoritesBtn').onclick=loadFavorites;$('loyaltyBtn').onclick=loadLoyalty;$('cartBtn').onclick=showCart;$('ordersBtn').onclick=loadOrders;load();
 </script></main></body></html>"""
 
@@ -11486,6 +11492,9 @@ def miniapp_refresh_tracking():
         with db_cursor() as cur:
             cur.execute("""UPDATE orders SET nova_poshta_tracking_status=%s,nova_poshta_updated_at=NOW(),updated_at=NOW()
                            WHERE id=%s AND telegram_id_snapshot=%s""", (status, order["id"], user.id))
+            if any(term in status.casefold() for term in ("отримано","вручено","доставлено")):
+                cur.execute("""UPDATE support_tickets SET status='closed',updated_at=NOW()
+                               WHERE customer_telegram_id=%s AND order_id=%s AND status<>'closed'""",(user.id,order["id"]))
             cur.execute("""INSERT INTO audit_log(action,entity_type,entity_id,after_data,reason)
                            VALUES('nova_poshta.tracking_refreshed','order',%s,%s::jsonb,'Customer requested tracking refresh')""",
                         (str(order["id"]), json_dumps({"status": status})))
@@ -11559,9 +11568,11 @@ def miniapp_customer_support():
         user = _miniapp_auth_user()
         if request.method == "GET":
             with db_cursor() as cur:
+                archived = request.args.get("archived") == "1"
                 cur.execute("""SELECT id,subject,status,created_at,updated_at FROM support_tickets
                                WHERE customer_telegram_id=%s AND subject<>'Запит на роботу'
-                               ORDER BY updated_at DESC,id DESC LIMIT 30""", (user.id,))
+                                 AND (status='closed')=%s
+                               ORDER BY updated_at DESC,id DESC LIMIT 30""", (user.id, archived))
                 tickets = list(cur.fetchall())
             items = []
             for row in tickets:
@@ -11599,6 +11610,32 @@ def miniapp_customer_support():
     except Exception:
         log.exception("Mini App customer support failed")
         return jsonify({"error":"Не вдалося надіслати повідомлення підтримці."}),500
+
+
+@miniapp.post("/api/miniapp/orders/review")
+def miniapp_order_review():
+    try:
+        user=_miniapp_auth_user();body=request.get_json(silent=True) or {}
+        order_number=" ".join(str(body.get("order_number") or "").split())[:80]
+        rating=int(body.get("rating") or 0);comment=" ".join(str(body.get("comment") or "").split())[:1000]
+        if rating not in range(1,6):return jsonify({"error":"Оцініть замовлення від 1 до 5 зірок."}),400
+        with db_cursor() as cur:
+            cur.execute("""SELECT id,nova_poshta_tracking_status FROM orders
+                           WHERE order_number=%s AND telegram_id_snapshot=%s""",(order_number,user.id));order=cur.fetchone()
+            if not order:return jsonify({"error":"Замовлення не знайдено."}),404
+            status=str(order.get("nova_poshta_tracking_status") or "").lower()
+            if not any(x in status for x in ("отримано","вручено","доставлено")):
+                return jsonify({"error":"Відгук можна залишити після отримання замовлення."}),409
+            cur.execute("""INSERT INTO order_reviews(order_id,customer_telegram_id,rating,comment)
+                           VALUES(%s,%s,%s,%s) ON CONFLICT(order_id) DO NOTHING RETURNING id""",
+                        (order["id"],user.id,rating,comment))
+            saved=cur.fetchone()
+        return jsonify({"ok":True,"already_reviewed":not bool(saved)})
+    except PermissionError as exc:return jsonify({"error":str(exc)}),401
+    except (ValueError,TypeError):return jsonify({"error":"Перевірте оцінку."}),400
+    except Exception:
+        log.exception("Order review submission failed")
+        return jsonify({"error":"Не вдалося зберегти відгук."}),500
 
 
 @miniapp.get("/api/miniapp/staff/support")
