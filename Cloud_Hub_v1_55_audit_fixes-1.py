@@ -3189,6 +3189,26 @@ def render_staff_section(chat_id: int, staff: Staff, section: str) -> None:
                 r = cur.fetchone()
                 cur.execute("SELECT COUNT(*) n FROM customers")
                 customers = int(cur.fetchone()["n"])
+                local_now = datetime.now(ZoneInfo(CONFIG.timezone))
+                today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+                tomorrow_start = today_start + timedelta(days=1)
+                week_start = today_start - timedelta(days=6)
+                cur.execute("""SELECT COUNT(*) FILTER (WHERE created_at >= %s AND created_at < %s) AS starts_today,
+                                      COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= %s AND created_at < %s) AS people_today,
+                                      COUNT(*) FILTER (WHERE created_at >= %s AND created_at < %s) AS starts_7d,
+                                      COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= %s AND created_at < %s) AS people_per_day_7d
+                               FROM storefront_events WHERE event_type='bot_start'
+                                 AND created_at >= %s AND created_at < %s""",
+                            (today_start, tomorrow_start, today_start, tomorrow_start,
+                             week_start, tomorrow_start, week_start, tomorrow_start, week_start, tomorrow_start))
+                entries = cur.fetchone() or {}
+                lines += [
+                    f"\u0412\u0445\u043e\u0434\u0438 \u0432 \u0431\u043e\u0442 \u0441\u044c\u043e\u0433\u043e\u0434\u043d\u0456: <b>{int(entries.get('starts_today') or 0)}</b>",
+                    f"\u0423\u043d\u0456\u043a\u0430\u043b\u044c\u043d\u0438\u0445 \u043a\u043e\u0440\u0438\u0441\u0442\u0443\u0432\u0430\u0447\u0456\u0432: <b>{int(entries.get('people_today') or 0)}</b>",
+                    f"\u0412\u0445\u043e\u0434\u0438 \u0437\u0430 7 \u0434\u043d\u0456\u0432: <b>{int(entries.get('starts_7d') or 0)}</b>",
+                    f"\u0423\u043d\u0456\u043a\u0430\u043b\u044c\u043d\u0456 \u0432\u0445\u043e\u0434\u0438 \u043f\u043e \u0434\u043d\u044f\u0445 \u0437\u0430 7 \u0434\u043d\u0456\u0432: <b>{int(entries.get('people_per_day_7d') or 0)}</b>"]
+                kb.add(types.InlineKeyboardButton("\u21bb \u041e\u043d\u043e\u0432\u0438\u0442\u0438 \u0441\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043a\u0443 \u0432\u0445\u043e\u0434\u0456\u0432", callback_data="section:statistics"))
+
                 lines += [f"Замовлень сьогодні: <b>{r['orders']}</b>", f"Сума замовлень сьогодні: <b>{money(r['revenue'])}</b>", f"Клієнтів у базі: <b>{customers}</b>", "\nВиторг тут показаний за створеними замовленнями, не як підтверджений прибуток."]
                 if staff.role == "owner":
                     kb.add(types.InlineKeyboardButton("📈 Фінансовий звіт · 7 днів", callback_data="bizrep:finance:7d"),
