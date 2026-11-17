@@ -4927,6 +4927,42 @@ def owner_section_menu(message):
     render_staff_section(message.chat.id, staff, section)
 
 
+@bot.message_handler(commands=["bot_entries"])
+def bot_entries_analytics(message):
+    staff = require_staff(message)
+    if not staff:
+        return
+    if staff.role != "owner":
+        bot.reply_to(message, "?? ????????? ???????? ???? ????????.")
+        return
+    try:
+        local_now = datetime.now(ZoneInfo(CONFIG.timezone))
+        today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        week_start = today_start - timedelta(days=6)
+        with db_cursor() as cur:
+            cur.execute("""SELECT COUNT(*) FILTER (WHERE created_at >= %s AND created_at < %s) AS starts_today,
+                                  COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= %s AND created_at < %s) AS people_today,
+                                  COUNT(*) FILTER (WHERE created_at >= %s AND created_at < %s) AS starts_7d,
+                                  COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= %s AND created_at < %s) AS people_per_day_7d
+                           FROM storefront_events WHERE event_type='bot_start'
+                             AND created_at >= %s AND created_at < %s""",
+                        (today_start, tomorrow_start, today_start, tomorrow_start,
+                         week_start, tomorrow_start, week_start, tomorrow_start, week_start, tomorrow_start))
+            row = cur.fetchone() or {}
+        bot.reply_to(message,
+            "<b>????? ? Telegram-??? ????????</b>\n"
+            f"????????: <b>{int(row.get('starts_today') or 0)}</b>\n"
+            f"?????????? ????????????: <b>{int(row.get('people_today') or 0)}</b>\n\n"
+            "<b>??????? 7 ????</b>\n"
+            f"????????: <b>{int(row.get('starts_7d') or 0)}</b>\n"
+            f"?????????? ?????? ?? ????: <b>{int(row.get('people_per_day_7d') or 0)}</b>\n\n"
+            "????????? ??????????? ?????????? ?????? ??? ??????? ???.", parse_mode="HTML")
+    except Exception:
+        log.exception("Owner bot-entry analytics failed")
+        bot.reply_to(message, "?? ??????? ??????????? ?????????? ??????.")
+
+
 @bot.message_handler(func=lambda m: m.text == "🏠 Головне меню")
 def return_main_menu(message):
     staff = require_staff(message)
