@@ -47,7 +47,7 @@ Cloud Hub Handoff v1.9 is complete. Implemented here:
 - v1.46: customer product photo cards, variant selection, cart item removal, wholesale requests/history, roulette, shipping labels
 
 This is a single-file application. It is designed to be extended in place; do not
-split it into a multi-file project for the owner. Some advanced handoff modules still require implementation and live-provider testing before launch. This repaired build fixes known broken navigation paths; it is not a substitute for live checkout, Telegram, database, and provider acceptance tests. Nova Poshta directory lookup is optional assistance only: checkout never depends on its availability. Customer city/branch can be entered manually. Automatic TTN creation is queued after order commit. It requires the business API key and sender Ref values in Render environment variables; live provider acceptance tests are still required. Tracking status polling is not yet implemented.
+split it into a multi-file project for the owner. Some advanced handoff modules still require implementation and live-provider testing before launch. This repaired build fixes known broken navigation paths; it is not a substitute for live checkout, Telegram, database, and provider acceptance tests. Nova Poshta directory lookup is optional assistance only: checkout never depends on its availability. Клієнт city/branch can be entered manually. Automatic TTN creation is queued after order commit. It requires the business API key and sender Ref values in Render environment variables; live provider acceptance tests are still required. Tracking status polling is not yet implemented.
 
 Render environment variables:
   BOT_TOKEN                 required
@@ -267,6 +267,37 @@ CREATE TABLE IF NOT EXISTS staff_access_codes (
 );
 CREATE INDEX IF NOT EXISTS idx_staff_access_codes_active
     ON staff_access_codes(expires_at) WHERE used_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS staff_web_accounts (
+    telegram_id BIGINT PRIMARY KEY REFERENCES staff(telegram_id) ON DELETE CASCADE,
+    username TEXT NOT NULL UNIQUE,
+    password_salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    custom_permissions_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until TIMESTAMPTZ,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS staff_permission_grants (
+    telegram_id BIGINT NOT NULL REFERENCES staff_web_accounts(telegram_id) ON DELETE CASCADE,
+    permission TEXT NOT NULL,
+    granted_by BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY(telegram_id, permission)
+);
+CREATE TABLE IF NOT EXISTS staff_web_sessions (
+    token_hash TEXT PRIMARY KEY,
+    telegram_id BIGINT NOT NULL REFERENCES staff_web_accounts(telegram_id) ON DELETE CASCADE,
+    csrf_token TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_staff_web_sessions_expiry ON staff_web_sessions(expires_at);
+
 
 
 
@@ -488,6 +519,25 @@ CREATE TABLE IF NOT EXISTS product_variants (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS compare_at_price NUMERIC(12,2) CHECK(compare_at_price IS NULL OR compare_at_price>=0);
+
+CREATE TABLE IF NOT EXISTS website_purchase_requests (
+    id BIGSERIAL PRIMARY KEY,
+    request_number TEXT NOT NULL UNIQUE,
+    variant_id BIGINT NOT NULL REFERENCES product_variants(id),
+    product_name_snapshot TEXT NOT NULL,
+    variant_name_snapshot TEXT NOT NULL DEFAULT '',
+    sku_snapshot TEXT NOT NULL DEFAULT '',
+    unit_price NUMERIC(12,2) NOT NULL,
+    contact TEXT NOT NULL,
+    customer_name TEXT NOT NULL DEFAULT '',
+    comment TEXT NOT NULL DEFAULT '',
+    privacy_accepted BOOLEAN NOT NULL DEFAULT FALSE,
+    privacy_version TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'new' CHECK(state IN ('new','contacted','converted','closed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_website_purchase_requests_recent ON website_purchase_requests(state,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_products_active ON products(active, manually_hidden);
 CREATE INDEX IF NOT EXISTS idx_products_category_brand ON products(category_id,brand_id,active);
 CREATE INDEX IF NOT EXISTS idx_variants_product ON product_variants(product_id);
@@ -1627,7 +1677,7 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
                 cur.execute("UPDATE loyalty_accounts SET available=available+%s,updated_at=NOW() WHERE customer_id=%s",
                             (certificate_remainder, customer_id))
             cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data,reason)
-                           VALUES(%s,'customer','gift_certificate.redeemed','order',%s,%s::jsonb,'Customer checkout')""",
+                           VALUES(%s,'customer','gift_certificate.redeemed','order',%s,%s::jsonb,'Клієнт checkout')""",
                         (customer_telegram_id, str(order_id), json_dumps({"code": certificate_code, "used": certificate_used, "remainder_bonus": certificate_remainder})))
         if delivery_type == "nova_poshta":
             # Queue is committed atomically with the order. The API call happens later,
@@ -2236,11 +2286,14 @@ class Staff:
     display_name: str
     role: str
     active: bool
+    permission_override: Optional[frozenset[str]] = None
 
     def can(self, permission: str) -> bool:
         # Owner has full permissions; security locks are enforced earlier by require_staff().
         if self.role == "owner":
             return True
+        if self.permission_override is not None:
+            return permission in self.permission_override
         allowed = PERMISSIONS.get(self.role, set())
         return "*" in allowed or permission in allowed
 
@@ -2248,11 +2301,20 @@ class Staff:
 def get_staff(telegram_id: int) -> Optional[Staff]:
     with db_cursor() as cur:
         cur.execute(
-            "SELECT telegram_id, display_name, role, active FROM staff WHERE telegram_id=%s",
+            """SELECT s.telegram_id,s.display_name,s.role,s.active,
+                      COALESCE(a.custom_permissions_enabled,FALSE) AS custom_permissions_enabled,
+                      COALESCE(array_agg(g.permission) FILTER(WHERE g.permission IS NOT NULL),'{}') AS custom_permissions
+               FROM staff s LEFT JOIN staff_web_accounts a ON a.telegram_id=s.telegram_id
+               LEFT JOIN staff_permission_grants g ON g.telegram_id=s.telegram_id
+               WHERE s.telegram_id=%s GROUP BY s.telegram_id,s.display_name,s.role,s.active,
+                    a.custom_permissions_enabled""",
             (telegram_id,),
         )
         row = cur.fetchone()
-    return Staff(**row) if row else None
+    if not row:
+        return None
+    override = frozenset(row.pop("custom_permissions") or []) if row.pop("custom_permissions_enabled") else None
+    return Staff(**row, permission_override=override)
 
 
 def release_expired_security_lock(telegram_id: int) -> bool:
@@ -3489,7 +3551,7 @@ def staff_request_history_callback(call):
 
 
 # ---------------------------------------------------------------------------
-# Customer storefront UI
+# Клієнт storefront UI
 # ---------------------------------------------------------------------------
 
 
@@ -3627,7 +3689,7 @@ def send_customer_product_card(chat_id: int, variant_id: int,
             bot.send_photo(chat_id, photo_id, caption=caption, reply_markup=kb)
             return
         except Exception:
-            log.exception("Customer product photo send failed: product_id=%s", item["product_id"])
+            log.exception("Клієнт product photo send failed: product_id=%s", item["product_id"])
     # Keep catalogue navigation in one editable message to avoid chat flooding.
     _render_customer_catalog_message(chat_id, caption, kb, message_id)
 
@@ -4037,7 +4099,7 @@ def customer_order_callback(call):
     except ValueError as exc:
         bot.answer_callback_query(call.id, safe(str(exc))[:180], show_alert=True)
     except Exception:
-        log.exception("Customer order action failed")
+        log.exception("Клієнт order action failed")
         bot.answer_callback_query(call.id, "Не вдалося виконати дію. Спробуйте пізніше.", show_alert=True)
 
 
@@ -4048,7 +4110,7 @@ def customer_orders_back_callback(call):
 
 
 def customer_cancel_order(order_id: int, telegram_user) -> None:
-    """Customer may cancel only a not-yet-confirmed order; release stock atomically."""
+    """Клієнт may cancel only a not-yet-confirmed order; release stock atomically."""
     actor_id = int(telegram_user.id)
     actor_name = " ".join(x for x in [telegram_user.first_name, telegram_user.last_name] if x) or "Клієнт"
     customer_actor = Staff(actor_id, actor_name, "customer", True)
@@ -4167,7 +4229,7 @@ def customer_info_handler(message):
 
 
 # ---------------------------------------------------------------------------
-# Customer checkout wizard (consent -> contact -> delivery -> confirmation)
+# Клієнт checkout wizard (consent -> contact -> delivery -> confirmation)
 # ---------------------------------------------------------------------------
 
 def save_checkout_draft(telegram_id: int, customer_id: int, **fields) -> None:
@@ -4353,7 +4415,7 @@ def customer_checkout_callback(call):
             finalize_customer_checkout(call.message.chat.id, telegram_id)
             return
     except Exception as exc:
-        log.exception("Customer checkout callback failed")
+        log.exception("Клієнт checkout callback failed")
         bot.answer_callback_query(call.id, safe(str(exc))[:180], show_alert=True)
 
 
@@ -4772,7 +4834,7 @@ def send_customer_campaign_banner(chat_id: int) -> None:
             bot.send_message(chat_id, caption, reply_markup=markup, disable_web_page_preview=True)
     except Exception:
         # Campaign content must never interfere with customer onboarding.
-        log.exception("Customer campaign banner delivery failed")
+        log.exception("Клієнт campaign banner delivery failed")
 
 
 @bot.callback_query_handler(func=lambda c: bool(c.data) and c.data.startswith("web-login:"))
@@ -8776,7 +8838,7 @@ def customer_export_security_test_command(message):
             "Жодні дані клієнтів не експортувалися."
         )
     except Exception:
-        log.exception("Customer export security trigger failed")
+        log.exception("Клієнт export security trigger failed")
         bot.reply_to(message, "⚠️ Не вдалося зафіксувати подію безпеки. Повідомлення записано в журнал помилок.")
 
 
@@ -8960,7 +9022,7 @@ def _delivery_staff(message_or_call, permission: str = "delivery.read") -> Optio
 
 
 def delivery_ready_orders(limit: int = 100) -> list[dict]:
-    """Orders waiting for a delivery decision, newest first."""
+    """Замовлення waiting for a delivery decision, newest first."""
     with db_cursor() as cur:
         cur.execute("""SELECT o.id,o.order_number,o.customer_name_snapshot,o.phone_snapshot,
                    o.city,o.delivery_branch,o.delivery_address,o.delivery_type,o.status,
@@ -10264,7 +10326,7 @@ def customer_ticket_reply_callback(call):
         msg = bot.send_message(call.message.chat.id, f"Напишіть вашу відповідь до звернення #{ticket_id}:")
         bot.register_next_step_handler(msg, customer_ticket_reply_step, ticket_id)
     except Exception:
-        log.exception("Customer ticket reply callback failed")
+        log.exception("Клієнт ticket reply callback failed")
         bot.answer_callback_query(call.id, "Не вдалося відкрити звернення.", show_alert=True)
 
 
@@ -10298,7 +10360,7 @@ def customer_ticket_reply_step(message, ticket_id: int) -> None:
     except ValueError as exc:
         bot.reply_to(message, safe(str(exc)))
     except Exception:
-        log.exception("Customer ticket reply failed")
+        log.exception("Клієнт ticket reply failed")
         bot.reply_to(message, "⚠️ Не вдалося надіслати відповідь. Спробуйте ще раз.")
 
 
@@ -10372,25 +10434,25 @@ def _build_customers_pdf(output_path: str) -> int:
 
     # Register once per process. Re-registering the same font on every export
     # can cause collisions in long-running workers.
-    font_name = "CloudHubCustomerExport"
+    font_name = "CloudHubКлієнтExport"
     if font_name not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(TTFont(font_name, font_path))
 
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
-        "CHCustomerExportTitle", parent=styles["Title"], fontName=font_name,
+        "CHКлієнтExportTitle", parent=styles["Title"], fontName=font_name,
         fontSize=15, leading=19, alignment=TA_CENTER, spaceAfter=3*mm,
     )
     meta_style = ParagraphStyle(
-        "CHCustomerExportMeta", parent=styles["BodyText"], fontName=font_name,
+        "CHКлієнтExportMeta", parent=styles["BodyText"], fontName=font_name,
         fontSize=8, leading=10, alignment=TA_LEFT,
     )
     cell_style = ParagraphStyle(
-        "CHCustomerExportCell", parent=styles["BodyText"], fontName=font_name,
+        "CHКлієнтExportCell", parent=styles["BodyText"], fontName=font_name,
         fontSize=6.5, leading=8, alignment=TA_LEFT, wordWrap="CJK",
     )
     header_style = ParagraphStyle(
-        "CHCustomerExportHeader", parent=cell_style, textColor=colors.white,
+        "CHКлієнтExportHeader", parent=cell_style, textColor=colors.white,
         fontSize=6.5, leading=7.5,
     )
 
@@ -10423,7 +10485,7 @@ def _build_customers_pdf(output_path: str) -> int:
     doc = SimpleDocTemplate(
         output_path, pagesize=page_size,
         rightMargin=7*mm, leftMargin=7*mm, topMargin=8*mm, bottomMargin=8*mm,
-        title="Cloud Hub - Customer Register",
+        title="Cloud Hub - Клієнт Register",
         author="Cloud Hub",
         pageCompression=1,
     )
@@ -10548,7 +10610,7 @@ def _customer_export_password_step(message) -> None:
         with open(output_path, "rb") as fh:
             bot.send_document(message.chat.id, fh, caption=f"📄 Реєстр клієнтів Cloud Hub · {count} записів")
     except Exception as exc:
-        log.exception("Customer PDF export failed")
+        log.exception("Клієнт PDF export failed")
         bot.reply_to(message, f"⚠️ Не вдалося сформувати PDF: {safe(str(exc))[:500]}\nПеревірте журнал Render для повного traceback.")
     finally:
         try:
@@ -10919,6 +10981,7 @@ def fallback(message):
 
 miniapp = Flask("cloudhub_miniapp")
 
+
 @miniapp.after_request
 def _compress_small_text_responses(response):
     """Reduce the large bootstrap JSON transfer without changing API payloads."""
@@ -10958,21 +11021,21 @@ header{position:sticky;top:0;background:rgba(17,11,32,.86);backdrop-filter:blur(
 .success-wrap{text-align:center;padding:26px 14px 20px;animation:rise .35s ease both}.success-mark{width:82px;height:82px;margin:4px auto 16px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#7549d5,#a36cff);box-shadow:0 0 0 9px rgba(151,92,255,.11),0 0 34px rgba(151,92,255,.3);animation:pop .48s cubic-bezier(.2,1.5,.5,1) both}.success-mark svg{width:43px;height:43px;stroke:#fff;stroke-width:4;fill:none;stroke-linecap:round;stroke-linejoin:round}.success-mark path{stroke-dasharray:40;stroke-dashoffset:40;animation:draw .48s .25s ease forwards}.success-wrap h2{margin:8px 0;color:#f5eaff}.success-wrap .thanks{color:#e6c4ed;font-size:14px}.success-order{font-size:13px;color:var(--gold);letter-spacing:.4px;margin:10px 0}.success-wrap .notice{text-align:left}
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes pop{0%{transform:scale(.55);opacity:0}100%{transform:scale(1);opacity:1}}@keyframes draw{to{stroke-dashoffset:0}}
 @media(min-width:600px){.banner img{height:128px}}
-.brand-row{display:flex;align-items:center;gap:12px}.brand-row h1{margin:0;animation:brandGlow 5s ease-in-out infinite alternate}.cloud-logo{width:54px;height:44px;padding:5px;flex:0 0 54px;border:0;background:transparent;box-shadow:none}.cloud-logo svg{width:100%;height:100%;fill:none;stroke:#e9d8ff;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;filter:drop-shadow(0 0 5px #9b65ff);animation:cloudGlow 4s ease-in-out infinite alternate}header{position:sticky;overflow:visible}#snowfallFx{position:absolute;left:0;right:0;top:76px;height:0;pointer-events:none;z-index:9}.snowflake{position:absolute;top:0;color:#fff;font-size:14px;animation:snowfall 2.4s ease-in forwards}@keyframes snowfall{to{transform:translateY(135px) rotate(270deg);opacity:0}}@keyframes brandGlow{from{text-shadow:0 0 3px #9b65ff}to{text-shadow:0 0 9px #b87cff,0 0 16px #8c5bff}}@keyframes cloudGlow{from{stroke:#e9d8ff;filter:drop-shadow(0 0 3px #7654ed)}to{stroke:#c9a5ff;filter:drop-shadow(0 0 9px #ab63ff)}}.card{animation:rise .22s ease-out both}.product-photo img{width:100%;height:100%;object-fit:contain;transition:transform .25s ease,filter .25s ease}.product-photo img:hover{transform:scale(1.04);filter:drop-shadow(0 5px 10px #0005)}.product-photo.photo-missing:after{content:'Фото тимчасово недоступне';font-size:12px;color:var(--muted);padding:8px}.bottom button.active{animation:pop .2s ease-out}.ops-group{padding:14px;margin:12px 0;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#211735,#171126)}.crm-result{text-align:left;width:100%;animation:rise .18s ease-out}.admin-product-photo{display:block;width:min(100%,128px);height:128px;max-height:128px;object-fit:contain;margin:8px auto;border-radius:12px;background:#100d18;border:1px solid var(--line)}.admin-product-photo+input{max-width:100%}.support-fab{animation:supportPulse 3s ease-in-out infinite}@keyframes supportPulse{50%{box-shadow:0 0 18px #9b65ff99}}body.staff-mode .bottom{display:none}body.staff-mode #gameFab,body.staff-mode #supportFab{display:none}body.staff-mode{padding-bottom:28px}#staffPanel button,#ownerPanel button{min-height:44px}@media(max-width:380px){.cart-row{grid-template-columns:54px minmax(0,1fr);gap:8px}.cart-photo{width:54px;height:54px}.cart-price{grid-column:2}.bottom{padding-left:8px;padding-right:8px;gap:4px}}
+.brand-row{display:flex;align-items:center;gap:12px}.brand-row h1{margin:0;animation:brandGlow 5s ease-in-out infinite alternate}.cloud-logo{width:54px;height:44px;padding:5px;flex:0 0 54px;border:0;background:transparent;box-shadow:none}.cloud-logo svg{width:100%;height:100%;fill:none;stroke:#e9d8ff;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;filter:drop-shadow(0 0 5px #9b65ff);animation:cloudGlow 4s ease-in-out infinite alternate}header{position:sticky;overflow:visible}#snowfallFx{position:absolute;left:0;right:0;top:76px;height:0;pointer-events:none;z-index:9}.snowflake{position:absolute;top:0;color:#fff;font-size:14px;animation:snowfall 2.4s ease-in forwards}@keyframes snowfall{to{transform:translateY(135px) rotate(270deg);opacity:0}}@keyframes brandGlow{from{text-shadow:0 0 3px #9b65ff}to{text-shadow:0 0 9px #b87cff,0 0 16px #8c5bff}}@keyframes cloudGlow{from{stroke:#e9d8ff;filter:drop-shadow(0 0 3px #7654ed)}to{stroke:#c9a5ff;filter:drop-shadow(0 0 9px #ab63ff)}}.card{animation:rise .22s ease-out both}.product-photo img{width:100%;height:100%;object-fit:contain;transition:transform .25s ease,filter .25s ease}.product-photo img:hover{transform:scale(1.04);filter:drop-shadow(0 5px 10px #0005)}.product-photo.photo-missing:after{content:'Фото тимчасово недоступне';font-size:12px;color:var(--muted);padding:8px}.bottom button.active{animation:pop .2s ease-out}.ops-group{padding:14px;margin:12px 0;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#211735,#171126)}.crm-result{text-align:left;width:100%;animation:rise .18s ease-out}.support-desk{padding:14px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#211735,#171126)}.support-tabs{display:flex;gap:7px;overflow-x:auto;padding:8px 0;scrollbar-width:thin}.support-tabs button{white-space:nowrap;min-height:40px}.support-search{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:7px;align-items:center}.support-ticket-list{display:grid;gap:9px;margin-top:12px}.support-ticket-row{text-align:left!important;display:block;min-width:0}.support-ticket-row .row{align-items:flex-start}.support-ticket-row p{margin:8px 0;color:var(--muted);white-space:normal;overflow-wrap:anywhere}.support-thread{display:grid;gap:10px;margin:14px 0}.support-message{max-width:88%;padding:12px 14px;border:1px solid var(--line);border-radius:16px;background:#211735;white-space:pre-wrap;overflow-wrap:anywhere}.support-message.customer{justify-self:start}.support-message.staff{justify-self:end;background:#322149;border-color:#684c91}.support-message small{display:block;color:var(--muted);margin-bottom:5px}.support-actions{display:flex;flex-wrap:wrap;gap:7px}.site-promo{display:block;margin:14px auto;padding:14px;border:1px solid #6b4a93;border-radius:16px;background:linear-gradient(120deg,#2d1b46,#171126);color:inherit;text-decoration:none}.site-promo img{display:block;width:100%;max-height:180px;object-fit:cover;border-radius:11px;margin-bottom:8px}.site-promo b{color:#f1d59d}.product-badge{display:inline-block;padding:5px 9px;border-radius:999px;background:linear-gradient(110deg,#f14d6b,#b63df5);color:#fff;font-size:12px;font-weight:800}.admin-product-photo{display:block;width:min(100%,128px);height:128px;max-height:128px;object-fit:contain;margin:8px auto;border-radius:12px;background:#100d18;border:1px solid var(--line)}.admin-product-photo+input{max-width:100%}.support-fab{animation:supportPulse 3s ease-in-out infinite}@keyframes supportPulse{50%{box-shadow:0 0 18px #9b65ff99}}body.staff-mode .bottom{display:none}body.staff-mode #gameFab,body.staff-mode #supportFab{display:none}body.staff-mode{padding-bottom:28px}#staffPanel button,#ownerPanel button{min-height:44px}@media(max-width:380px){.cart-row{grid-template-columns:54px minmax(0,1fr);gap:8px}.cart-photo{width:54px;height:54px}.cart-price{grid-column:2}.bottom{padding-left:8px;padding-right:8px;gap:4px}.support-search{grid-template-columns:minmax(0,1fr) auto}.support-search button[type=button]{grid-column:1/-1}}
 </style><style>.sale-price{color:#ff536b!important}.sale-price del{color:#b8accb;font-size:.8em}.product-photo{width:min(100%,260px);height:min(80vw,260px);aspect-ratio:1/1;background:#100d18;margin-left:auto;margin-right:auto}.product-photo img{object-fit:contain}.cart-row{display:grid;grid-template-columns:56px minmax(0,1fr);gap:10px;align-items:center}.cart-row .cart-photo{width:56px;height:56px;min-width:56px;flex:0 0 56px;margin:0;border-radius:10px}.cart-row .cart-info{min-width:0}.cart-row .cart-price{grid-column:2}.product-dialog{position:fixed;inset:0;z-index:1200;background:#100b20;overflow-y:auto;padding:0}.product-detail{width:100%;min-height:100dvh;border:0;border-radius:0;padding:calc(12px + env(safe-area-inset-top)) 18px calc(18px + env(safe-area-inset-bottom));overflow:visible;animation:rise .22s ease-out}.detail-photo{display:block;width:min(82vw,34vh,460px);height:min(82vw,34vh,460px);aspect-ratio:1/1;max-height:34vh;object-fit:contain;border-radius:18px;background:#100d18;margin:8px auto}.dialog-close{position:sticky;top:8px;float:right;z-index:2;width:44px!important;height:44px;padding:8px!important;border-radius:50%}.product-detail h2{clear:both;font-size:22px;margin:8px 0}.product-detail .price{font-size:22px}.product-detail button{min-height:44px;margin-top:8px}.detail-quantity{display:flex;align-items:center;justify-content:center;gap:18px;margin:10px 0}.detail-quantity button{width:48px!important;height:48px;padding:6px;font-size:22px}</style><style>
 .game-fab{position:fixed;left:16px;bottom:calc(82px + env(safe-area-inset-bottom));z-index:5;width:52px;height:52px;padding:0;border-radius:50%;font-size:23px;background:linear-gradient(140deg,#6846cb,#a669ff);box-shadow:0 6px 24px #8856ff70;animation:supportPulse 3s ease-in-out infinite}.game-overlay{display:none;position:fixed;inset:0;z-index:1300;background:radial-gradient(ellipse at top,#30204e,#100b20 72%);padding:calc(12px + env(safe-area-inset-top)) 16px calc(14px + env(safe-area-inset-bottom));flex-direction:column;overflow:hidden}.game-overlay.open{display:flex}.game-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.game-top h2{margin:4px 0;font-size:20px}.game-close{width:42px;height:42px;padding:5px;border-radius:50%}.game-hud{display:flex;justify-content:space-between;gap:8px;margin:12px 0}.game-hud span{border:1px solid var(--line);border-radius:13px;padding:8px 12px;background:#211735;font-weight:700}.game-stage{position:relative;flex:1;min-height:180px;border:1px solid #6844a1;border-radius:22px;overflow:hidden;background:linear-gradient(#151026,#241638);touch-action:none;box-shadow:inset 0 0 32px #9b65ff18}.game-stage canvas{display:block;width:100%;height:100%;touch-action:none}.game-card{margin:auto;width:min(100%,430px);padding:20px;border:1px solid #604389;border-radius:22px;background:#1b1430eF;text-align:center;box-shadow:0 14px 50px #0006}.game-card h3{font-size:23px;margin:2px 0 8px}.game-card p{color:var(--muted);line-height:1.5}.game-start{width:100%;font-weight:800}.game-result{position:absolute;inset:0;display:grid;place-items:center;padding:18px;background:#100b20c9;backdrop-filter:blur(7px)}.game-tip{text-align:center;color:var(--muted);font-size:13px;margin:10px 0 0}.game-overlay .notice{margin:10px 0}
 </style></head><body>
 <header><div class="brand-row"><button id="cloudLogo" class="cloud-logo" aria-label="Cloud Hub" onclick="startSnowfall()"><svg viewBox="0 0 64 44" aria-hidden="true"><path d="M17 37h32a11 11 0 0 0 1-22A18 18 0 0 0 16 19a9 9 0 0 0 1 18Z"/></svg></button><div><h1>Cloud Hub</h1><small>Магазин · каталог · замовлення</small></div></div><button id="webLogout" class="hidden" onclick="webLogout()">Log out</button><div id="snowfallFx"></div></header><main>
 <div id="banners"></div><input id="search" class="search" placeholder="Пошук товарів…"><div id="categories" class="chips"></div><div id="products" class="grid"></div><div id="catalogBanners"></div>
 <section id="cart" class="hidden"></section><section id="orders" class="hidden"></section><section id="favorites" class="hidden"></section><section id="loyaltyPanel" class="hidden panel"></section><section id="supportPanel" class="hidden panel"></section><section id="adminBanners" class="hidden panel"></section><section id="ownerPanel" class="hidden panel"></section><section id="staffPanel" class="hidden panel"></section><div id="status" class="notice hidden"></div>
-</main><button id="gameFab" class="game-fab" aria-label="Mini game Cloud Hub" title="Let us play?">&#127918;</button><button id="supportFab" class="support-fab" aria-label="Чат підтримки" title="Чат підтримки">💬</button><nav class="bottom"><button id="shopBtn" class="primary">Каталог</button><button id="favoritesBtn">Обране</button><button id="loyaltyBtn">Бонуси</button><button id="cartBtn">Кошик <span id="cartCount">0</span></button><button id="ordersBtn">Замовлення</button></nav>
-<div id="gameOverlay" class="game-overlay" aria-hidden="true"><div class="game-top"><div><h2>&#9729;&#65039; &#x0425;&#x043C;&#x0430;&#x0440;&#x043E;&#x043B;&#x043E;&#x0432;</h2><small>&#x041B;&#x043E;&#x0432;&#x0438;&#x0020;&#x0441;&#x044F;&#x0439;&#x0432;&#x043E;&#x002C;&#x0020;&#x0443;&#x043D;&#x0438;&#x043A;&#x0430;&#x0439;&#x0020;&#x043F;&#x0435;&#x0440;&#x0435;&#x0448;&#x043A;&#x043E;&#x0434;</small></div><button id="gameClose" class="game-close" aria-label="&#x0417;&#x0430;&#x043A;&#x0440;&#x0438;&#x0442;&#x0438;&#x0020;&#x0433;&#x0440;&#x0443;">&#10005;</button></div><div class="game-hud"><span>&#10024; <b id="gameScore">0</b></span><span>&#10084;&#65039; <b id="gameLives">3</b></span><span>&#9201; <b id="gameTime">45</b></span></div><div id="gameStage" class="game-stage"><canvas id="gameCanvas"></canvas><div id="gameResult" class="game-result"><div class="game-card"><h3 id="gameTitle">&#x0425;&#x043C;&#x0430;&#x0440;&#x043E;&#x043B;&#x043E;&#x0432;</h3><p id="gameMessage">&#x041B;&#x043E;&#x0432;&#x0438;&#x0020;&#x0441;&#x0432;&#x0456;&#x0442;&#x043B;&#x0456;&#x0020;&#x0445;&#x043C;&#x0430;&#x0440;&#x0438;&#x043D;&#x043A;&#x0438;&#x0020;&#x043F;&#x0430;&#x043B;&#x044C;&#x0446;&#x0435;&#x043C;&#x0020;&#x0430;&#x0431;&#x043E;&#x0020;&#x043C;&#x0438;&#x0448;&#x043A;&#x043E;&#x044E;&#x002E;&#x0020;&#x0427;&#x0435;&#x0440;&#x0432;&#x043E;&#x043D;&#x0456;&#x0020;&#x0456;&#x0441;&#x043A;&#x0440;&#x0438;&#x0020;&#x0437;&#x0430;&#x0431;&#x0438;&#x0440;&#x0430;&#x044E;&#x0442;&#x044C;&#x0020;&#x0436;&#x0438;&#x0442;&#x0442;&#x044F;&#x002E;&#x0020;&#x041E;&#x0447;&#x043A;&#x0438;&#x0020;&#x0442;&#x0430;&#x0020;&#x0440;&#x0435;&#x043A;&#x043E;&#x0440;&#x0434;&#x0020;&#x2014;&#x0020;&#x043B;&#x0438;&#x0448;&#x0435;&#x0020;&#x0434;&#x043B;&#x044F;&#x0020;&#x0440;&#x043E;&#x0437;&#x0432;&#x0430;&#x0433;&#x0438;&#x002C;&#x0020;&#x0431;&#x0435;&#x0437;&#x0020;&#x043E;&#x0431;&#x043C;&#x0456;&#x043D;&#x0443;&#x0020;&#x043D;&#x0430;&#x0020;&#x0433;&#x0440;&#x043E;&#x0448;&#x0456;&#x0020;&#x0447;&#x0438;&#x0020;&#x0442;&#x043E;&#x0432;&#x0430;&#x0440;&#x0438;&#x002E;</p><div id="gameProfile" class="notice">&#x0417;&#x0430;&#x0432;&#x0430;&#x043D;&#x0442;&#x0430;&#x0436;&#x0443;&#x044E;&#x0020;&#x0442;&#x0432;&#x0456;&#x0439;&#x0020;&#x0440;&#x0430;&#x0445;&#x0443;&#x043D;&#x043E;&#x043A;&#x2026;</div><button id="gameStart" class="primary game-start">&#x041F;&#x043E;&#x0447;&#x0430;&#x0442;&#x0438;&#x0020;&#x0433;&#x0440;&#x0443;</button></div></div></div><p class="game-tip">&#x0420;&#x0443;&#x0445;&#x0430;&#x0439;&#x0020;&#x043A;&#x043E;&#x0448;&#x0438;&#x043A;&#x0020;&#x0443;&#x043D;&#x0438;&#x0437;&#x0443;&#x0020;&#x0435;&#x043A;&#x0440;&#x0430;&#x043D;&#x0430;&#x0020;&#x00B7;&#x0020;&#x0442;&#x0440;&#x0438;&#x0020;&#x0437;&#x0456;&#x0442;&#x043A;&#x043D;&#x0435;&#x043D;&#x043D;&#x044F;&#x0020;&#x2014;&#x0020;&#x043F;&#x0440;&#x043E;&#x0433;&#x0440;&#x0430;&#x0448;</p></div>
+</main><button id="gameFab" class="game-fab" aria-label="Mini game Cloud Hub" title="Let us play?">🎮</button><button id="supportFab" class="support-fab" aria-label="Чат підтримки" title="Чат підтримки">💬</button><nav class="bottom"><button id="shopBtn" class="primary">Каталог</button><button id="favoritesBtn">Обране</button><button id="loyaltyBtn">Бонуси</button><button id="cartBtn">Кошик <span id="cartCount">0</span></button><button id="ordersBtn">Замовлення</button></nav>
+<div id="gameOverlay" class="game-overlay" aria-hidden="true"><div class="game-top"><div><h2>☁️ &#x0425;&#x043C;&#x0430;&#x0440;&#x043E;&#x043B;&#x043E;&#x0432;</h2><small>&#x041B;&#x043E;&#x0432;&#x0438;&#x0020;&#x0441;&#x044F;&#x0439;&#x0432;&#x043E;&#x002C;&#x0020;&#x0443;&#x043D;&#x0438;&#x043A;&#x0430;&#x0439;&#x0020;&#x043F;&#x0435;&#x0440;&#x0435;&#x0448;&#x043A;&#x043E;&#x0434;</small></div><button id="gameClose" class="game-close" aria-label="&#x0417;&#x0430;&#x043A;&#x0440;&#x0438;&#x0442;&#x0438;&#x0020;&#x0433;&#x0440;&#x0443;">✕</button></div><div class="game-hud"><span>✨ <b id="gameScore">0</b></span><span>❤️ <b id="gameLives">3</b></span><span>⏱ <b id="gameTime">45</b></span></div><div id="gameStage" class="game-stage"><canvas id="gameCanvas"></canvas><div id="gameResult" class="game-result"><div class="game-card"><h3 id="gameTitle">&#x0425;&#x043C;&#x0430;&#x0440;&#x043E;&#x043B;&#x043E;&#x0432;</h3><p id="gameMessage">&#x041B;&#x043E;&#x0432;&#x0438;&#x0020;&#x0441;&#x0432;&#x0456;&#x0442;&#x043B;&#x0456;&#x0020;&#x0445;&#x043C;&#x0430;&#x0440;&#x0438;&#x043D;&#x043A;&#x0438;&#x0020;&#x043F;&#x0430;&#x043B;&#x044C;&#x0446;&#x0435;&#x043C;&#x0020;&#x0430;&#x0431;&#x043E;&#x0020;&#x043C;&#x0438;&#x0448;&#x043A;&#x043E;&#x044E;&#x002E;&#x0020;&#x0427;&#x0435;&#x0440;&#x0432;&#x043E;&#x043D;&#x0456;&#x0020;&#x0456;&#x0441;&#x043A;&#x0440;&#x0438;&#x0020;&#x0437;&#x0430;&#x0431;&#x0438;&#x0440;&#x0430;&#x044E;&#x0442;&#x044C;&#x0020;&#x0436;&#x0438;&#x0442;&#x0442;&#x044F;&#x002E;&#x0020;&#x041E;&#x0447;&#x043A;&#x0438;&#x0020;&#x0442;&#x0430;&#x0020;&#x0440;&#x0435;&#x043A;&#x043E;&#x0440;&#x0434;&#x0020;&#x2014;&#x0020;&#x043B;&#x0438;&#x0448;&#x0435;&#x0020;&#x0434;&#x043B;&#x044F;&#x0020;&#x0440;&#x043E;&#x0437;&#x0432;&#x0430;&#x0433;&#x0438;&#x002C;&#x0020;&#x0431;&#x0435;&#x0437;&#x0020;&#x043E;&#x0431;&#x043C;&#x0456;&#x043D;&#x0443;&#x0020;&#x043D;&#x0430;&#x0020;&#x0433;&#x0440;&#x043E;&#x0448;&#x0456;&#x0020;&#x0447;&#x0438;&#x0020;&#x0442;&#x043E;&#x0432;&#x0430;&#x0440;&#x0438;&#x002E;</p><div id="gameProfile" class="notice">&#x0417;&#x0430;&#x0432;&#x0430;&#x043D;&#x0442;&#x0430;&#x0436;&#x0443;&#x044E;&#x0020;&#x0442;&#x0432;&#x0456;&#x0439;&#x0020;&#x0440;&#x0430;&#x0445;&#x0443;&#x043D;&#x043E;&#x043A;&#x2026;</div><button id="gameStart" class="primary game-start">&#x041F;&#x043E;&#x0447;&#x0430;&#x0442;&#x0438;&#x0020;&#x0433;&#x0440;&#x0443;</button></div></div></div><p class="game-tip">&#x0420;&#x0443;&#x0445;&#x0430;&#x0439;&#x0020;&#x043A;&#x043E;&#x0448;&#x0438;&#x043A;&#x0020;&#x0443;&#x043D;&#x0438;&#x0437;&#x0443;&#x0020;&#x0435;&#x043A;&#x0440;&#x0430;&#x043D;&#x0430;&#x0020;&#x00B7;&#x0020;&#x0442;&#x0440;&#x0438;&#x0020;&#x0437;&#x0456;&#x0442;&#x043A;&#x043D;&#x0435;&#x043D;&#x043D;&#x044F;&#x0020;&#x2014;&#x0020;&#x043F;&#x0440;&#x043E;&#x0433;&#x0440;&#x0430;&#x0448;</p></div>
 <script>
 const tg=window.Telegram?.WebApp;tg?.ready();tg?.expand();
 const headers={'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''};const inTelegram=Boolean(tg?.initData);let authenticated=inTelegram,webSession=false;const GUEST_CART_KEY='cloudhub.guest-cart.v1';let guestCart=[];try{guestCart=JSON.parse(localStorage.getItem(GUEST_CART_KEY)||'[]');if(!Array.isArray(guestCart))guestCart=[]}catch(e){guestCart=[]}let category=null,products=[],popularProductIds=new Set(),cart=[],favorites=new Set(),canManageBanners=false,canManageOwner=false,canManageCatalog=false,canEditCatalog=false,canViewCustomers=false,canViewOrders=false,canUpdateOrders=false,canViewSupport=false,canReplySupport=false,canManageInventory=false,canConfirmInventory=false,banners=[],npCityRef="",npWarehouseRef="",checkoutKey="",photoObserver=null;const photoUrls=new Map(),photoRequests=new Map();
 const $=id=>document.getElementById(id);function money(v){return new Intl.NumberFormat('uk-UA',{maximumFractionDigits:2}).format(Number(v||0))+' грн'}
 let toastTimer;function msg(t){let el=$('status');el.textContent=t;el.classList.remove('hidden');el.setAttribute('role','status');el.style.cssText='position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:1000;width:max-content;max-width:calc(100vw - 32px);padding:13px 18px;border:1px solid #a879ff;border-radius:18px;background:rgba(39,25,65,.97);box-shadow:0 8px 28px #0008;color:#fff;text-align:center;font-weight:700;animation:toastIn .22s ease-out';clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.add('hidden'),2400)}
-const apiReadCache=new Map(),apiReadPending=new Map();async function api(path,opts={}){let method=(opts.method||'GET').toUpperCase(),key=method+':'+path;if(method==='GET'){let cached=apiReadCache.get(key);if(cached&&Date.now()-cached.at<5000)return cached.data;if(apiReadPending.has(key))return apiReadPending.get(key)}let work=(async()=>{let r=await fetch(path,{...opts,headers:{...headers,...(opts.headers||{})},credentials:'same-origin'});let d=await r.json();if(!r.ok)throw Error(d.error||'Помилка запиту');if(method==='GET')apiReadCache.set(key,{at:Date.now(),data:d});else apiReadCache.clear();return d})();if(method==='GET')apiReadPending.set(key,work);try{return await work}finally{if(method==='GET')apiReadPending.delete(key)}}
+const apiReadCache=new Map(),apiReadОчікують=new Map();async function api(path,opts={}){let method=(opts.method||'GET').toUpperCase(),key=method+':'+path;if(method==='GET'){let cached=apiReadCache.get(key);if(cached&&Date.now()-cached.at<5000)return cached.data;if(apiReadОчікують.has(key))return apiReadОчікують.get(key)}let work=(async()=>{let r=await fetch(path,{...opts,headers:{...headers,...(opts.headers||{})},credentials:'same-origin'});let d=await r.json();if(!r.ok)throw Error(d.error||'Помилка запиту');if(method==='GET')apiReadCache.set(key,{at:Date.now(),data:d});else apiReadCache.clear();return d})();if(method==='GET')apiReadОчікують.set(key,work);try{return await work}finally{if(method==='GET')apiReadОчікують.delete(key)}}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function setActiveTab(id){document.querySelectorAll('.bottom button').forEach(b=>{b.classList.toggle('active',b.id===id);b.classList.toggle('primary',b.id===id)});}
 const VISITOR_KEY='cloudhub.visitor.v1';let visitorId=localStorage.getItem(VISITOR_KEY);if(!visitorId){visitorId=(crypto?.randomUUID?crypto.randomUUID().replace(/-/g,''):Array.from({length:32},()=>Math.floor(Math.random()*16).toString(16)).join(''));localStorage.setItem(VISITOR_KEY,visitorId)}function visitSource(){try{let p=new URLSearchParams(location.search),t=tg?.initDataUnsafe?.start_param;if(t)return t.startsWith('ref_')?'telegram_referral':'telegram_deep_link';let first=sessionStorage.getItem('cloudhub.first.source.v1');if(first)return first;let source=p.get('utm_source')||p.get('source')||(document.referrer&&new URL(document.referrer).host!==location.host?new URL(document.referrer).hostname:'direct');sessionStorage.setItem('cloudhub.first.source.v1',source);return source}catch(e){return 'direct'}}function track(eventType,eventRef=''){fetch('/api/miniapp/analytics/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({visitor_id:visitorId,event_type:eventType,event_ref:String(eventRef||'').slice(0,80)}),keepalive:true}).catch(()=>{})}
@@ -10982,19 +11045,20 @@ function hideSections(){['cart','orders','favorites','loyaltyPanel','supportPane
 function bannerMarkup(slot){return banners.filter(b=>b.active&&(b.placement||'home_top')===slot).map(b=>`<a class="banner" href="${esc(b.link_url||'#')}" ${b.link_url?'target="_blank" rel="noopener"':''}>${b.image_url?`<img src="${esc(b.image_url)}" alt="${esc(b.title)}">`:''}<div><b>${esc(b.title)}</b><p>${esc(b.body||'')}</p></div></a>`).join('')}
 function renderBanners(){ $('banners').innerHTML=bannerMarkup('home_top');$('catalogBanners').innerHTML=bannerMarkup('catalog_bottom'); }
 function productCards(arr){return arr.map(p=>{let low=Number(p.low_stock_threshold)>0&&Number(p.available)<=Number(p.low_stock_threshold);let badge=p.storefront_badge|| (low?'⚠ Мало залишилось':'');let sale=Number(p.compare_at_price)>Number(p.price);let photo=p.photo_id?`<img src="/api/miniapp/products/${Number(p.photo_id)}/photo" alt="${esc(p.name)}" loading="lazy" decoding="async" onerror="this.hidden=true;this.parentElement.classList.add('photo-missing')">`:'<span>Фото поки немає</span>';return `<article class="card">${badge?`<span class="product-badge">${esc(badge)}</span>`:''}<div class="product-photo loaded">${photo}</div><small>${esc(p.brand||'')}</small><h3>${esc(p.name)} ${esc(p.variant_name||'')}</h3><small>SKU: ${esc(p.sku)} · В наявності: ${p.available}</small><div class="price ${sale?'sale-price':''}">${sale?`<del>${money(p.compare_at_price)}</del> `:''}${money(p.price)}</div><button onclick="toggleFavorite(${p.product_id})">${favorites.has(Number(p.product_id))?'♥ Обране':'♡ В обране'}</button><button onclick="openProduct(${p.variant_id})">Детальніше</button><button onclick="add(${p.variant_id})">Додати в кошик</button></article>`}).join('')}
-let detailVariantId=0,detailQuantity=1;function openProduct(variantId){let p=products.find(x=>Number(x.variant_id)===Number(variantId));if(!p)return;track('product_view',p.product_id);detailVariantId=Number(variantId);detailQuantity=1;document.getElementById('productDetailOverlay')?.remove();let sale=Number(p.compare_at_price)>Number(p.price);let old=sale?`<del>${money(p.compare_at_price)}</del> `:'';let overlay=document.createElement('div');overlay.id='productDetailOverlay';overlay.className='product-dialog';overlay.innerHTML=`<article class="card product-detail"><button class="dialog-close" aria-label="Закрити" onclick="closeProductDetail()">✕</button>${p.photo_id?`<img class="detail-photo" src="/api/miniapp/products/${Number(p.photo_id)}/photo" alt="${esc(p.name)}">`:'<div class="detail-photo">Фото товару поки немає</div>'}<h2>${esc(p.name)} ${esc(p.variant_name||'')}</h2><small>${esc(p.brand||'')} · SKU ${esc(p.sku)} · В наявності ${Number(p.available)}</small><div class="price ${sale?'sale-price':''}">${old}${money(p.price)}</div><p>${esc(p.description||'Опис товару уточнюйте у підтримки.')}</p><div class="detail-quantity"><button aria-label="Мінус" onclick="stepProductDetail(-1)">−</button><b id="detailQty">1</b><button aria-label="Плюс" onclick="stepProductDetail(1)">+</button></div><button onclick="toggleFavorite(${p.product_id})">♡ В обране</button><button class="primary" onclick="addDetailToCart()">Додати до кошика</button></article>`;overlay.addEventListener('click',e=>{if(e.target===overlay)closeProductDetail()});document.body.append(overlay);document.body.style.overflow='hidden'}function stepProductDetail(delta){let p=products.find(x=>Number(x.variant_id)===detailVariantId);if(!p)return;detailQuantity=Math.max(1,Math.min(Number(p.available)||1,detailQuantity+delta));document.getElementById('detailQty').textContent=detailQuantity}async function addDetailToCart(){for(let i=0;i<detailQuantity;i++)await add(detailVariantId);closeProductDetail()}function closeProductDetail(){document.getElementById('productDetailOverlay')?.remove();document.body.style.overflow=''}
+let detailVariantId=0,detailQuantity=1;function openProduct(variantId){let p=products.find(x=>Number(x.variant_id)===Number(variantId));if(!p)return;track('product_view',p.product_id);detailVariantId=Number(variantId);detailQuantity=1;document.getElementById('productDetailOverlay')?.remove();let sale=Number(p.compare_at_price)>Number(p.price);let old=sale?`<del>${money(p.compare_at_price)}</del> `:'';let overlay=document.createElement('div');overlay.id='productDetailOverlay';overlay.className='product-dialog';overlay.innerHTML=`<article class="card product-detail"><button class="dialog-close" aria-label="Закрити" onclick="closeProductDetail()">✕</button>${p.photo_id?`<img class="detail-photo" src="/api/miniapp/products/${Number(p.photo_id)}/photo" alt="${esc(p.name)}">`:'<div class="detail-photo">Фото товару поки немає</div>'}<h2>${esc(p.name)} ${esc(p.variant_name||'')}</h2><small>${esc(p.brand||'')} · SKU ${esc(p.sku)} · В наявності ${Number(p.available)}</small><div class="price ${sale?'sale-price':''}">${old}${money(p.price)}</div><p>${esc(p.description||'Опис товару уточнюйте у підтримки.')}</p><div class="detail-quantity"><button aria-label="Мінус" onclick="stepProductDetail(-1)">−</button><b id="detailQty">1</b><button aria-label="Плюс" onclick="stepProductDetail(1)">+</button></div><button onclick="toggleFavorite(${p.product_id})">♡ В обране</button>${!inTelegram?`<button class="primary" onclick="quickOrder(${p.variant_id})">Купити в 1 клік</button>`:""}<button class="primary" onclick="addDetailToCart()">Додати до кошика</button></article>`;overlay.addEventListener('click',e=>{if(e.target===overlay)closeProductDetail()});document.body.append(overlay);document.body.style.overflow='hidden'}function quickOrder(variantId){let p=products.find(x=>Number(x.variant_id)===Number(variantId));if(!p)return;let card=document.querySelector('#productDetailOverlay .product-detail');card.innerHTML=`<button class="dialog-close" onclick="closeProductDetail()" aria-label="Закрити">✕</button><h2>Купити в 1 клік</h2><p>${esc(p.name)} ${esc(p.variant_name||'')} ? ${money(p.price)}</p><label>Телефон або Telegram<input id="quickContact" placeholder="+380... or @username" autocomplete="tel"></label><label>Ім’я (необов’язко)<input id="quickName" maxlength="120"></label><label>Коментар (необов’язко)<textarea id="quickComment" maxlength="1000" rows="3"></textarea></label><label><input id="quickAge" type="checkbox"> Мені вже є 18 років</label><label><input id="quickPrivacy" type="checkbox"> Згоден/на на обробку контактних даних</label><button class="primary" onclick="submitQuickOrder(${Number(variantId)})">Надіслати запит</button><button onclick="openProduct(${Number(variantId)})">Назад до товару</button>`}async function submitQuickOrder(variantId){let contact=$('#quickContact').value.trim();if(!contact)return msg('Вкажіть номер телефону або Telegram.');if(!$('#quickAge').checked)return msg('Підтвердьте, що вам ё8+.');if(!$('#quickPrivacy').checked)return msg('Потрібна згода на обробку даних.');try{let r=await fetch('/api/site/quick-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({variant_id:variantId,contact,name:$('#quickName').value,comment:$('#quickComment').value,age_confirmed:true,privacy_accepted:true})}),d=await r.json();if(!r.ok)throw Error(d.error||'Не вдалося надіслати запит');document.querySelector('#productDetailOverlay .product-detail').innerHTML=`<h2>Дякуємо! Запит прийнято</h2><p>${esc(d.request_number)}</p><p>Команда зв’яжеться з вами.</p><button class="primary" onclick="closeProductDetail()">Готово</button>`}catch(e){msg(e.message)}}
+function stepProductDetail(delta){let p=products.find(x=>Number(x.variant_id)===detailVariantId);if(!p)return;detailQuantity=Math.max(1,Math.min(Number(p.available)||1,detailQuantity+delta));document.getElementById('detailQty').textContent=detailQuantity}async function addDetailToCart(){for(let i=0;i<detailQuantity;i++)await add(detailVariantId);closeProductDetail()}function closeProductDetail(){document.getElementById('productDetailOverlay')?.remove();document.body.style.overflow=''}
 function loadOnePhoto(img){let id=img.dataset.photoId,parent=img.parentElement;if(photoUrls.has(id)){img.onload=()=>parent.classList.add('loaded');img.onerror=()=>{parent.classList.remove('loaded');parent.classList.add('photo-missing');parent.innerHTML='<span>Фото тимчасово недоступне</span>'};img.src=photoUrls.get(id);parent.classList.add('loaded');return}let request=photoRequests.get(id);if(!request){request=fetch(`/api/miniapp/products/${encodeURIComponent(id)}/photo`,{headers:{'X-Telegram-Init-Data':tg?.initData||''}}).then(r=>r.ok?r.blob():null).then(blob=>{if(!blob)return null;let url=URL.createObjectURL(blob);photoUrls.set(id,url);return url}).catch(()=>null);photoRequests.set(id,request)}request.then(url=>{if(!img.isConnected)return;if(!url){parent.classList.remove('loaded');parent.classList.add('photo-missing');parent.innerHTML='<span>Фото тимчасово недоступне</span>';return}img.onload=()=>parent.classList.add('loaded');img.onerror=()=>{parent.classList.remove('loaded');parent.classList.add('photo-missing');parent.innerHTML='<span>Фото тимчасово недоступне</span>'};img.src=url;if(img.complete&&img.naturalWidth)parent.classList.add('loaded')})}
 function loadProductPhotos(){if(photoObserver)photoObserver.disconnect();const images=[...document.querySelectorAll('img[data-photo-id]')];if(!('IntersectionObserver'in window)){images.forEach(loadOnePhoto);return}photoObserver=new IntersectionObserver(entries=>{for(const entry of entries){if(!entry.isIntersecting)continue;photoObserver.unobserve(entry.target);loadOnePhoto(entry.target)}},{rootMargin:'200px'});images.forEach(img=>photoObserver.observe(img))}
 function editDistance(a,b){if(Math.abs(a.length-b.length)>2)return 99;let prev=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){let curr=[i],rowMin=i;for(let j=1;j<=b.length;j++){let v=Math.min(curr[j-1]+1,prev[j]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));curr[j]=v;rowMin=Math.min(rowMin,v)}if(rowMin>2)return 99;prev=curr}return prev[b.length]}
 function productMatches(p,q){if(!q)return true;let fields=`${p.name} ${p.brand||''} ${p.sku||''} ${p.variant_name||''}`.toLowerCase();if(fields.includes(q))return true;let needles=q.split(/\s+/).filter(Boolean),words=fields.split(/[^\p{L}\p{N}]+/u).filter(Boolean);return needles.every(n=>{if(words.some(w=>w.includes(n)))return true;if(n.length<4)return false;let max=n.length>=8?2:1;return words.some(w=>Math.abs(w.length-n.length)<=max&&editDistance(n,w)<=max)})}
 function renderProducts(){setActiveTab('shopBtn');hideSections();let q=$('search').value.toLowerCase().trim();let arr=products.filter(p=>(!category||(category===0?popularProductIds.has(Number(p.product_id)):(p.storefront_category_id??p.category_id)===category))&&productMatches(p,q));let empty=q?'Нічого не знайдено. Перевірте написання або пошукайте коротше.':category===0?'Популярні товари ще не мають підтверджених продажів.':category?'У цій категорії зараз немає товарів у наявності.':'Каталог наразі порожній.';$('products').innerHTML=productCards(arr)||`<div class="notice">${empty}</div>`}
-async function load(){try{let d=await api('/api/miniapp/bootstrap');track('visit',visitSource());authenticated=Boolean(d.authenticated||inTelegram);webSession=Boolean(d.web_session);$("webLogout").classList.toggle("hidden",!webSession);products=d.products;popularProductIds=new Set((d.popular_product_ids||[]).map(Number));favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;canViewSupport=d.can_view_support;canReplySupport=d.can_reply_support;canManageInventory=Boolean(d.can_manage_inventory);canConfirmInventory=Boolean(d.can_confirm_inventory);let staffMode=canManageOwner||canManageCatalog||canEditCatalog||canViewCustomers||canViewOrders||canViewSupport||canManageInventory||canConfirmInventory||canManageBanners;document.body.classList.toggle('staff-mode',staffMode);banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі товари</button>'+(popularProductIds.size?'<button class="chip" onclick="setCat(0,this)">Популярне</button>':'')+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();let directVariant=new URLSearchParams(location.search).get('variant');if(!directVariant){let startParam=tg?.initDataUnsafe?.start_param||'';let match=startParam.match(/^(?:product|variant)_(\d+)$/);if(match)directVariant=match[1]}if(directVariant&&products.some(p=>Number(p.variant_id)===Number(directVariant)))openProduct(Number(directVariant));if(webSession&&guestCart.length){try{await Promise.all(guestCart.map(line=>api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:line.variant_id,quantity:line.quantity})})));guestCart=[];localStorage.removeItem(GUEST_CART_KEY)}catch(e){msg('Guest cart sync failed; it remains saved here.')}}await loadCart();if(canManageBanners)renderBannerAdmin();if(canManageOwner){renderOwnerEntry();renderAnalyticsEntry()}if(staffMode){renderStaffEntry();loadStaffTools()}if(canManageInventory)renderInventoryEntry()}catch(e){msg(e.message)}}
+async function load(){try{let d=await api('/api/miniapp/bootstrap');track('visit',visitSource());authenticated=Boolean(d.authenticated||inTelegram);webSession=Boolean(d.web_session);$("webLogout").classList.toggle("hidden",!webSession);products=d.products;popularProductIds=new Set((d.popular_product_ids||[]).map(Number));favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;canViewSupport=d.can_view_support;canReplySupport=d.can_reply_support;canManageInventory=Boolean(d.can_manage_inventory);canConfirmInventory=Boolean(d.can_confirm_inventory);let staffMode=canManageOwner||canManageCatalog||canEditCatalog||canViewCustomers||canViewOrders||canViewSupport||canManageInventory||canConfirmInventory||canManageBanners;document.body.classList.toggle('staff-mode',staffMode);banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі товари</button>'+(popularProductIds.size?'<button class="chip" onclick="setCat(0,this)">Популярне</button>':'')+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();let directVariant=new URLSearchParams(location.search).get('variant');if(!directVariant){let startParam=tg?.initDataUnsafe?.start_param||'';let match=startParam.match(/^(?:product|variant)_(\d+)$/);if(match)directVariant=match[1]}if(directVariant&&products.some(p=>Number(p.variant_id)===Number(directVariant)))openProduct(Number(directVariant));if(webSession&&guestCart.length){try{await Promise.all(guestCart.map(line=>api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:line.variant_id,quantity:line.quantity})})));guestCart=[];localStorage.removeItem(GUEST_CART_KEY)}catch(e){msg('Guest cart sync failed; it remains saved here.')}}await loadCart();if(new URLSearchParams(location.search).get('support')==='1')openSupport();if(canManageBanners)renderBannerAdmin();if(canManageOwner){renderOwnerEntry();renderAnalyticsEntry()}if(staffMode){renderStaffEntry();loadStaffTools()}if(canManageInventory)renderInventoryEntry()}catch(e){msg(e.message)}}
 async function toggleFavorite(productId){if(!authenticated){msg('Щоб зберегти обране, увійдіть через Telegram.');return}try{let add=!favorites.has(Number(productId));let d=await api('/api/miniapp/favorites',{method:'POST',body:JSON.stringify({product_id:productId,active:add})});favorites=new Set((d.product_ids||[]).map(Number));msg(add?'Додано в обране ♥':'Прибрано з обраного');if(!$('favorites').classList.contains('hidden'))await loadFavorites();else renderProducts()}catch(e){msg(e.message)}}
 async function loadFavorites(){track('favorites_view');setActiveTab('favoritesBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('favorites').classList.remove('hidden');if(!authenticated){$('favorites').innerHTML='<h2>Обране</h2>'+telegramPrompt();return}try{if(!favorites.size){$('favorites').innerHTML='<h2>Обране</h2><div class="notice">В обраному поки немає товарів</div>';return}let items=products.filter(p=>favorites.has(Number(p.product_id)));$('favorites').innerHTML='<h2>Обране</h2>'+ (items.length?productCards(items):'<div class="notice">В обраному поки немає доступних товарів</div>')}catch(e){$('favorites').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function loadLoyalty(){track('loyalty_view');setActiveTab('loyaltyBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('loyaltyPanel').classList.remove('hidden');if(!authenticated){$('loyaltyPanel').innerHTML='<h2>Бонуси</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/profile');let share=d.referral_link?`<a class="banner" href="https://t.me/share/url?url=${encodeURIComponent(d.referral_link)}&text=${encodeURIComponent('Приєднуйся до Cloud Hub за моїм посиланням')}" target="_blank" rel="noopener"><div><b>Запросити друга</b><p>Після першого отриманого замовлення ви обоє отримаєте по 50 бонусів. Код: ${esc(d.referral_code)}</p></div></a>`:`<div class="notice">Код запрошення: ${esc(d.referral_code||'')}. Якщо посилання ще не готове, поділіться кодом із другом.</div>`;$('loyaltyPanel').innerHTML=`<h2>Бонусна карта</h2><div class="grid"><div class="card"><small>Доступно</small><h3>${money(d.bonus_available||0)}</h3></div><div class="card"><small>Нарахуємо після отримання</small><h3>${money(d.bonus_pending||0)}</h3></div></div><div class="notice">Картка: <b>${esc(d.loyalty_card_number||'—')}</b><br>1 бонус = 1 грн. Бонусами можна оплатити до 100% вартості товарів.</div>${share}<button onclick="loadOwnerDashboard()" ${canManageOwner?'':'class="hidden"'}>Панель власника</button>`}catch(e){$('loyaltyPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
-async function openSupport(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('supportPanel').classList.remove('hidden');$('supportPanel').innerHTML='<h2>Чат підтримки</h2>';if(!authenticated){$('supportPanel').innerHTML+='<div class="notice">Звернення зберігаються у вашому акаунті Telegram, щоб ми могли відповісти напряму.</div>'+telegramPrompt();return}await loadCustomerSupport()}
-async function loadCustomerSupport(archived=false){try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));let tabs=`<div class="support-tabs"><button class="${!archived?'primary':''}" onclick="loadCustomerSupport(false)">&#1040;&#1082;&#1090;&#1080;&#1074;&#1085;&#1110;</button><button class="${archived?'primary':''}" onclick="loadCustomerSupport(true)">&#1040;&#1088;&#1093;&#1110;&#1074; (${(d.items||[]).length})</button></div>`;let cards=(d.items||[]).map(t=>`<article class="card"><b>&#1047;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1085;&#1103; #${Number(t.id)}</b> ? ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'&#1055;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1072;':'&#1042;&#1080;'} ? ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${t.status==='closed'?'<div class="notice">&#1062;&#1077; &#1079;&#1072;&#1072;&#1088;&#1093;&#1110;&#1074;&#1086;&#1074;&#1072;&#1085;&#1077; &#1079;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1085;&#1103;. &#1044;&#1086;&#1076;&#1072;&#1090;&#1080; &#1087;&#1086;&#1074;&#1110;&#1076;&#1086;&#1084;&#1083;&#1077;&#1085;&#1085;&#1103; &#1085;&#1077;&#1084;&#1086;&#1078;&#1085;&#1072;.</div>':`<textarea id="reply-${Number(t.id)}" maxlength="4000" placeholder="&#1042;&#1072;&#1096;&#1077; &#1087;&#1086;&#1074;&#1110;&#1076;&#1086;&#1084;&#1083;&#1077;&#1085;&#1085;&#1103;"></textarea><button onclick="sendSupportMessage(${Number(t.id)})">&#1042;&#1110;&#1076;&#1087;&#1086;&#1074;&#1110;&#1089;&#1090;&#1080;</button>`}</article>`).join('');let empty='<div class="notice">'+(archived?'&#1040;&#1088;&#1093;&#1110;&#1074; &#1097;&#1077; &#1087;&#1086;&#1088;&#1086;&#1078;&#1085;&#1110;&#1081;.':'&#1053;&#1077;&#1084;&#1072;&#1108; &#1074;&#1110;&#1076;&#1082;&#1088;&#1080;&#1090;&#1080;&#1093; &#1079;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1100;. &#1053;&#1072;&#1087;&#1080;&#1096;&#1110;&#1090;&#1100; &#1085;&#1072;&#1084; ? &#1084;&#1080; &#1076;&#1086;&#1087;&#1086;&#1084;&#1086;&#1078;&#1077;&#1084;&#1086;.')+'</div>';let newForm=!archived?'<div class="card"><h3>&#1053;&#1086;&#1074;&#1077; &#1079;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1085;&#1103;</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="&#1063;&#1080;&#1084; &#1084;&#1086;&#1078;&#1077;&#1084;&#1086; &#1076;&#1086;&#1087;&#1086;&#1084;&#1086;&#1075;&#1090;&#1080;?"></textarea><button class="primary" onclick="sendSupportMessage(0)">&#1053;&#1072;&#1076;&#1110;&#1089;&#1083;&#1072;&#1090;&#1080;</button></div>':'<button class="primary" onclick="loadCustomerSupport(false)">&#1055;&#1086;&#1095;&#1072;&#1090;&#1080; &#1085;&#1086;&#1074;&#1080;&#1081; &#1095;&#1072;&#1090;</button>'; $('supportPanel').innerHTML='<h2>&#1063;&#1072;&#1090; &#1087;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1080;</h2>'+tabs+(cards||empty)+newForm}catch(e){$('supportPanel').innerHTML='<h2>&#1063;&#1072;&#1090; &#1087;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1080;</h2><div class="notice">'+esc(e.message)+'</div>'}}
-async function sendSupportMessage(ticketId){let field=$(ticketId?'reply-'+ticketId:'newSupportMessage'),message=(field?.value||'').trim();if(!message){msg('Напишіть повідомлення');return}try{await api('/api/miniapp/support',{method:'POST',body:JSON.stringify({ticket_id:ticketId,message})});msg('Повідомлення надіслано підтримці');await loadCustomerSupport()}catch(e){msg(e.message)}}
+async function openSupport(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('supportPanel').classList.remove('hidden');$('supportPanel').innerHTML='<h2>Чат підтримки</h2>';if(!authenticated){$('supportPanel').innerHTML+='<div class="notice">Звернення зберігаються у вашому акаунті Telegram, щоб ми могли відповісти напряму.</div>'+telegramPrompt();return}await loadКлієнтSupport()}
+async function loadКлієнтSupport(archived=false){try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));let tabs=`<div class="support-tabs"><button class="${!archived?'primary':''}" onclick="loadКлієнтSupport(false)">Активні</button><button class="${archived?'primary':''}" onclick="loadКлієнтSupport(true)">Архів (${(d.items||[]).length})</button></div>`;let cards=(d.items||[]).map(t=>`<article class="card"><b>Звернення #${Number(t.id)}</b> ? ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Підтримка':'Ви'} ? ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${t.status==='closed'?'<div class="notice">Це заархівоване звернення. Додати повідомлення неможна.</div>':`<textarea id="reply-${Number(t.id)}" maxlength="4000" placeholder="Ваше повідомлення"></textarea><button onclick="sendSupportMessage(${Number(t.id)})">Відповісти</button>`}</article>`).join('');let empty='<div class="notice">'+(archived?'Архів ще порожній.':'Немає відкритих звернень. Напишіть нам ? ми допоможемо.')+'</div>';let newForm=!archived?'<div class="card"><h3>Нове звернення</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="Чим можемо допомогти?"></textarea><button class="primary" onclick="sendSupportMessage(0)">Надіслати</button></div>':'<button class="primary" onclick="loadКлієнтSupport(false)">Почати новий чат</button>'; $('supportPanel').innerHTML='<h2>Чат підтримки</h2>'+tabs+(cards||empty)+newForm}catch(e){$('supportPanel').innerHTML='<h2>Чат підтримки</h2><div class="notice">'+esc(e.message)+'</div>'}}
+async function sendSupportMessage(ticketId){let field=$(ticketId?'reply-'+ticketId:'newSupportMessage'),message=(field?.value||'').trim();if(!message){msg('Напишіть повідомлення');return}try{await api('/api/miniapp/support',{method:'POST',body:JSON.stringify({ticket_id:ticketId,message})});msg('Повідомлення надіслано підтримці');await loadКлієнтSupport()}catch(e){msg(e.message)}}
 function setCat(id,el){track("category_view",id??"all");category=id;document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));el.classList.add('active');renderProducts()}
 function saveGuestCart(){try{localStorage.setItem(GUEST_CART_KEY,JSON.stringify(guestCart))}catch(e){msg('Браузер не дозволив зберегти кошик. Перевірте налаштування приватності.')}}
 function cartCount(){return cart.reduce((n,x)=>n+Number(x.quantity||0),0)}
@@ -11008,9 +11072,9 @@ async function chooseCity(i){let c=(window._npCities||[])[i];if(!c)return;$('npC
 async function suggestBranches(){clearTimeout(branchTimer);branchTimer=setTimeout(async()=>{if(!npCityRef)return;try{let d=await api('/api/miniapp/np/branches?city_ref='+encodeURIComponent(npCityRef));$('branchChoices').innerHTML=(d.items||[]).slice(0,80).map((x,i)=>`<button type="button" onclick="chooseBranch(${i})">${esc(x.name)}</button>`).join('');window._npBranches=d.items||[]}catch(e){$('branchChoices').textContent='Довідник недоступний. Введіть відділення вручну.'}},200)}
 function chooseBranch(i){let b=(window._npBranches||[])[i];if(!b)return;$('npBranch').value=b.name;npWarehouseRef=b.ref;$('branchChoices').innerHTML=''}
 async function checkoutForm(){track("checkout_start");let d=await api('/api/miniapp/profile');checkoutKey=(window.crypto?.randomUUID?crypto.randomUUID():('ch_'+Date.now()+'_'+Math.random().toString(16).slice(2)));$('cart').innerHTML=`<h2>Оформлення замовлення</h2><div class="formgrid"><input id="buyerName" placeholder="Ім’я та прізвище" value="${esc(d.full_name||'')}"><input id="buyerPhone" placeholder="Телефон +380…" value="${esc(d.phone||'')}"><div class="notice">Доступно бонусів: <b>${money(d.bonus_available||0)}</b>. Можна покрити ними до 100% вартості товарів.</div><input id="bonusAmount" type="number" min="0" step="0.01" max="${Number(d.bonus_available||0)}" value="0" placeholder="Списати бонусів"><input id="certificateCode" maxlength="40" placeholder="Сертифікат (за наявності)"><input id="npCity" placeholder="Місто Нової пошти (можна вручну)" autocomplete="off"><div id="cityChoices"></div><input id="npBranch" placeholder="Відділення або поштомат (можна вручну)" autocomplete="off"><div id="branchChoices"></div><small>Якщо номінал сертифіката більший за вартість товарів після бонусів, залишок зарахуємо на бонусний рахунок.</small><small>Можна вибрати місто й відділення з довідника Нової пошти або ввести вручну. Якщо API не працює, замовлення все одно оформлюється.</small><label class="check"><input type="checkbox" id="privacyOk"> Погоджуюся з обробкою даних, необхідних для оформлення та доставки замовлення.</label><button onclick="submitOrder()" class="primary">Підтвердити замовлення</button><button onclick="showCart()">Назад до кошика</button></div>`;$('npCity').addEventListener('input',()=>{npCityRef='';npWarehouseRef='';suggestCities()});$('npBranch').addEventListener('input',()=>{npWarehouseRef='';suggestBranches()})}
-async function submitOrder(){let body={name:$('buyerName').value,phone:$('buyerPhone').value,city:$('npCity').value,branch:$('npBranch').value,city_ref:npCityRef,warehouse_ref:npWarehouseRef,bonus_amount:$('bonusAmount').value,certificate_code:$('certificateCode').value,privacy_accepted:$('privacyOk').checked,idempotency_key:checkoutKey};try{let d=await api('/api/miniapp/checkout',{method:'POST',body:JSON.stringify(body)});$('cart').innerHTML=`<div class="success-wrap"><div class="success-mark"><svg viewBox="0 0 48 48"><path d="M10 25l9 9L38 14"/></svg></div><h2>Дякуємо за замовлення!</h2><div class="thanks">Ваше замовлення успішно оформлено</div><div class="success-order">${esc(d.order_number)}</div><div class="notice"><b>До сплати: ${money(d.grand_total)}</b><br>Нова пошта: ${esc(body.city)} / ${esc(body.branch)}${Number(d.certificate_remainder_bonus||0)>0?`<br>Залишок сертифіката зараховано бонусами: ${money(d.certificate_remainder_bonus)}`:''}<br>ТТН створюється автоматично. Якщо сервіс перевізника тимчасово недоступний, замовлення вже збережене, а ТТН буде оброблена окремо.</div><button class="primary" onclick="loadOrders()">Мої замовлення</button><button onclick="renderProducts()">Повернутися до каталогу</button></div>`;await loadCart()}catch(e){msg(e.message)}}
-async function loadOrders(){track('orders_view');setActiveTab('ordersBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');if(!authenticated){$('orders').innerHTML='<h2>Замовлення</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small>${o.ttn?`<div class="notice">ТТН: <b>${esc(o.ttn)}</b><br>Статус Нової пошти: ${esc(o.tracking_status||'Ще не оновлювався')}<br><small>Оновлено: ${esc(o.tracking_updated_at||'—')}</small><button onclick="refreshTracking('${esc(o.order_number)}')">Оновити статус доставки</button></div>`:''}${o.status_history?.length?`<details><summary>Історія статусів</summary><ul>${o.status_history.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></details>`:''}</div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
-async function refreshTracking(orderNumber){try{let d=await api('/api/miniapp/orders/refresh-tracking',{method:'POST',body:JSON.stringify({order_number:orderNumber})});msg(d.tracking_status||'Статус доставки оновлено');loadOrders()}catch(e){msg(e.message)}}
+async function submitOrder(){let body={name:$('buyerName').value,phone:$('buyerPhone').value,city:$('npCity').value,branch:$('npBranch').value,city_ref:npCityRef,warehouse_ref:npWarehouseRef,bonus_amount:$('bonusAmount').value,certificate_code:$('certificateCode').value,privacy_accepted:$('privacyOk').checked,idempotency_key:checkoutKey};try{let d=await api('/api/miniapp/checkout',{method:'POST',body:JSON.stringify(body)});$('cart').innerHTML=`<div class="success-wrap"><div class="success-mark"><svg viewBox="0 0 48 48"><path d="M10 25l9 9L38 14"/></svg></div><h2>Дякуємо за замовлення!</h2><div class="thanks">Ваше замовлення успішно оформлено</div><div class="success-order">${esc(d.order_number)}</div><div class="notice"><b>До сплати: ${money(d.grand_total)}</b><br>Нова пошта: ${esc(body.city)} / ${esc(body.branch)}${Number(d.certificate_remainder_bonus||0)>0?`<br>Залишок сертифіката зараховано бонусами: ${money(d.certificate_remainder_bonus)}`:''}<br>ТТН створюється автоматично. Якщо сервіс перевізника тимчасово недоступний, замовлення вже збережене, а ТТН буде оброблена окремо.</div><button class="primary" onclick="loadЗамовлення()">Мої замовлення</button><button onclick="renderProducts()">Повернутися до каталогу</button></div>`;await loadCart()}catch(e){msg(e.message)}}
+async function loadЗамовлення(){track('orders_view');setActiveTab('ordersBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');if(!authenticated){$('orders').innerHTML='<h2>Замовлення</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small>${o.ttn?`<div class="notice">ТТН: <b>${esc(o.ttn)}</b><br>Статус Нової пошти: ${esc(o.tracking_status||'Ще не оновлювався')}<br><small>Оновлено: ${esc(o.tracking_updated_at||'—')}</small><button onclick="refreshTracking('${esc(o.order_number)}')">Оновити статус доставки</button></div>`:''}${o.status_history?.length?`<details><summary>Історія статусів</summary><ul>${o.status_history.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></details>`:''}</div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function refreshTracking(orderNumber){try{let d=await api('/api/miniapp/orders/refresh-tracking',{method:'POST',body:JSON.stringify({order_number:orderNumber})});msg(d.tracking_status||'Статус доставки оновлено');loadЗамовлення()}catch(e){msg(e.message)}}
 function renderBannerAdmin(){ $('adminBanners').innerHTML=`<h3>Керування банерами</h3><p class="muted">Банери відображаються компактно: на головній, у каталозі або в кошику.</p><div id="bannerRows">${banners.map((b,i)=>bannerRow(b,i)).join('')}</div><button onclick="addBannerRow()">Додати банер</button><button class="primary" onclick="saveBanners()">Зберегти банери</button>`;let btn=document.createElement('button');btn.textContent='Банери (адмін)';btn.onclick=()=>{hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('adminBanners').classList.remove('hidden')};$('banners').after(btn)}
 function renderOwnerEntry(){if(document.getElementById('ownerBtn'))return;let btn=document.createElement('button');btn.id='ownerBtn';btn.textContent='Панель власника';btn.onclick=loadOwnerDashboard;$('banners').after(btn)}
 function renderStaffEntry(){if(document.getElementById('staffToolsBtn'))return;let btn=document.createElement('button');btn.id='staffToolsBtn';btn.textContent='Керування магазином';btn.onclick=loadStaffTools;$('banners').after(btn)}
@@ -11019,17 +11083,20 @@ async function loadStaffCatalog(){try{let q=prompt('Пошук за назвою
 async function saveStaffProduct(btn){let c=btn.closest('[data-product]');try{await api(`/api/miniapp/staff/catalog/${c.dataset.product}`,{method:'PUT',body:JSON.stringify({variant_id:c.dataset.variant,name:c.querySelector('[data-field=name]').value,description:c.querySelector('[data-field=description]').value,sku:c.querySelector('[data-field=sku]').value,price:c.querySelector('[data-field=price]').value,reason:c.querySelector('[data-field=reason]').value})});msg('Товар збережено');await loadStaffCatalog()}catch(e){msg(e.message)}}
 async function uploadStaffPhoto(btn){let c=btn.closest('[data-product]'),file=c.querySelector('[data-field=photo]').files[0];if(!file){msg('Оберіть файл фото');return}let form=new FormData();form.append('photo',file);try{let r=await fetch(`/api/miniapp/staff/catalog/${c.dataset.product}/photo`,{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:form}),d=await r.json();if(!r.ok)throw Error(d.error||'Помилка завантаження');msg('Фото додано до товару');await loadStaffCatalog()}catch(e){msg(e.message)}}
 async function adjustStaffStock(btn){let c=btn.closest('[data-product]');try{let d=await api(`/api/miniapp/staff/catalog/variants/${c.dataset.variant}/stock`,{method:'POST',body:JSON.stringify({delta:c.querySelector('[data-field=delta]').value,reason:c.querySelector('[data-field=stockReason]').value})});msg(`Залишок оновлено: ${d.stock_qty}`);await loadStaffCatalog()}catch(e){msg(e.message)}}
-async function searchStaffCustomers(){let q=prompt('Картка клієнта: ім’я, телефон, номер картки або Telegram ID')||'';if(q.trim().length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(c=>`<button class="card" onclick="openStaffCustomer(${c.id})"><b>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</b><br><small>${esc(c.phone||'Немає телефону')} · картка ${esc(c.loyalty_card_number||'—')}</small><br><small>Бонуси ${money(c.bonus_available)} · замовлень ${c.order_count} · на суму ${money(c.lifetime_value)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
-async function openStaffCustomer(id){try{let d=await api(`/api/miniapp/staff/customers/${id}`),c=d.customer;$('staffContent').innerHTML=`<button onclick="searchStaffCustomers()">← До пошуку</button><div class="card"><h3>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</h3><p>Телефон: ${esc(c.phone||'—')}<br>Telegram: ${esc(c.telegram_id||'—')} · @${esc(c.username||'—')}<br>Картка: ${esc(c.loyalty_card_number||'—')}<br>Доступні бонуси: ${money(c.bonus_available)} · Очікують: ${money(c.bonus_pending)}</p><h4>Замовлення</h4>${d.orders.map(o=>`<div class="notice">${esc(o.order_number)} · ${esc(o.status)} · ${money(o.grand_total)} · ${esc(o.created_at||'')}</div>`).join('')||'Немає замовлень'}<h4>Бонусний журнал</h4>${d.loyalty.map(x=>`<div class="notice">${esc(x.transaction_type)} ${money(x.amount)} · ${esc(x.state)} · ${esc(x.reason||'')}</div>`).join('')||'Операцій немає'}</div>`}catch(e){msg(e.message)}}
+async function searchStaffCustomers(){let q=prompt('Картка клієнта: ім’я, телефон, номер картки або Telegram ID')||'';if(q.trim().length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(c=>`<button class="card" onclick="openStaffКлієнт(${c.id})"><b>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</b><br><small>${esc(c.phone||'Немає телефону')} · картка ${esc(c.loyalty_card_number||'—')}</small><br><small>Бонуси ${money(c.bonus_available)} · замовлень ${c.order_count} · на суму ${money(c.lifetime_value)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
+async function openStaffКлієнт(id){try{let d=await api(`/api/miniapp/staff/customers/${id}`),c=d.customer;$('staffContent').innerHTML=`<button onclick="searchStaffCustomers()">← До пошуку</button><div class="card"><h3>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</h3><p>Телефон: ${esc(c.phone||'—')}<br>Telegram: ${esc(c.telegram_id||'—')} · @${esc(c.username||'—')}<br>Картка: ${esc(c.loyalty_card_number||'—')}<br>Доступні бонуси: ${money(c.bonus_available)} · Очікують: ${money(c.bonus_pending)}</p><h4>Замовлення</h4>${d.orders.map(o=>`<div class="notice">${esc(o.order_number)} · ${esc(o.status)} · ${money(o.grand_total)} · ${esc(o.created_at||'')}</div>`).join('')||'Немає замовлень'}<h4>Бонусний журнал</h4>${d.loyalty.map(x=>`<div class="notice">${esc(x.transaction_type)} ${money(x.amount)} · ${esc(x.state)} · ${esc(x.reason||'')}</div>`).join('')||'Операцій немає'}</div>`}catch(e){msg(e.message)}}
 async function loadStaffOrders(){try{let q=prompt('Пошук за номером, клієнтом, телефоном або ТТН')||'';let d=await api('/api/miniapp/staff/orders?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(o=>`<article class="card"><b>${esc(o.order_number)}</b> · ${esc(o.status)}<p>${esc(o.customer_name)} · ${esc(o.phone)}<br>${esc(o.city)}, ${esc(o.delivery_branch)}<br>Сума: ${money(o.grand_total)} · сплачено: ${money(o.paid_amount)}<br>ТТН: ${esc(o.ttn||'—')}</p>${canUpdateOrders?`<select data-order-status="${o.id}"><option value="new">Прийнято</option><option value="confirmed">Підтверджено</option><option value="packing">Збирається</option><option value="packed">Зібрано</option><option value="ready_to_ship">Готове до відправлення</option><option value="shipped">Відправлено</option><option value="delivered">Отримано</option><option value="completed">Завершено</option><option value="cancelled">Скасовано</option><option value="problem">Потрібна перевірка</option></select><button onclick="updateStaffOrder(${o.id})">Зберегти статус</button>`:''}</article>`).join('')||'<div class="notice">Замовлень не знайдено.</div>'}catch(e){msg(e.message)}}
 async function updateStaffOrder(id){try{let status=document.querySelector(`[data-order-status="${id}"]`).value;await api(`/api/miniapp/staff/orders/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус замовлення оновлено');await loadStaffOrders()}catch(e){msg(e.message)}}
-async function loadStaffSupport(status=staffSupportStatus,query=staffSupportQuery){staffSupportStatus=status;staffSupportQuery=String(query||'').trim();try{let d=await api('/api/miniapp/staff/support?status='+encodeURIComponent(status)+'&q='+encodeURIComponent(staffSupportQuery));let c=d.counts||{};let tabs=[['active','&#1054;&#1089;&#1090;&#1072;&#1085;&#1085;&#1110; 5',Math.min(Number(c.active||0),5)],['archive','&#1040;&#1088;&#1093;&#1110;&#1074;',c.archive||0],['all','&#1059;&#1089;&#1110; &#1090;&#1110;&#1082;&#1077;&#1090;&#1080;',Object.values(c).reduce((a,x)=>a+Number(x||0),0)-Number(c.active||0)-Number(c.archive||0)]];let tabHtml=tabs.map(([key,label,count])=>`<button class="${status===key?'primary':''}" onclick="loadStaffSupport('${key}','')">${label} ? ${count}</button>`).join('');let cards=(d.items||[]).map(t=>`<button class="card support-ticket-row" onclick="openStaffSupport(${Number(t.id)})"><span class="row"><b>#${Number(t.id)} ? ${esc(t.subject||'&#1047;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1085;&#1103;')}</b><span class="pill">${esc(supportStatusLabel(t.status))}</span></span><small>&#1050;&#1083;&#1110;&#1108;&#1085;&#1090; ${esc(t.customer_telegram_id)}${t.order_id?' ? &#1047;&#1072;&#1084;&#1086;&#1074;&#1083;&#1077;&#1085;&#1085;&#1103; #'+esc(t.order_id):''} ? ${Number(t.message_count)} &#1087;&#1086;&#1074;&#1110;&#1076;&#1086;&#1084;&#1083;&#1077;&#1085;&#1100;</small><p>${t.latest_sender==='staff'?'&#1042;&#1080;: ':'&#1050;&#1083;&#1110;&#1108;&#1085;&#1090;: '}${esc(t.latest_message||'&#1055;&#1086;&#1074;&#1110;&#1076;&#1086;&#1084;&#1083;&#1077;&#1085;&#1100; &#1097;&#1077; &#1085;&#1077;&#1084;&#1072;&#1108;')}</p><small>&#1054;&#1085;&#1086;&#1074;&#1083;&#1077;&#1085;&#1086;: ${esc(t.updated_at||'')}</small></button>`).join('');$('staffContent').innerHTML=`<div class="support-desk"><div class="row"><div><h2>&#1055;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1072;</h2><p class="muted">&#1053;&#1072;&#1081;&#1089;&#1074;&#1110;&#1078;&#1110;&#1096;&#1110; &#1090;&#1110;&#1082;&#1077;&#1090;&#1080;, &#1072;&#1088;&#1093;&#1110;&#1074; &#1110; &#1087;&#1086;&#1096;&#1091;&#1082; &#1091; &#1095;&#1072;&#1090;&#1072;&#1093;</p></div><button onclick="loadStaffSupport()">&#1054;&#1085;&#1086;&#1074;&#1080;&#1090;&#1080;</button></div><div class="support-tabs">${tabHtml}</div><form class="support-search" onsubmit="event.preventDefault();loadStaffSupport(staffSupportStatus,this.elements.q.value)"><input name="q" value="${esc(staffSupportQuery)}" placeholder="&#1055;&#1086;&#1096;&#1091;&#1082; &#1090;&#1077;&#1082;&#1089;&#1090;&#1091; &#1095;&#1072;&#1090;&#1091;, &#1090;&#1077;&#1084;&#1110; &#1072;&#1073;&#1086; ID &#1082;&#1083;&#1110;&#1108;&#1085;&#1090;&#1072;"><button class="primary">&#1064;&#1091;&#1082;&#1072;&#1090;&#1080;</button>${staffSupportQuery?'<button type="button" onclick="loadStaffSupport(staffSupportStatus,\'\')">&#1054;&#1095;&#1080;&#1089;&#1090;&#1080;&#1090;&#1080;</button>':''}</form><div class="support-ticket-list">${cards||'<div class="notice">&#1047;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1100; &#1079;&#1072; &#1094;&#1080;&#1084;&#1080; &#1091;&#1084;&#1086;&#1074;&#1072;&#1084;&#1080; &#1085;&#1077;&#1084;&#1072;&#1108;.</div>'}</div></div>`}catch(e){msg(e.message)}}
-async function openStaffSupport(id){try{let d=await api(`/api/miniapp/staff/support/${id}`),t=d.ticket;$('staffContent').innerHTML=`<button onclick="loadStaffSupport()">← До списку звернень</button><h3>Звернення #${t.id} · ${esc(t.status)}</h3>${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Працівник':'Клієнт'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${canReplySupport&&t.status!=='closed'?`<textarea id="staffSupportReply" maxlength="4000" placeholder="Відповідь клієнту"></textarea><button class="primary" onclick="replyStaffSupport(${t.id})">Відповісти</button><button onclick="setStaffSupportStatus(${t.id},'closed')">Закрити звернення</button>`:''}`}catch(e){msg(e.message)}}
+let staffSupportStatus='active',staffSupportQuery='';
+function supportStatusLabel(s){return ({new:'\u041d\u043e\u0432\u0435',open:'\u0412\u0456\u0434\u043a\u0440\u0438\u0442\u0435',waiting_customer:'\u041e\u0447\u0456\u043a\u0443\u0454 \u043a\u043b\u0456\u0454\u043d\u0442\u0430',closed:'\u0417\u0430\u043a\u0440\u0438\u0442\u0435'})[s]||s}
+
+async function loadStaffSupport(status=staffSupportStatus,query=staffSupportQuery){staffSupportStatus=status;staffSupportQuery=String(query||'').trim();try{let d=await api('/api/miniapp/staff/support?status='+encodeURIComponent(status)+'&q='+encodeURIComponent(staffSupportQuery));let c=d.counts||{};let tabs=[['active','Останні 5',Math.min(Number(c.active||0),5)],['archive','Архів',c.archive||0],['all','Усі тікети',Object.values(c).reduce((a,x)=>a+Number(x||0),0)-Number(c.active||0)-Number(c.archive||0)]];let tabHtml=tabs.map(([key,label,count])=>`<button class="${status===key?'primary':''}" onclick="loadStaffSupport('${key}','')">${label} ? ${count}</button>`).join('');let cards=(d.items||[]).map(t=>`<button class="card support-ticket-row" onclick="openStaffSupport(${Number(t.id)})"><span class="row"><b>#${Number(t.id)} ? ${esc(t.subject||'Звернення')}</b><span class="pill">${esc(supportStatusLabel(t.status))}</span></span><small>Клієнт ${esc(t.customer_telegram_id)}${t.order_id?' ? Замовлення #'+esc(t.order_id):''} ? ${Number(t.message_count)} повідомлень</small><p>${t.latest_sender==='staff'?'Ви: ':'Клієнт: '}${esc(t.latest_message||'Повідомлень ще немає')}</p><small>Оновлено: ${esc(t.updated_at||'')}</small></button>`).join('');$('staffContent').innerHTML=`<div class="support-desk"><div class="row"><div><h2>Підтримка</h2><p class="muted">Найсвіжіші тікети, архів і пошук у чатах</p></div><button onclick="loadStaffSupport()">Оновити</button></div><div class="support-tabs">${tabHtml}</div><form class="support-search" onsubmit="event.preventDefault();loadStaffSupport(staffSupportStatus,this.elements.q.value)"><input name="q" value="${esc(staffSupportQuery)}" placeholder="Пошук тексту чату, темі або ID клієнта"><button class="primary">Шукати</button>${staffSupportQuery?'<button type="button" onclick="loadStaffSupport(staffSupportStatus,\'\')">Очистити</button>':''}</form><div class="support-ticket-list">${cards||'<div class="notice">Звернень за цими умовами немає.</div>'}</div></div>`}catch(e){msg(e.message)}}
+async function openStaffSupport(id){try{let d=await api(`/api/miniapp/staff/support/${id}`),t=d.ticket;let thread=(t.messages||[]).map(m=>`<article class="support-message ${m.sender_type==='staff'?'staff':'customer'}"><small>${m.sender_type==='staff'?'Працівник':'Клієнт'} ? ${esc(m.created_at||'')}</small>${esc(m.body)}</article>`).join('');let actions=canReplySupport?(t.status==='closed'?`<button class="primary" onclick="setStaffSupportStatus(${Number(t.id)},'open')">Повернути у роботу</button>`:`<button onclick="setStaffSupportStatus(${Number(t.id)},'open')">В роботі</button><button onclick="setStaffSupportStatus(${Number(t.id)},'waiting_customer')">Чекає клієнта</button><button onclick="setStaffSupportStatus(${Number(t.id)},'closed')">Закрити тікет</button>`):'';$('staffContent').innerHTML=`<div class="support-desk"><button onclick="loadStaffSupport()">? До черги</button><div class="row"><div><h2>Звернення #${Number(t.id)}</h2><p class="muted">${esc(t.subject||'Підтримка')} ? клієнт ${esc(t.customer_telegram_id)}${t.order_id?' ? замовлення #'+esc(t.order_id):''}</p></div><span class="pill">${esc(supportStatusLabel(t.status))}</span></div><div class="support-thread">${thread||'<div class="notice">Повідомлень ще немає.</div>'}</div>${canReplySupport&&t.status!=='closed'?`<label for="staffSupportReply">Ваша відповідь</label><textarea id="staffSupportReply" maxlength="4000" rows="4" placeholder="Напишіть відповідь клієнту"></textarea><button class="primary" onclick="replyStaffSupport(${Number(t.id)})">Надіслати відповідь</button>`:''}<div class="support-actions">${actions}</div></div>`}catch(e){msg(e.message)}}
 async function replyStaffSupport(id){let message=$('staffSupportReply')?.value?.trim();if(!message){msg('Напишіть відповідь');return}try{await api(`/api/miniapp/staff/support/${id}/reply`,{method:'POST',body:JSON.stringify({message})});msg('Відповідь надіслано клієнту');await openStaffSupport(id)}catch(e){msg(e.message)}}
-async function setStaffSupportStatus(id,status){try{await api(`/api/miniapp/staff/support/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус звернення оновлено');await loadStaffSupport()}catch(e){msg(e.message)}}async function loadOwnerDashboard(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Панель власника</h2><div class="notice">Завантажую статистику…</div>';try{let d=await api('/api/miniapp/admin/dashboard');$('ownerPanel').innerHTML=`<h2>Статистика магазину</h2><div class="grid"><div class="card"><small>Замовлень сьогодні</small><h3>${d.orders_today}</h3></div><div class="card"><small>Сума замовлень сьогодні</small><h3>${money(d.order_value_today)}</h3></div><div class="card"><small>Оплачено сьогодні</small><h3>${money(d.paid_today)}</h3></div><div class="card"><small>Замовлень за місяць</small><h3>${d.orders_month}</h3></div><div class="card"><small>Сума замовлень за місяць</small><h3>${money(d.order_value_month)}</h3></div><div class="card"><small>Оплачено за місяць</small><h3>${money(d.paid_month)}</h3></div><div class="card"><small>Середнє замовлення</small><h3>${money(d.average_order)}</h3></div><div class="card"><small>Отримано замовлень цього місяця</small><h3>${d.delivered_month}</h3></div><div class="card"><small>Клієнтів</small><h3>${d.customers}</h3></div><div class="card"><small>Очікують обробки</small><h3>${d.pending_orders}</h3></div><div class="card"><small>Бонусне зобов’язання</small><h3>${money(d.bonus_liability)}</h3></div><div class="card"><small>Активні сертифікати</small><h3>${d.active_certificates} · ${money(d.active_certificate_value)}</h3></div><div class="card"><small>Запрошено друзів</small><h3>${d.referrals_rewarded} / ${d.referrals}</h3></div></div><h3>Коригування бонусів</h3><div class="formgrid"><input id="loyaltyLookup" placeholder="Картка, телефон або Telegram ID"><select id="loyaltyOperation"><option value="earn">Нарахувати</option><option value="redeem">Списати</option></select><input id="loyaltyAmount" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума"><input id="loyaltyReason" maxlength="250" placeholder="Обов’язкова причина"><button class="primary" onclick="adjustLoyalty()">Застосувати коригування</button></div><small>Операція записується в бонусний журнал та аудит.</small><h3>Випуск сертифіката</h3><div class="formgrid"><input id="certCustomer" placeholder="Картка клієнта, телефон або Telegram ID"><input id="certCode" maxlength="40" placeholder="Код або залиште порожнім для генерації"><input id="certValue" type="number" min="0.01" max="100000" step="0.01" placeholder="Номінал, грн"><button onclick="createCertificate()">Створити сертифікат</button></div>`}catch(e){$('ownerPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function setStaffSupportStatus(id,status){try{await api(`/api/miniapp/staff/support/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус звернення оновлено');await loadStaffSupport()}catch(e){msg(e.message)}}async function loadOwnerDashboard(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Панель власника</h2><div class="notice">Завантажую статистику…</div>';try{let d=await api('/api/miniapp/admin/dashboard');$('ownerPanel').innerHTML=`<h2>Статистика магазину</h2><div class="grid"><div class="card"><small>Замовлень сьогодні</small><h3>${d.orders_today}</h3></div><div class="card"><small>Сума замовлень сьогодні</small><h3>${money(d.order_value_today)}</h3></div><div class="card"><small>Оплачено сьогодні</small><h3>${money(d.paid_today)}</h3></div><div class="card"><small>Замовлень за місяць</small><h3>${d.orders_month}</h3></div><div class="card"><small>Сума замовлень за місяць</small><h3>${money(d.order_value_month)}</h3></div><div class="card"><small>Оплачено за місяць</small><h3>${money(d.paid_month)}</h3></div><div class="card"><small>Середнє замовлення</small><h3>${money(d.average_order)}</h3></div><div class="card"><small>Отримано замовлень цього місяця</small><h3>${d.delivered_month}</h3></div><div class="card"><small>Клієнтів</small><h3>${d.customers}</h3></div><div class="card"><small>Очікують обробки</small><h3>${d.pending_orders}</h3></div><div class="card"><small>Бонусне зобов’язання</small><h3>${money(d.bonus_liability)}</h3></div><div class="card"><small>Активні сертифікати</small><h3>${d.active_certificates} · ${money(d.active_certificate_value)}</h3></div><div class="card"><small>Запрошено друзів</small><h3>${d.referrals_rewarded} / ${d.referrals}</h3></div></div><h3>Коригування бонусів</h3><div class="formgrid"><input id="loyaltyLookup" placeholder="Картка, телефон або Telegram ID"><select id="loyaltyOperation"><option value="earn">Нарахувати</option><option value="redeem">Списати</option></select><input id="loyaltyAmount" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума"><input id="loyaltyReason" maxlength="250" placeholder="Обов’язкова причина"><button class="primary" onclick="adjustLoyalty()">Застосувати коригування</button></div><small>Операція записується в бонусний журнал та аудит.</small><h3>Випуск сертифіката</h3><div class="formgrid"><input id="certКлієнт" placeholder="Картка клієнта, телефон або Telegram ID"><input id="certCode" maxlength="40" placeholder="Код або залиште порожнім для генерації"><input id="certValue" type="number" min="0.01" max="100000" step="0.01" placeholder="Номінал, грн"><button onclick="createCertificate()">Створити сертифікат</button></div>`}catch(e){$('ownerPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function adjustLoyalty(){try{let body={customer_lookup:$('loyaltyLookup').value,operation:$('loyaltyOperation').value,amount:$('loyaltyAmount').value,reason:$('loyaltyReason').value};let d=await api('/api/miniapp/admin/loyalty-adjust',{method:'POST',body:JSON.stringify(body)});msg(`Бонуси оновлено. Баланс: ${money(d.available)}`);loadOwnerDashboard()}catch(e){msg(e.message)}}
 async function createCertificate(){try{let d=await api('/api/miniapp/admin/certificates',{method:'POST',body:JSON.stringify({code:$('certCode').value,face_value:$('certValue').value})});msg(`Сертифікат ${d.code} створено. ${d.notified?"Подарункове повідомлення надіслано":"Повідомлення в Telegram не доставлено"}`);loadOwnerDashboard()}catch(e){msg(e.message)}}
-function bannerRow(b={},i=Date.now()){return `<div class="card" data-banner><select data-k="placement"><option value="home_top" ${(!b.placement||b.placement==='home_top')?'selected':''}>Головна: верхній банер</option><option value="catalog_bottom" ${b.placement==='catalog_bottom'?'selected':''}>Каталог: між блоками / внизу</option><option value="cart_top" ${b.placement==='cart_top'?'selected':''}>Кошик: верхній банер</option><option value="bot_welcome" ${b.placement==='bot_welcome'?'selected':''}>Telegram-бот: привітання</option></select><input data-k="title" placeholder="Заголовок" value="${esc(b.title||'')}"><input data-k="body" placeholder="Текст" value="${esc(b.body||'')}"><input data-k="image_url" placeholder="URL зображення (необов’язково)" value="${esc(b.image_url||'')}"><input data-k="link_url" placeholder="Посилання (необов’язково)" value="${esc(b.link_url||'')}"><label class="check"><input data-k="active" type="checkbox" ${b.active?'checked':''}> Активний</label><button onclick="this.parentElement.remove()">Видалити</button></div>`}
+function bannerRow(b={},i=Date.now()){return `<div class="card" data-banner><select data-k="placement"><option value="home_top" ${(!b.placement||b.placement==='home_top')?'selected':''}>Головна: верхній банер</option><option value="catalog_bottom" ${b.placement==='catalog_bottom'?'selected':''}>Каталог: між блоками / внизу</option><option value="cart_top" ${b.placement==='cart_top'?'selected':''}>Кошик: верхній банер</option><option value="website_top" ${b.placement==='website_top'?'selected':''}>Website: top banner</option><option value="website_bottom" ${b.placement==='website_bottom'?'selected':''}>Website: bottom banner</option><option value="bot_welcome" ${b.placement==='bot_welcome'?'selected':''}>Telegram-бот: привітання</option></select><input data-k="title" placeholder="Заголовок" value="${esc(b.title||'')}"><input data-k="body" placeholder="Текст" value="${esc(b.body||'')}"><input data-k="image_url" placeholder="URL зображення (необов’язково)" value="${esc(b.image_url||'')}"><input data-k="link_url" placeholder="Посилання (необов’язково)" value="${esc(b.link_url||'')}"><label class="check"><input data-k="active" type="checkbox" ${b.active?'checked':''}> Активний</label><button onclick="this.parentElement.remove()">Видалити</button></div>`}
 function addBannerRow(){ $('bannerRows').insertAdjacentHTML('beforeend',bannerRow({active:true})) }
 async function saveBanners(){let rows=[...document.querySelectorAll('[data-banner]')].map(el=>{let o={};el.querySelectorAll('[data-k]').forEach(x=>o[x.dataset.k]=x.type==='checkbox'?x.checked:x.value);return o});try{let d=await api('/api/miniapp/admin/banners',{method:'PUT',body:JSON.stringify({banners:rows})});banners=d.banners;renderBanners();msg('Банери збережено')}catch(e){msg(e.message)}}
 async function beginWebLogin(){let authTab=window.open('about:blank','_blank');try{let d=await api('/api/miniapp/web-login',{method:'POST',body:'{}'});if(authTab)authTab.location=d.url;else window.location.href=d.url;msg('Підтвердіть вхід у Telegram — сторінка оновиться автоматично.');let started=Date.now();while(Date.now()-started<300000){await new Promise(resolve=>setTimeout(resolve,1800));let status=await api('/api/miniapp/web-login/status?token='+encodeURIComponent(d.token));if(status.authenticated){if(authTab)authTab.close();window.location.reload();return}if(status.expired)break}if(authTab)authTab.close();msg('Час запиту минув. Натисніть вхід ще раз.')}catch(e){if(authTab)authTab.close();msg(e.message)}}
@@ -11040,7 +11107,7 @@ function showCart(){track('cart_view');setActiveTab('cartBtn');hideSections();$(
 function startSnowfall(){let box=$('snowfallFx');if(!box)return;box.replaceChildren();for(let i=0;i<18;i++){let flake=document.createElement('span');flake.className='snowflake';flake.textContent=i%3?'✦':'❄';flake.style.left=(5+Math.random()*90)+'%';flake.style.animationDelay=(Math.random()*.9)+'s';flake.style.fontSize=(9+Math.random()*9)+'px';box.append(flake)}setTimeout(()=>box.replaceChildren(),3300)}
 async function webLogout(){try{await api('/api/miniapp/web-login/logout',{method:'POST',body:'{}'});window.location.reload()}catch(e){msg(e.message)}}
 function renderInventoryEntry(){if(document.getElementById('inventoryBtn'))return;let btn=document.createElement('button');btn.id='inventoryBtn';btn.textContent='Інвентаризація';btn.onclick=loadInventory;$('staffToolsBtn')?.after(btn)}
-async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>&#1030;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1111;</h2><div class="notice">&#1047;&#1072;&#1074;&#1072;&#1085;&#1090;&#1072;&#1078;&#1091;&#1102; &#1110;&#1089;&#1090;&#1086;&#1088;&#1110;&#1102;...</div>';try{let d=await api('/api/miniapp/staff/inventory?archived='+(archived?'1':'0'));let items=d.items||[];let cards=items.map(x=>`<button class="card support-ticket-row" onclick="renderInventoryCount(${Number(x.id)})"><div class="row"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'&#1047;&#1072;&#1074;&#1077;&#1088;&#1096;&#1077;&#1085;&#1072;':x.status==='counting'?'&#1059; &#1087;&#1088;&#1086;&#1094;&#1077;&#1089;&#1110;':esc(x.status)}</b><span class="pill">${Number(x.counted_count)}/${Number(x.sku_count)} SKU</span></div><small>${esc(x.created_at||'')}${x.confirmed_at?' ? &#1055;&#1110;&#1076;&#1090;&#1074;&#1077;&#1088;&#1076;&#1078;&#1077;&#1085;&#1072; '+esc(x.confirmed_at):''}</small></button>`).join('');let actions=`<div class="formgrid"><button onclick="loadInventory(${archived?'false':'true'})">${archived?'? &#1044;&#1086; &#1086;&#1089;&#1090;&#1072;&#1085;&#1085;&#1110;&#1093; 2':'&#1040;&#1088;&#1093;&#1110;&#1074; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081; ? '+Number(d.archive_count||0)}</button>${!archived&&d.can_start?'<button class="primary" onclick="startInventory()">&#1055;&#1086;&#1095;&#1072;&#1090;&#1080; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1102;</button>':''}</div>`;$('staffPanel').innerHTML=`<h2>${archived?'&#1040;&#1088;&#1093;&#1110;&#1074; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081;':'&#1054;&#1089;&#1090;&#1072;&#1085;&#1085;&#1110; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1111;'}</h2>${actions}<div class="support-ticket-list">${cards||'<div class="notice">&#1055;&#1086;&#1082;&#1080; &#1085;&#1077;&#1084;&#1072;&#1108; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081;.</div>'}</div>`}catch(e){$('staffPanel').innerHTML='<div class="notice">'+esc(e.message)+'</div>'}}
+async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризації</h2><div class="notice">Завантажую історію...</div>';try{let d=await api('/api/miniapp/staff/inventory?archived='+(archived?'1':'0'));let items=d.items||[];let cards=items.map(x=>`<button class="card support-ticket-row" onclick="renderInventoryCount(${Number(x.id)})"><div class="row"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'Завершена':x.status==='counting'?'У процесі':esc(x.status)}</b><span class="pill">${Number(x.counted_count)}/${Number(x.sku_count)} SKU</span></div><small>${esc(x.created_at||'')}${x.confirmed_at?' ? Підтверджена '+esc(x.confirmed_at):''}</small></button>`).join('');let actions=`<div class="formgrid"><button onclick="loadInventory(${archived?'false':'true'})">${archived?'? До останніх 2':'Архів інвентаризацій ? '+Number(d.archive_count||0)}</button>${!archived&&d.can_start?'<button class="primary" onclick="startInventory()">Почати інвентаризацію</button>':''}</div>`;$('staffPanel').innerHTML=`<h2>${archived?'Архів інвентаризацій':'Останні інвентаризації'}</h2>${actions}<div class="support-ticket-list">${cards||'<div class="notice">Поки немає інвентаризацій.</div>'}</div>`}catch(e){$('staffPanel').innerHTML='<div class="notice">'+esc(e.message)+'</div>'}}
 async function renderInventoryCount(id) {
   try {
     let d=await api('/api/miniapp/staff/inventory/'+id);
@@ -11086,34 +11153,454 @@ async function confirmInventory(countId) {
 }
 function renderAnalyticsEntry(){if(!document.getElementById('analyticsBtn')){let btn=document.createElement('button');btn.id='analyticsBtn';btn.textContent='Аналітика відвідувань';btn.onclick=()=>loadOwnerAnalytics('day');$('ownerBtn')?.after(btn)}if(!document.getElementById('replenishmentBtn')){let btn=document.createElement('button');btn.id='replenishmentBtn';btn.textContent='Рекомендації закупівлі';btn.onclick=loadReplenishment;$('analyticsBtn')?.after(btn)}}
 async function loadReplenishment(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">Рахую продажі та запас…</div>';try{let d=await api('/api/miniapp/admin/replenishment');$('ownerPanel').innerHTML=`<h2>Рекомендації закупівлі</h2><div class="notice">Попит рахується за останні 30 днів. Цільовий запас покриває 5 днів доставки, ще 5 днів до наступного циклу закупівлі та 2 дні резерву. Списання не враховуються.</div>${d.items.length?`<div class="grid">${d.items.map(x=>`<article class="card"><h3>${esc(x.product_name)}</h3><small>SKU: ${esc(x.sku)}</small><p>Продано: ${x.sold_units} за 30 днів · у наявності: ${x.available_qty}</p><p>Середнє: ${x.daily_velocity}/день</p><div class="price">Замовити: ${x.suggested_order_qty}</div></article>`).join('')}</div>`:'<div class="notice">За поточним запасом і продажами термінової закупівлі не потрібно.</div>'}`}catch(e){$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">'+esc(e.message)+'</div>'}}
-async function loadOwnerAnalytics(period='day'){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');try{let d=await api('/api/miniapp/admin/analytics?period='+encodeURIComponent(period));$('ownerPanel').innerHTML=`<h2>Аналітика · ${({day:'день',week:'тиждень',month:'місяць',year:'рік'})[period]}</h2><select id="analyticsPeriod" onchange="loadOwnerAnalytics(this.value)"><option value="day" ${period==='day'?'selected':''}>День</option><option value="week" ${period==='week'?'selected':''}>Тиждень</option><option value="month" ${period==='month'?'selected':''}>Місяць</option><option value="year" ${period==='year'?'selected':''}>Рік</option></select><div class="grid"><div class="card"><small>Унікальні відвідувачі сайту</small><h3>${d.visitors}</h3></div><div class="card"><small>Запуски бота</small><h3>${d.bot_starts}</h3></div><div class="card"><small>Переглядали категорії</small><h3>${d.category_visitors}</h3></div><div class="card"><small>Пошукали</small><h3>${d.search_visitors}</h3></div><div class="card"><small>Додали товар</small><h3>${d.adders} · натискань ${d.add_clicks}</h3></div><div class="card"><small>Відкрили кошик</small><h3>${d.cart_visitors}</h3></div><div class="card"><small>Почали оформлення</small><h3>${d.checkouts}</h3></div><div class="card"><small>Замовлення оформлено</small><h3>${d.buyers} · ${d.orders}</h3></div><div class="card"><small>&#1055;&#1077;&#1088;&#1077;&#1075;&#1083;&#1103;&#1076;&#1072;&#1083;&#1080; &#1090;&#1086;&#1074;&#1072;&#1088;</small><h3>${d.product_viewers||0}</h3></div><section class="ops-group"><h3>&#1056;&#1077;&#1092;&#1077;&#1088;&#1072;&#1083;&#1080; ? &#1076;&#1078;&#1077;&#1088;&#1077;&#1083;&#1072; ? &#1074;&#1110;&#1076;&#1090;&#1110;&#1082;</h3><div class="grid"><div class="card"><small>&#1047;&#1072;&#1087;&#1088;&#1086;&#1096;&#1077;&#1085;&#1086;</small><h3>${d.referrals?.referred||0}</h3></div><div class="card"><small>&#1050;&#1086;&#1085;&#1074;&#1077;&#1088;&#1089;&#1110;&#1103; &#1074; &#1087;&#1077;&#1088;&#1096;&#1077; &#1079;&#1072;&#1084;&#1086;&#1074;&#1083;&#1077;&#1085;&#1085;&#1103;</small><h3>${d.referrals?.converted||0}</h3></div><div class="card"><small>&#1063;&#1077;&#1082;&#1072;&#1102;&#1090;&#1100; &#1085;&#1072; &#1087;&#1077;&#1088;&#1096;&#1077; &#1079;&#1072;&#1084;&#1086;&#1074;&#1083;&#1077;&#1085;&#1085;&#1103;</small><h3>${d.referrals?.pending||0}</h3></div><div class="card"><small>&#1044;&#1086;&#1093;&#1110;&#1076; &#1074;&#1110;&#1076; &#1088;&#1077;&#1092;&#1077;&#1088;&#1072;&#1083;&#1110;&#1074;</small><h3>${money(d.referrals?.referral_revenue||0)}</h3></div></div><h4>&#1047;&#1074;&#1110;&#1076;&#1082;&#1080; &#1087;&#1077;&#1088;&#1077;&#1093;&#1086;&#1076;&#1103;&#1090;&#1100;</h4>${(d.traffic_sources||[]).map(x=>`<div class="row notice"><span>${esc(x.source)}</span><b>${x.visitors} ? ${x.visits}</b></div>`).join('')||'<div class="notice">??????? ??????? ?????????????? ????? ?????????.</div>'}<h4>&#1058;&#1086;&#1087; &#1079;&#1072;&#1087;&#1088;&#1086;&#1096;&#1091;&#1074;&#1072;&#1095;&#1110;&#1074; ? &#1082;&#1086;&#1076; ? &#1082;&#1086;&#1085;&#1074;&#1077;&#1088;&#1089;&#1110;&#1103; ? &#1074;&#1080;&#1088;&#1091;&#1095;&#1082;&#1072;</h4>${(d.top_referrers||[]).map(x=>`<div class="row notice"><span>${esc(x.referrer)} ? ${esc(x.code)}</span><b>${x.converted}/${x.referred} ? ${money(x.revenue)}</b></div>`).join('')||'<div class="notice">No referral data for this period yet.</div>'}</section><h3>Де залишають сайт</h3><div class="notice">Відвідування → кошик: ${d.visitors?Math.round(d.cart_visitors/d.visitors*100):0}%<br>Кошик → оформлення: ${d.cart_visitors?Math.round(d.checkouts/d.cart_visitors*100):0}%<br>Оформлення → завершене замовлення: ${d.checkouts?Math.round(d.buyers/d.checkouts*100):0}%</div><small>Унікальні браузери рахуються анонімним випадковим ID; показники Mini App/сайту й запусків бота агреговані.</small>`}catch(e){$('ownerPanel').innerHTML='<h2>Аналітика</h2><div class="notice">'+esc(e.message)+'</div>'}}
+async function loadOwnerAnalytics(period='day'){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');try{let d=await api('/api/miniapp/admin/analytics?period='+encodeURIComponent(period));$('ownerPanel').innerHTML=`<h2>Аналітика · ${({day:'день',week:'тиждень',month:'місяць',year:'рік'})[period]}</h2><select id="analyticsPeriod" onchange="loadOwnerAnalytics(this.value)"><option value="day" ${period==='day'?'selected':''}>День</option><option value="week" ${period==='week'?'selected':''}>Тиждень</option><option value="month" ${period==='month'?'selected':''}>Місяць</option><option value="year" ${period==='year'?'selected':''}>Рік</option></select><div class="grid"><div class="card"><small>Унікальні відвідувачі сайту</small><h3>${d.visitors}</h3></div><div class="card"><small>Запуски бота</small><h3>${d.bot_starts}</h3></div><div class="card"><small>Переглядали категорії</small><h3>${d.category_visitors}</h3></div><div class="card"><small>Пошукали</small><h3>${d.search_visitors}</h3></div><div class="card"><small>Додали товар</small><h3>${d.adders} · натискань ${d.add_clicks}</h3></div><div class="card"><small>Відкрили кошик</small><h3>${d.cart_visitors}</h3></div><div class="card"><small>Почали оформлення</small><h3>${d.checkouts}</h3></div><div class="card"><small>Замовлення оформлено</small><h3>${d.buyers} · ${d.orders}</h3></div><div class="card"><small>Переглядали товар</small><h3>${d.product_viewers||0}</h3></div><section class="ops-group"><h3>Реферали ? джерела ? відтік</h3><div class="grid"><div class="card"><small>Запрошено</small><h3>${d.referrals?.referred||0}</h3></div><div class="card"><small>Конверсія в перше замовлення</small><h3>${d.referrals?.converted||0}</h3></div><div class="card"><small>Чекають на перше замовлення</small><h3>${d.referrals?.pending||0}</h3></div><div class="card"><small>Дохід від рефералів</small><h3>${money(d.referrals?.referral_revenue||0)}</h3></div></div><h4>Звідки переходять</h4>${(d.traffic_sources||[]).map(x=>`<div class="row notice"><span>${esc(x.source)}</span><b>${x.visitors} ? ${x.visits}</b></div>`).join('')||'<div class="notice">??????? ??????? ?????????????? ????? ?????????.</div>'}<h4>Топ запрошувачів ? код ? конверсія ? виручка</h4>${(d.top_referrers||[]).map(x=>`<div class="row notice"><span>${esc(x.referrer)} ? ${esc(x.code)}</span><b>${x.converted}/${x.referred} ? ${money(x.revenue)}</b></div>`).join('')||'<div class="notice">No referral data for this period yet.</div>'}</section><h3>Де залишають сайт</h3><div class="notice">Відвідування → кошик: ${d.visitors?Math.round(d.cart_visitors/d.visitors*100):0}%<br>Кошик → оформлення: ${d.cart_visitors?Math.round(d.checkouts/d.cart_visitors*100):0}%<br>Оформлення → завершене замовлення: ${d.checkouts?Math.round(d.buyers/d.checkouts*100):0}%</div><small>Унікальні браузери рахуються анонімним випадковим ID; показники Mini App/сайту й запусків бота агреговані.</small>`}catch(e){$('ownerPanel').innerHTML='<h2>Аналітика</h2><div class="notice">'+esc(e.message)+'</div>'}}
 async function loadStaffCatalog(){try{let q=prompt('Пошук за назвою або SKU')||'';let d=await api('/api/miniapp/staff/catalog?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(p=>`<article class="card" data-product="${p.product_id}" data-variant="${p.variant_id}"><div class="row"><b>${esc(p.name)}</b><b>${money(p.price)}</b></div>${p.media_id?`<img class="admin-product-photo" src="/api/miniapp/products/${p.media_id}/photo" alt="${esc(p.name)}">`:''}<input data-field="name" value="${esc(p.name)}" placeholder="Назва"><textarea data-field="description" placeholder="Опис">${esc(p.description||'')}</textarea><input data-field="sku" value="${esc(p.sku)}" placeholder="SKU"><input data-field="price" type="number" min="0" step="0.01" value="${Number(p.price)}" placeholder="Ціна"><select data-field="category"><option value="">Без категорії</option>${d.categories.map(c=>`<option value="${c.id}" ${Number(p.category_id)===Number(c.id)?'selected':''}>${esc(c.name)}</option>`).join('')}</select><select data-field="badge"><option value="" ${!p.storefront_badge?'selected':''}>Без плашки</option><option value="Bestseller" ${p.storefront_badge==='Bestseller'?'selected':''}>Bestseller</option><option value="MEGA SALE" ${p.storefront_badge==='MEGA SALE'?'selected':''}>MEGA SALE</option><option value="Акція" ${p.storefront_badge==='Акція'?'selected':''}>Акція</option></select><div class="notice">Залишок: ${p.stock_qty} · низький рівень: ${p.low_stock_threshold} · зарезервовано: ${p.reserved_qty}</div>${canEditCatalog?`<label class="check"><input data-field="active" type="checkbox" ${p.active?'checked':''}> Активний у каталозі</label><label class="check"><input data-field="hidden" type="checkbox" ${p.manually_hidden?'checked':''}> Приховати</label><input data-field="reason" placeholder="Причина зміни"><button class="primary" onclick="saveStaffProduct(this)">Зберегти товар</button><label>Нове фото <input data-field="photo" type="file" accept="image/png,image/jpeg,image/webp"></label><button onclick="uploadStaffPhoto(this)">Замінити фото</button><div class="formgrid"><input data-field="delta" type="number" step="1" placeholder="Зміна залишку (+/−)"><input data-field="stockReason" placeholder="Причина коригування"><button onclick="adjustStaffStock(this)">Змінити залишок</button></div>`:''}</article>`).join('')||'<div class="notice">Товари не знайдені.</div>'}catch(e){msg(e.message)}}
 async function saveStaffProduct(btn){let c=btn.closest('[data-product]');try{await api(`/api/miniapp/staff/catalog/${c.dataset.product}`,{method:'PUT',body:JSON.stringify({variant_id:c.dataset.variant,name:c.querySelector('[data-field=name]').value,description:c.querySelector('[data-field=description]').value,sku:c.querySelector('[data-field=sku]').value,price:c.querySelector('[data-field=price]').value,category_id:c.querySelector('[data-field=category]').value||null,storefront_badge:c.querySelector('[data-field=badge]').value,active:c.querySelector('[data-field=active]').checked,manually_hidden:c.querySelector('[data-field=hidden]').checked,reason:c.querySelector('[data-field=reason]').value})});msg('Товар збережено');await loadStaffCatalog()}catch(e){msg(e.message)}}
 function showCart(){track('cart_view');setActiveTab('cartBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('cart').classList.remove('hidden');cart=authenticated?cart:guestCart.map(x=>({...x,line_total:Number(x.price)*Number(x.quantity)}));let total=cart.reduce((sum,x)=>sum+Number(x.line_total||0),0);let note=authenticated?'':'<div class="notice">Кошик збережено в цьому браузері. Увійдіть через Telegram, щоб оформити замовлення, бачити його статус і синхронізувати бонуси.</div>'+telegramPrompt();$('cart').innerHTML=bannerMarkup('cart_top')+'<h2>Ваш кошик</h2>'+(cart.length?cart.map(cartRow).join('')+`<h3>Разом: ${money(total)}</h3>${note}${authenticated?'<button class="primary" onclick="checkoutForm()">Оформити замовлення</button>':''}`:`<div class="notice">Кошик порожній. Додайте товари з каталогу — вони з’являться тут.</div>`);setTimeout(loadProductPhotos,0)}
 function renderStaffEntry(){if(document.getElementById('staffToolsBtn'))return;let btn=document.createElement('button');btn.id='staffToolsBtn';btn.textContent='Робоча панель';btn.onclick=loadStaffTools;$('banners').after(btn)}
 async function searchStaffCustomers(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>CRM · пошук клієнтів</h2><input id="crmQuery" placeholder="Ім’я, телефон, картка, Telegram ID" onkeydown="if(event.key===\'Enter\')runCrmSearch()"><button class="primary" onclick="runCrmSearch()">Знайти</button><div id="staffContent"></div>';}
-async function runCrmSearch(){let q=$('crmQuery').value.trim();if(q.length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=(d.items||[]).map(c=>`<button class="card crm-result" onclick="openStaffCustomer(${c.id})"><b>${esc(c.full_name||c.first_name||'Клієнт')}</b><br><small>${esc(c.phone||'Телефон не вказано')} · ${esc(c.loyalty_card_number||'Без картки')}</small><br><small>Замовлень: ${c.order_count} · Сума: ${money(c.lifetime_value)} · Бонуси: ${money(c.bonus_available)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
-async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>&#1030;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1111;</h2><div id="inventoryActions"></div><div class="support-tabs"><button class="'+(!archived?'primary':'')+'" onclick="loadInventory(false)">&#1054;&#1089;&#1090;&#1072;&#1085;&#1085;&#1110; 2</button><button class="'+(archived?'primary':'')+'" onclick="loadInventory(true)">&#1040;&#1088;&#1093;&#1110;&#1074; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081;</button></div><div class="notice">'+(archived?'&#1057;&#1090;&#1072;&#1088;&#1110; &#1087;&#1077;&#1088;&#1077;&#1088;&#1072;&#1093;&#1091;&#1085;&#1082;&#1080;':'&#1044;&#1074;&#1110; &#1085;&#1072;&#1081;&#1089;&#1074;&#1110;&#1078;&#1110;&#1096;&#1110; &#1087;&#1077;&#1088;&#1077;&#1088;&#1072;&#1093;&#1091;&#1085;&#1082;&#1080;')+'</div><div id="inventoryHistory">&#1047;&#1072;&#1074;&#1072;&#1085;&#1090;&#1072;&#1078;&#1091;&#1102;...</div>';try{let d=await api('/api/miniapp/staff/inventory'+(archived?'?archived=1':''));$('inventoryActions').innerHTML=!archived&&d.can_start?'<button class="primary" onclick="startInventory()">&#1055;&#1086;&#1095;&#1072;&#1090;&#1080; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1102;</button>':'';$('inventoryHistory').innerHTML=(d.items||[]).map(x=>`<button class="card" onclick="renderInventoryCount(${Number(x.id)})"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'&#1047;&#1072;&#1074;&#1077;&#1088;&#1096;&#1077;&#1085;&#1072;':x.status==='counting'?'&#1059; &#1087;&#1088;&#1086;&#1094;&#1077;&#1089;&#1110;':esc(x.status)}</b><br><small>${esc(x.created_at)} ? &#1055;&#1086;&#1088;&#1072;&#1093;&#1086;&#1074;&#1072;&#1085;&#1086; ${Number(x.counted_count)}/${Number(x.sku_count)}</small></button>`).join('')||'<div class="notice">'+(archived?'&#1040;&#1088;&#1093;&#1110;&#1074; &#1087;&#1086;&#1088;&#1086;&#1078;&#1085;&#1110;&#1081;.':'&#1030;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081; &#1097;&#1077; &#1085;&#1077;&#1084;&#1072;&#1108;.')+'</div>'}catch(e){$('inventoryHistory').textContent=e.message}}
+async function runCrmSearch(){let q=$('crmQuery').value.trim();if(q.length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=(d.items||[]).map(c=>`<button class="card crm-result" onclick="openStaffКлієнт(${c.id})"><b>${esc(c.full_name||c.first_name||'Клієнт')}</b><br><small>${esc(c.phone||'Телефон не вказано')} · ${esc(c.loyalty_card_number||'Без картки')}</small><br><small>Замовлень: ${c.order_count} · Сума: ${money(c.lifetime_value)} · Бонуси: ${money(c.bonus_available)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
+async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризації</h2><div id="inventoryActions"></div><div class="support-tabs"><button class="'+(!archived?'primary':'')+'" onclick="loadInventory(false)">Останні 2</button><button class="'+(archived?'primary':'')+'" onclick="loadInventory(true)">Архів інвентаризацій</button></div><div class="notice">'+(archived?'Старі перерахунки':'Дві найсвіжіші перерахунки')+'</div><div id="inventoryHistory">Завантажую...</div>';try{let d=await api('/api/miniapp/staff/inventory'+(archived?'?archived=1':''));$('inventoryActions').innerHTML=!archived&&d.can_start?'<button class="primary" onclick="startInventory()">Почати інвентаризацію</button>':'';$('inventoryHistory').innerHTML=(d.items||[]).map(x=>`<button class="card" onclick="renderInventoryCount(${Number(x.id)})"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'Завершена':x.status==='counting'?'У процесі':esc(x.status)}</b><br><small>${esc(x.created_at)} ? Пораховано ${Number(x.counted_count)}/${Number(x.sku_count)}</small></button>`).join('')||'<div class="notice">'+(archived?'Архів порожній.':'Інвентаризацій ще немає.')+'</div>'}catch(e){$('inventoryHistory').textContent=e.message}}
 async function startInventory(){try{let d=await api('/api/miniapp/staff/inventory',{method:'POST',body:'{}'});await renderInventoryCount(d.count_id)}catch(e){msg(e.message)}}
-function loadStaffTools(){hideSections();$('banners').classList.add('hidden');$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML=`<h2>&#1056;&#1086;&#1073;&#1086;&#1095;&#1072; &#1087;&#1072;&#1085;&#1077;&#1083;&#1100;</h2><section class="ops-group"><h3>&#1050;&#1083;&#1110;&#1108;&#1085;&#1090;&#1080; / &#1079;&#1072;&#1084;&#1086;&#1074;&#1083;&#1077;&#1085;&#1085;&#1103;</h3><div class="formgrid">${canViewCustomers?'<button onclick="searchStaffCustomers()">&#1055;&#1086;&#1096;&#1091;&#1082; CRM</button>':''}${canViewOrders?'<button onclick="loadStaffOrders()">&#1047;&#1072;&#1084;&#1086;&#1074;&#1083;&#1077;&#1085;&#1085;&#1103;</button>':''}</div></section><section class="ops-group"><h3>&#1058;&#1086;&#1074;&#1072;&#1088;&#1080; / &#1089;&#1082;&#1083;&#1072;&#1076;</h3><div class="formgrid">${canManageCatalog?'<button onclick="loadStaffCatalog()">&#1056;&#1077;&#1076;&#1072;&#1075;&#1091;&#1074;&#1072;&#1090;&#1080; &#1090;&#1086;&#1074;&#1072;&#1088;&#1080;</button>':''}${canManageInventory?'<button onclick="loadInventory()">&#1030;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1111;</button>':''}</div></section>${canManageOwner?'<section class="ops-group"><h3>&#1042;&#1083;&#1072;&#1089;&#1085;&#1080;&#1082; / &#1079;&#1074;&#1110;&#1090;&#1080; / &#1082;&#1077;&#1088;&#1091;&#1074;&#1072;&#1085;&#1085;&#1103;</h3><div class="formgrid"><button onclick="loadOwnerAnalytics(this.dataset.period)" data-period="day">&#1040;&#1085;&#1072;&#1083;&#1110;&#1090;&#1080;&#1082;&#1072; &#1076;&#1078;&#1077;&#1088;&#1077;&#1083; / &#1074;&#1086;&#1088;&#1086;&#1085;&#1082;&#1080; / &#1088;&#1077;&#1092;&#1077;&#1088;&#1072;&#1083;&#1110;&#1074;</button><button onclick="loadReplenishment()">&#1047;&#1072;&#1082;&#1091;&#1087;&#1110;&#1074;&#1083;&#1110;</button><button onclick="loadOwnerDashboard()">&#1055;&#1072;&#1085;&#1077;&#1083;&#1100; &#1074;&#1083;&#1072;&#1089;&#1085;&#1080;&#1082;&#1072;</button><button onclick="renderBannerAdmin()">&#1041;&#1072;&#1085;&#1077;&#1088;&#1080;</button></div></section>':''}<section class="ops-group"><h3>&#1055;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1072;</h3><div class="formgrid">${canViewSupport?'<button onclick="loadStaffSupport()">&#1063;&#1072;&#1090; &#1087;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1080;</button>':''}</div></section><div id="staffContent"></div>`}
-async function loadCustomerSupport(archived=false){let panel=$('supportPanel');panel.innerHTML=`<h2>Чат підтримки</h2><div class="formgrid"><button onclick="loadCustomerSupport(false)">Активні</button><button onclick="loadCustomerSupport(true)">Архів</button></div><div class="notice">Тут лише ваші звернення до підтримки — товари й історія замовлень окремо.</div>`;try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));panel.innerHTML+=((d.items||[]).map(t=>`<article class="card"><b>Звернення #${t.id}</b> · ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Підтримка':'Ви'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${!archived&&t.status!=='closed'?`<textarea id="reply-${t.id}" maxlength="4000" placeholder="Напишіть відповідь"></textarea><button onclick="sendSupportMessage(${t.id})">Надіслати</button>`:''}</article>`).join('')||`<div class="notice">${archived?'Архів порожній':'Активних звернень немає'}</div>`)+(archived?'':'<div class="card"><h3>Нове звернення</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="Опишіть, чим допомогти"></textarea><button class="primary" onclick="sendSupportMessage(0)">Надіслати підтримці</button></div>')}catch(e){panel.innerHTML+='<div class="notice">'+esc(e.message)+'</div>'}}
-let arcadeSession=null,arcadeRun=null,arcadeRaf=0,arcadePendingFinish=null;
+function loadStaffTools(){hideSections();$('banners').classList.add('hidden');$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML=`<h2>Робоча панель</h2><section class="ops-group"><h3>Клієнти / замовлення</h3><div class="formgrid">${canViewCustomers?'<button onclick="searchStaffCustomers()">Пошук CRM</button>':''}${canViewOrders?'<button onclick="loadStaffOrders()">Замовлення</button>':''}</div></section><section class="ops-group"><h3>Товари / склад</h3><div class="formgrid">${canManageCatalog?'<button onclick="loadStaffCatalog()">Редагувати товари</button>':''}${canManageInventory?'<button onclick="loadInventory()">Інвентаризації</button>':''}</div></section>${canManageOwner?'<section class="ops-group"><h3>Власник / звіти / керування</h3><div class="formgrid"><button onclick="loadOwnerAnalytics(this.dataset.period)" data-period="day">Аналітика джерел / воронки / рефералів</button><button onclick="loadReplenishment()">Закупівлі</button><button onclick="loadOwnerDashboard()">Панель власника</button><button onclick="renderBannerAdmin()">Банери</button></div></section>':''}<section class="ops-group"><h3>Підтримка</h3><div class="formgrid">${canViewSupport?'<button onclick="loadStaffSupport()">Чат підтримки</button>':''}</div></section><div id="staffContent"></div>`}
+async function loadКлієнтSupport(archived=false){let panel=$('supportPanel');panel.innerHTML=`<h2>Чат підтримки</h2><div class="formgrid"><button onclick="loadКлієнтSupport(false)">Активні</button><button onclick="loadКлієнтSupport(true)">Архів</button></div><div class="notice">Тут лише ваші звернення до підтримки — товари й історія замовлень окремо.</div>`;try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));panel.innerHTML+=((d.items||[]).map(t=>`<article class="card"><b>Звернення #${t.id}</b> · ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Підтримка':'Ви'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${!archived&&t.status!=='closed'?`<textarea id="reply-${t.id}" maxlength="4000" placeholder="Напишіть відповідь"></textarea><button onclick="sendSupportMessage(${t.id})">Надіслати</button>`:''}</article>`).join('')||`<div class="notice">${archived?'Архів порожній':'Активних звернень немає'}</div>`)+(archived?'':'<div class="card"><h3>Нове звернення</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="Опишіть, чим допомогти"></textarea><button class="primary" onclick="sendSupportMessage(0)">Надіслати підтримці</button></div>')}catch(e){panel.innerHTML+='<div class="notice">'+esc(e.message)+'</div>'}}
+let arcadeSession=null,arcadeRun=null,arcadeRaf=0,arcadeОчікуютьFinish=null;
 async function openArcade(){const o=$('gameOverlay');o.classList.add('open');o.setAttribute('aria-hidden','false');document.body.style.overflow='hidden';$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid';$('gameTitle').textContent='Хмаролов';$('gameMessage').textContent='Лови світлі хмаринки пальцем або мишкою. Червоні іскри забирають життя. Очки та рекорд — лише для розваги, без обміну на гроші чи товари.';$('gameStart').disabled=true;$('gameProfile').textContent='Завантажую твій рахунок…';try{const d=await api('/api/miniapp/arcade/status');$('gameProfile').textContent=`Твій рахунок: ${d.total_score} очок · Спроб до ліміту: ${d.losses_left}/3 за 24 год.`;if(!d.losses_left){$('gameMessage').textContent=`Спроби на сьогодні закінчилися. Нові з’являться після ${new Date(d.reset_at).toLocaleTimeString('uk-UA',{hour:'2-digit',minute:'2-digit'})}. Рахунок збережено.`;$('gameStart').textContent='Спроби закінчилися';$('gameStart').disabled=true}else{$('gameStart').textContent='Почати гру';$('gameStart').disabled=false}}catch(e){$('gameProfile').textContent=e.message;$('gameMessage').textContent='Щоб рахунок і ліміт спроб зберігались, відкрий Cloud Hub у Telegram та запусти гру ще раз.';$('gameStart').textContent='Потрібен вхід через Telegram';$('gameStart').disabled=true}}
 function closeArcade(){if(arcadeRun)finishArcade(true);const o=$('gameOverlay');o.classList.remove('open');o.setAttribute('aria-hidden','true');document.body.style.overflow=''}
 function sizeArcadeCanvas(){const c=$('gameCanvas'),r=$('gameStage').getBoundingClientRect(),d=Math.min(devicePixelRatio||1,2);c.width=Math.max(1,Math.floor(r.width*d));c.height=Math.max(1,Math.floor(r.height*d));c.getContext('2d').setTransform(d,0,0,d,0,0)}
-async function startArcade(){if(arcadePendingFinish){await submitArcadeFinish();return}if($('gameStart').disabled)return;$('gameStart').disabled=true;try{const d=await api('/api/miniapp/arcade/start',{method:'POST',body:'{}'});arcadeSession=d.session_id;arcadeRun={score:0,lives:3,time:45,last:0,spawn:0,items:[],playerX:0,done:false};$('gameResult').classList.add('hidden');$('gameResult').style.display='none';$('gameScore').textContent='0';$('gameLives').textContent='3';$('gameTime').textContent='45';sizeArcadeCanvas();arcadeRun.playerX=$('gameStage').getBoundingClientRect().width/2;arcadeRaf=requestAnimationFrame(drawArcade)}catch(e){msg(e.message);await openArcade()}}
-function finishArcade(lost){if(!arcadeRun||arcadeRun.done)return;arcadeRun.done=true;cancelAnimationFrame(arcadeRaf);arcadePendingFinish={session_id:arcadeSession,score:arcadeRun.score,lost};arcadeRun=null;submitArcadeFinish()}
-async function submitArcadeFinish(){if(!arcadePendingFinish)return;const payload=arcadePendingFinish;try{const d=await api('/api/miniapp/arcade/finish',{method:'POST',body:JSON.stringify(payload)});arcadePendingFinish=null;arcadeSession=null;$('gameTitle').textContent=payload.lost?'\u0429\u0435 \u043e\u0434\u043d\u0430 \u0441\u043f\u0440\u043e\u0431\u0430 \u2014 \u0456 \u0440\u0435\u0432\u0430\u043d\u0448!':'\u0427\u0443\u0434\u043e\u0432\u0430 \u0433\u0440\u0430!';$('gameMessage').textContent=`\u0417\u0430 \u0446\u044e \u0433\u0440\u0443: ${payload.score} \u043e\u0447\u043e\u043a. \u0417\u0430\u0433\u0430\u043b\u044c\u043d\u0438\u0439 \u0440\u0430\u0445\u0443\u043d\u043e\u043a: ${d.total_score}. ${payload.lost?'\u041f\u0440\u043e\u0433\u0440\u0430\u0448\u0456\u0432 \u0437\u0430 24 \u0433\u043e\u0434\u0438\u043d\u0438: '+(3-d.losses_left)+'/3.':'\u0426\u044c\u043e\u0433\u043e \u0440\u0430\u0443\u043d\u0434\u0443 \u0442\u0438 \u043d\u0435 \u043f\u0440\u043e\u0433\u0440\u0430\u0432 \u2014 \u043c\u043e\u0436\u043d\u0430 \u0437\u0456\u0433\u0440\u0430\u0442\u0438 \u0449\u0435.'}`;$('gameProfile').textContent=`\u0414\u043e \u043b\u0456\u043c\u0456\u0442\u0443 \u043f\u0440\u043e\u0433\u0440\u0430\u0448\u0456\u0432 \u0437\u0430\u043b\u0438\u0448\u0438\u043b\u043e\u0441\u044f ${d.losses_left} \u0437 3 \u0437\u0430 24 \u0433\u043e\u0434.`;$('gameStart').textContent=d.losses_left?'\u0417\u0456\u0433\u0440\u0430\u0442\u0438 \u0449\u0435':'\u0421\u043f\u0440\u043e\u0431\u0438 \u0437\u0430\u043a\u0456\u043d\u0447\u0438\u043b\u0438\u0441\u044f';$('gameStart').disabled=!d.losses_left;$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid'}catch(e){$('gameTitle').textContent='\u0420\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 \u043d\u0435 \u0437\u0431\u0435\u0440\u0456\u0433\u0441\u044f';$('gameMessage').textContent=e.message;$('gameStart').textContent='\u0421\u043f\u0440\u043e\u0431\u0443\u0432\u0430\u0442\u0438 \u0437\u0431\u0435\u0440\u0435\u0433\u0442\u0438';$('gameStart').disabled=false;$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid'}}
+async function startArcade(){if(arcadeОчікуютьFinish){await submitArcadeFinish();return}if($('gameStart').disabled)return;$('gameStart').disabled=true;try{const d=await api('/api/miniapp/arcade/start',{method:'POST',body:'{}'});arcadeSession=d.session_id;arcadeRun={score:0,lives:3,time:45,last:0,spawn:0,items:[],playerX:0,done:false};$('gameResult').classList.add('hidden');$('gameResult').style.display='none';$('gameScore').textContent='0';$('gameLives').textContent='3';$('gameTime').textContent='45';sizeArcadeCanvas();arcadeRun.playerX=$('gameStage').getBoundingClientRect().width/2;arcadeRaf=requestAnimationFrame(drawArcade)}catch(e){msg(e.message);await openArcade()}}
+function finishArcade(lost){if(!arcadeRun||arcadeRun.done)return;arcadeRun.done=true;cancelAnimationFrame(arcadeRaf);arcadeОчікуютьFinish={session_id:arcadeSession,score:arcadeRun.score,lost};arcadeRun=null;submitArcadeFinish()}
+async function submitArcadeFinish(){if(!arcadeОчікуютьFinish)return;const payload=arcadeОчікуютьFinish;try{const d=await api('/api/miniapp/arcade/finish',{method:'POST',body:JSON.stringify(payload)});arcadeОчікуютьFinish=null;arcadeSession=null;$('gameTitle').textContent=payload.lost?'\u0429\u0435 \u043e\u0434\u043d\u0430 \u0441\u043f\u0440\u043e\u0431\u0430 \u2014 \u0456 \u0440\u0435\u0432\u0430\u043d\u0448!':'\u0427\u0443\u0434\u043e\u0432\u0430 \u0433\u0440\u0430!';$('gameMessage').textContent=`\u0417\u0430 \u0446\u044e \u0433\u0440\u0443: ${payload.score} \u043e\u0447\u043e\u043a. \u0417\u0430\u0433\u0430\u043b\u044c\u043d\u0438\u0439 \u0440\u0430\u0445\u0443\u043d\u043e\u043a: ${d.total_score}. ${payload.lost?'\u041f\u0440\u043e\u0433\u0440\u0430\u0448\u0456\u0432 \u0437\u0430 24 \u0433\u043e\u0434\u0438\u043d\u0438: '+(3-d.losses_left)+'/3.':'\u0426\u044c\u043e\u0433\u043e \u0440\u0430\u0443\u043d\u0434\u0443 \u0442\u0438 \u043d\u0435 \u043f\u0440\u043e\u0433\u0440\u0430\u0432 \u2014 \u043c\u043e\u0436\u043d\u0430 \u0437\u0456\u0433\u0440\u0430\u0442\u0438 \u0449\u0435.'}`;$('gameProfile').textContent=`\u0414\u043e \u043b\u0456\u043c\u0456\u0442\u0443 \u043f\u0440\u043e\u0433\u0440\u0430\u0448\u0456\u0432 \u0437\u0430\u043b\u0438\u0448\u0438\u043b\u043e\u0441\u044f ${d.losses_left} \u0437 3 \u0437\u0430 24 \u0433\u043e\u0434.`;$('gameStart').textContent=d.losses_left?'\u0417\u0456\u0433\u0440\u0430\u0442\u0438 \u0449\u0435':'\u0421\u043f\u0440\u043e\u0431\u0438 \u0437\u0430\u043a\u0456\u043d\u0447\u0438\u043b\u0438\u0441\u044f';$('gameStart').disabled=!d.losses_left;$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid'}catch(e){$('gameTitle').textContent='\u0420\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 \u043d\u0435 \u0437\u0431\u0435\u0440\u0456\u0433\u0441\u044f';$('gameMessage').textContent=e.message;$('gameStart').textContent='\u0421\u043f\u0440\u043e\u0431\u0443\u0432\u0430\u0442\u0438 \u0437\u0431\u0435\u0440\u0435\u0433\u0442\u0438';$('gameStart').disabled=false;$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid'}}
 function drawArcade(now){if(!arcadeRun)return;const g=arcadeRun,c=$('gameCanvas'),ctx=c.getContext('2d'),w=c.clientWidth,h=c.clientHeight;if(!g.last)g.last=now;const dt=Math.min(.05,(now-g.last)/1000);g.last=now;g.time-=dt;g.spawn-=dt;if(g.spawn<=0){g.items.push({x:18+Math.random()*Math.max(1,w-36),y:-18,r:10+Math.random()*5,v:115+Math.random()*95,bad:Math.random()<.24,spin:Math.random()*6});g.spawn=.48+Math.random()*.45}g.items.forEach(a=>{a.y+=a.v*dt;a.spin+=dt*3});const px=g.playerX,py=h-37;for(let i=g.items.length-1;i>=0;i--){const a=g.items[i];if(a.y+a.r>=py-13&&a.y-a.r<=py+12&&Math.abs(a.x-px)<34){if(a.bad){g.lives--;$('gameLives').textContent=g.lives}else{g.score+=10;$('gameScore').textContent=g.score}g.items.splice(i,1);if(g.lives<=0){finishArcade(true);return}}else if(a.y>h+25)g.items.splice(i,1)}if(g.time<=0){$('gameTime').textContent='0';finishArcade(false);return}$('gameTime').textContent=Math.ceil(g.time);ctx.clearRect(0,0,w,h);for(const a of g.items){ctx.save();ctx.translate(a.x,a.y);ctx.rotate(a.spin);ctx.shadowBlur=18;ctx.shadowColor=a.bad?'#ff4b70':'#bd92ff';ctx.fillStyle=a.bad?'#ff526f':'#dfc6ff';ctx.beginPath();if(a.bad){for(let k=0;k<8;k++){const rr=k%2?a.r*.48:a.r,ang=k*Math.PI/4;ctx.lineTo(Math.cos(ang)*rr,Math.sin(ang)*rr)}}else ctx.arc(0,0,a.r,0,Math.PI*2);ctx.closePath();ctx.fill();ctx.restore()}ctx.save();ctx.translate(px,py);ctx.shadowBlur=20;ctx.shadowColor='#a56bff';ctx.fillStyle='#a878ff';ctx.beginPath();ctx.moveTo(-31,-9);ctx.quadraticCurveTo(-24,10,0,10);ctx.quadraticCurveTo(24,10,31,-9);ctx.lineTo(25,4);ctx.lineTo(-25,4);ctx.closePath();ctx.fill();ctx.restore();arcadeRaf=requestAnimationFrame(drawArcade)}
 function moveArcadePointer(e){if(!arcadeRun)return;const r=$('gameStage').getBoundingClientRect();arcadeRun.playerX=Math.max(32,Math.min(r.width-32,e.clientX-r.left))}
-$('search').addEventListener('input',renderProducts);$('gameFab').onclick=openArcade;$('gameClose').onclick=closeArcade;$('gameStart').onclick=startArcade;$('gameCanvas').addEventListener('pointermove',moveArcadePointer);$('gameCanvas').addEventListener('pointerdown',moveArcadePointer);window.addEventListener('resize',()=>{if($('gameOverlay').classList.contains('open')&&arcadeRun)sizeArcadeCanvas()});$('supportFab').onclick=openSupport;$('shopBtn').onclick=()=>renderProducts();$('favoritesBtn').onclick=loadFavorites;$('loyaltyBtn').onclick=loadLoyalty;$('cartBtn').onclick=showCart;$('ordersBtn').onclick=loadOrders;load();
+$('search').addEventListener('input',renderProducts);$('gameFab').onclick=openArcade;$('gameClose').onclick=closeArcade;$('gameStart').onclick=startArcade;$('gameCanvas').addEventListener('pointermove',moveArcadePointer);$('gameCanvas').addEventListener('pointerdown',moveArcadePointer);window.addEventListener('resize',()=>{if($('gameOverlay').classList.contains('open')&&arcadeRun)sizeArcadeCanvas()});$('supportFab').onclick=openSupport;$('shopBtn').onclick=()=>renderProducts();$('favoritesBtn').onclick=loadFavorites;$('loyaltyBtn').onclick=loadLoyalty;$('cartBtn').onclick=showCart;$('ordersBtn').onclick=loadЗамовлення;load();
 </script></main></body></html>"""
+
+
+SITE_ADMIN_HTML = r"""<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Cloud Hub — робоча панель</title><style>
+:root{color-scheme:dark;--bg:#0c0913;--panel:#191323;--line:#38294a;--muted:#b9adc8;--accent:#a36cff}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 45% -20%,#38205c,#100d18 55%);color:#f8f4ff;font:15px system-ui,sans-serif;min-height:100vh}button,input,select,textarea{font:inherit;color:inherit}button{border:1px solid var(--line);border-radius:12px;background:#211a2e;padding:10px 14px;cursor:pointer}button:hover{border-color:var(--accent)}button.primary{background:linear-gradient(135deg,#a56bff,#7041cf);border:0;font-weight:700}.shell{max-width:1450px;margin:auto;padding:22px}.login{max-width:440px;margin:8vh auto;padding:28px}.panel,.card{background:linear-gradient(145deg,#1b1527,#13101b);border:1px solid var(--line);border-radius:18px;padding:18px}.brand{font-size:20px;font-weight:800;color:#dec9ff}.muted,small{color:var(--muted)}.field{display:grid;gap:6px;margin:12px 0}.field input,.field select,.field textarea,input,select,textarea{background:#100d17;border:1px solid #423353;border-radius:10px;padding:11px;width:100%}.top,.row{display:flex;align-items:center;justify-content:space-between;gap:10px}.layout{display:grid;grid-template-columns:220px 1fr;gap:20px;margin-top:22px}.nav{align-self:start;position:sticky;top:16px;display:grid;gap:7px}.nav button{text-align:left}.nav button.active{border-color:#b587ff;background:#382456}.content{min-width:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.stack{display:grid;gap:10px}.toolbar{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.wide{width:100%}.hidden{display:none!important}.notice{padding:12px;border-radius:12px;background:#241b32;color:#ddd0ed}.scroll{overflow:auto}.table{width:100%;border-collapse:collapse}.table td,.table th{text-align:left;padding:10px;border-bottom:1px solid var(--line)}.photo{width:64px;height:64px;object-fit:contain;border-radius:10px;background:#0b0912}.split{display:grid;grid-template-columns:1fr 1fr;gap:10px}.permission-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:7px}.permission-list label{padding:8px;border:1px solid var(--line);border-radius:10px}.permission-list input,.check{width:auto}.ticket{white-space:pre-wrap;padding:12px;border-radius:12px;background:#20192b}.ticket.staff{margin-left:12%}.ticket.customer{margin-right:12%}.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#35214e;padding:12px 18px;border-radius:12px;z-index:10}@media(max-width:760px){.shell{padding:13px}.layout{grid-template-columns:1fr}.nav{position:static;display:flex;overflow:auto}.nav button{white-space:nowrap}.split{grid-template-columns:1fr}}
+</style></head><body><div id="app" class="shell"></div><div id="toast" class="toast hidden"></div><script>
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),money=n=>new Intl.NumberFormat('uk-UA',{style:'currency',currency:'UAH',maximumFractionDigits:2}).format(Number(n||0));let session=null;
+async function req(url,o={}){let h={...(o.headers||{})};if(!(o.body instanceof FormData))h['Content-Type']='application/json';if(session?.csrf_token)h['X-Admin-CSRF']=session.csrf_token;let r=await fetch(url,{...o,headers:h,credentials:'same-origin'}),d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||('Помилка '+r.status));return d}function say(t){let e=$('#toast');e.textContent=t;e.classList.remove('hidden');setTimeout(()=>e.classList.add('hidden'),3000)}
+async function boot(){try{session=await req('/api/site-admin/session');if(session.authenticated){shell();load('home')}else loginView(session.setup_required)}catch(e){$('#app').innerHTML=`<div class="login panel">${esc(e.message)}</div>`}}
+function loginView(setup){$('#app').innerHTML=`<div class="login panel"><div class="brand">☁ Cloud Hub</div><h1>${setup?'Перший вхід власника':'Вхід до робочої панелі'}</h1><p class="muted">${setup?'Підтвердьте власника в Telegram, тоді створіть окремий пароль сайту.':'Доступ видає власник. Сесія завершується через 12 годин.'}</p>${setup?'<button class="primary wide" onclick="approveOwner()">Підтвердити через Telegram</button><div id="setup" class="hidden"><label class="field">Логін<input id="su"></label><label class="field">Пароль від 12 символів<input id="sp" type="password"></label><button class="primary wide" onclick="bootstrapOwner()">Створити доступ власника</button></div>':'<label class="field">Логін<input id="u" autocomplete="username"></label><label class="field">Пароль<input id="p" type="password" autocomplete="current-password"></label><button class="primary wide" onclick="login()">Увійти</button>'}</div>`}
+async function approveOwner(){try{let d=await req('/api/miniapp/web-login',{method:'POST',body:'{}'});window.open(d.url,'_blank','noopener');say('Підтвердіть вхід у боті; чекаю…');for(let i=0;i<160;i++){await new Promise(r=>setTimeout(r,1800));let x=await req('/api/miniapp/web-login/status?token='+encodeURIComponent(d.token));if(x.authenticated){$('#setup').classList.remove('hidden');return say('Підтвердження є. Створіть логін і пароль.')}}say('Час запиту минув. Натисніть ще раз.')}catch(e){say(e.message)}}
+async function bootstrapOwner(){try{session=await req('/api/site-admin/bootstrap',{method:'POST',body:JSON.stringify({username:$('#su').value,password:$('#sp').value})});shell();load('home')}catch(e){say(e.message)}}async function login(){try{session=await req('/api/site-admin/login',{method:'POST',body:JSON.stringify({username:$('#u').value,password:$('#p').value})});shell();load('home')}catch(e){say(e.message)}}
+const nav=[['home','Огляд'],['orders','Замовлення'],['customers','CRM клієнтів'],['support','Підтримка'],['catalog','Товари й варіанти'],['inventory','Інвентаризація'],['banners','Банери й акції'],['delivery','Доставка / ТТН'],['staff','Працівники й доступ']];function shell(){$('#app').innerHTML=`<div class="top"><div class="brand">Cloud Hub <small>${esc(session.name)} ? ${esc(session.role)}</small></div><button onclick="logout()">Вийти</button></div><div class="layout"><nav class="nav">${nav.map(([k,v])=>`<button data-n="${k}" onclick="load('${k}')">${v}</button>`).join('')}</nav><main id="content" class="content"></main></div>`;let needs={orders:"orders.read",customers:"customers.read",support:"support.read",catalog:"catalog.read",inventory:"inventory.read",delivery:"delivery.read",banners:"catalog.update"};for(let [k,p] of Object.entries(needs))document.querySelector(`[data-n=${k}]`).classList.toggle("hidden",session.role!=="owner"&&!(session.permissions||[]).includes(p));document.querySelector("[data-n=staff]").classList.toggle("hidden",session.role!=="owner")}
+function begin(k){document.querySelectorAll('[data-n]').forEach(e=>e.classList.toggle('active',e.dataset.n===k));$('#content').innerHTML=`<h1>${nav.find(x=>x[0]===k)?.[1]||k}</h1><div id="view" class="stack"></div>`;return $('#view')}async function load(k){let v=begin(k);try{if(k==='home')return home(v);if(k==='orders')return orders(v);if(k==='customers')return customers(v);if(k==='support')return support(v);if(k==='catalog')return catalog(v);if(k==='inventory')return inventory(v);if(k==='banners')return banners(v);if(k==='delivery')return delivery(v);if(k==='staff')return staff(v)}catch(e){v.innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function home(v){if(session.role==="owner"){let d=await req("/api/miniapp/admin/dashboard"),fields=[["orders_today","Замовлень сьогодні"],["order_value_today","Сума сьогодні"],["orders_month","Замовлень за місяць"],["customers","Клієнтів"],["pending_orders","Очікують"],["delivered_month","Доставлено за місяць"]];v.innerHTML=`<div class="grid">${fields.map(([k,t])=>`<article class="card"><small>${t}</small><h2>${k.includes("value")?money(d[k]):esc(d[k])}</h2></article>`).join("")}</div><div class="card">Shared catalog, orders and customer records for website and Telegram.</div>`;return}let d=await req("/api/miniapp/staff/orders"),items=d.items||[];v.innerHTML=`<div class="grid"><article class="card"><small>Найновіші замовлення</small><h2>${items.length}</h2></article><article class="card"><small>Нові / чекають</small><h2>${items.filter(x=>["new","confirmed","packing"].includes(x.status)).length}</h2></article></div><div class="stack">${items.slice(0,8).map(o=>`<article class="card">#${esc(o.order_number)} ? ${esc(o.customer_name||"")} ? ${money(o.grand_total)} ? ${esc(o.status)}</article>`).join("")}</div>`}
+async function orders(v){v.innerHTML=`<div class="toolbar"><input id="orderq" placeholder="Number, phone or customer"><button onclick="orderSearch()">Search</button></div><div id="orderrows" class="stack"></div>`;await orderSearch()}async function orderSearch(){try{let q=encodeURIComponent($('#orderq').value||''),[d,leads]=await Promise.all([req("/api/miniapp/staff/orders?q="+q),req("/api/miniapp/staff/quick-orders?q="+q)]),editable=session.role==="owner"||(session.permissions||[]).includes("orders.update");let real=(d.items||[]).map(o=>`<article class="card"><div class="row"><b>#${esc(o.order_number)} ? ${esc(o.customer_name||'')}</b><b>${money(o.grand_total)}</b></div><p>${esc(o.phone||'')} ? ${esc(o.status)} ? ${esc(o.ttn||'')}</p>${editable?`<div class="toolbar"><select id="status-${Number(o.id)}"><option value="${esc(o.status)}" selected>${esc(o.status)}</option><option value="confirmed">confirmed</option><option value="packing">packing</option><option value="packed">packed</option><option value="ready_to_ship">ready to ship</option><option value="shipped">shipped</option><option value="delivered">delivered</option><option value="cancelled">cancelled</option><option value="problem">problem</option></select><button onclick="updateOrder(${Number(o.id)})">Зберегти статус</button></div>`:''}</article>`).join('');let quick=(leads.items||[]).map(o=>`<article class="card"><div class="row"><b>One-click ${esc(o.request_number)} ? ${esc(o.product_name_snapshot)} ${esc(o.variant_name_snapshot)}</b><span>${money(o.unit_price)}</span></div><p>${esc(o.contact)} ? ${esc(o.customer_name||'')}</p><p>${esc(o.comment||'No comment')} ? ${esc(o.state)}</p>${editable?`<div class="toolbar"><select id="quick-${Number(o.id)}"><option value="${esc(o.state)}" selected>${esc(o.state)}</option><option value="contacted">contacted</option><option value="converted">converted</option><option value="closed">closed</option></select><button onclick="updateQuickOrder(${Number(o.id)})">Зберегти статус заявки</button></div>`:''}</article>`).join('');$('#orderrows').innerHTML='<h2>Заявки ?купити в 1 ?????</h2>'+(quick||'<div class="notice">Нових заявок немає.</div>')+'<h2>Замовлення</h2>'+(real||'<div class="notice">Замовлень не знайдено.</div>')}catch(e){say(e.message)}}async function updateQuickOrder(id){try{await req("/api/miniapp/staff/quick-orders/"+id,{method:"PUT",body:JSON.stringify({state:$('#quick-'+id).value})});say("Request status updated");orderSearch()}catch(e){say(e.message)}}async function updateOrder(id){try{await req("/api/miniapp/staff/orders/"+id+"/status",{method:"PUT",body:JSON.stringify({status:$('#status-'+id).value})});say("Order status updated");orderSearch()}catch(e){say(e.message)}}function filter(id,q){let s=$('#'+q).value.toLowerCase();document.querySelectorAll('#'+id+' tr').forEach(x=>x.classList.toggle('hidden',!x.dataset.q.includes(s)))}
+async function customers(v){v.innerHTML='<div class="toolbar"><input id="cq" placeholder="Ім’я, телефон, Telegram ID, бонусна карта"><button class="primary" onclick="crm()">Знайти</button></div><div id="cr" class="stack"></div>'}async function crm(){try{let d=await req('/api/miniapp/staff/customers?q='+encodeURIComponent($('#cq').value));$('#cr').innerHTML=(d.items||[]).map(c=>`<article class="card"><b>${esc(c.full_name||c.first_name||'Клієнт')}</b><p>${esc(c.phone||'')} · ${esc(c.loyalty_card_number||'')}</p><small>Замовлень ${esc(c.order_count||0)} · сума ${money(c.lifetime_value)} · бонуси ${money(c.bonus_available)}</small><button onclick="crmDetail(${Number(c.id)})">Картка клієнта</button></article>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){say(e.message)}}async function crmDetail(id){try{let d=await req('/api/miniapp/staff/customers/'+id),c=d.customer,canOwner=session.role==='owner';let orders=(d.orders||[]).map(o=>`<article class="card">${esc(o.order_number)} ? ${esc(o.status)} ? ${money(o.grand_total)}<br><small>${esc(o.created_at||'')} ? ${esc(o.ttn||'')}</small></article>`).join('')||'<small>Замовлень немає</small>';let ledger=(d.loyalty||[]).map(x=>`<article class="card">${esc(x.transaction_type)} ? ${money(x.amount)} ? ${esc(x.state)}<br><small>${esc(x.reason||'')} ? ${esc(x.created_at||'')}</small></article>`).join('')||'<small>Операцій із бонусами немає</small>';$('#cr').insertAdjacentHTML('afterbegin',`<article class="card"><button onclick="this.parentElement.remove()">Закрити картку</button><h2>${esc(c.full_name||c.first_name||'Клієнт')}</h2><p>${esc(c.phone||'Телефон не вказано')} ? @${esc(c.username||'')} ? Telegram ${esc(c.telegram_id||'')}</p><p>Bonus card ${esc(c.loyalty_card_number||'?')} ? available ${money(c.bonus_available)} ? pending ${money(c.bonus_pending)}</p>${canOwner?`<div class="split"><input id="bonusValue-${id}" type="number" min="0.01" step="0.01" placeholder="Amount"><input id="bonusReason-${id}" placeholder="Required reason"></div><div class="toolbar"><button onclick="adjustКлієнтBonus(${id},'earn')">Нарахувати бонуси</button><button onclick="adjustКлієнтBonus(${id},'redeem')">Списати бонуси</button></div>`:''}<h3>Замовлення</h3><div class="stack">${orders}</div><h3>Історія бонусів</h3><div class="stack">${ledger}</div></article>`)}catch(e){say(e.message)}}async function adjustКлієнтBonus(id,operation){let value=$('#bonusValue-'+id).value,reason=$('#bonusReason-'+id).value;try{let d=await req('/api/miniapp/admin/loyalty-adjust',{method:'POST',body:JSON.stringify({customer_lookup:String(id),operation,amount:value,reason})});say('Bonus balance: '+money(d.available));crmDetail(id)}catch(e){say(e.message)}}
+async function support(v){let d=await req('/api/miniapp/staff/support?status=active');v.innerHTML=`<div class="toolbar"><button onclick="supportList('active')">Активні (${Math.min(5,(d.counts||{}).active||0)})</button><button onclick="supportList('archive')">Архів</button><button onclick="supportList('all')">Усі</button><input id="tq" placeholder="Пошук у повідомленнях"><button onclick="supportSearch()">Шукати</button></div><div id="tickets" class="stack">${ticketCards(d.items||[])}</div>`}function ticketCards(a){return a.map(t=>`<button class="card wide" style="text-align:left" onclick="ticket(${Number(t.id)})">#${Number(t.id)} · ${esc(t.subject||'Звернення')} · ${esc(t.status)}<p>${esc(t.latest_message||'')}</p></button>`).join('')||'<div class="notice">Тікетів немає.</div>'}async function supportList(s){try{let d=await req('/api/miniapp/staff/support?status='+s);$('#tickets').innerHTML=ticketCards(d.items||[])}catch(e){say(e.message)}}async function supportSearch(){try{let d=await req('/api/miniapp/staff/support?status=all&q='+encodeURIComponent($('#tq').value));$('#tickets').innerHTML=ticketCards(d.items||[])}catch(e){say(e.message)}}async function ticket(id){try{let d=await req('/api/miniapp/staff/support/'+id),t=d.ticket,canReply=session.role==='owner'||(session.permissions||[]).includes('support.reply');$('#content').innerHTML=`<button onclick="load('support')">← До черги</button><h1>Тікет #${id}</h1><div class="stack">${(t.messages||[]).map(m=>`<article class="ticket ${m.sender_type==='staff'?'staff':'customer'}">${esc(m.sender_type)} · ${esc(m.created_at||'')}<p>${esc(m.body)}</p></article>`).join('')}</div>${t.status==='closed'?'<div class="notice">Тікет закрито.</div>':'<textarea id="reply" placeholder="Відповідь клієнту"></textarea><button class="primary" onclick="reply(${id})">Надіслати</button><button onclick="closeTicket('+id+')">Закрити тікет</button>'}`}catch(e){say(e.message)}}async function reply(id){try{await req('/api/miniapp/staff/support/'+id+'/reply',{method:'POST',body:JSON.stringify({message:$('#reply').value})});ticket(id)}catch(e){say(e.message)}}async function closeTicket(id){try{await req('/api/miniapp/staff/support/'+id+'/status',{method:'PUT',body:JSON.stringify({status:'closed'})});load('support')}catch(e){say(e.message)}}
+async function catalog(v){let d=await req('/api/miniapp/staff/catalog');v.innerHTML=`<input id="pq" placeholder="Назва або SKU" oninput="products()"><div id="prod" class="stack">${prodCards(d)}</div>`}function prodCards(d){return(d.items||[]).map(p=>`<article class="card" data-p="${p.product_id}" data-v="${p.variant_id}">${p.media_id?`<img class="photo" src="/api/miniapp/products/${p.media_id}/photo">`:''}<div class="row"><b>${esc(p.name)} ${esc(p.variant_name||'')}</b>${money(p.price)}</div><small>SKU ${esc(p.sku||'')} · склад ${Number(p.stock_qty)}</small><div class="split"><input data-f="name" value="${esc(p.name)}" placeholder="Назва"><input data-f="price" type="number" step=".01" value="${Number(p.price)}"></div><textarea data-f="description" placeholder="Опис">${esc(p.description||'')}</textarea><select data-f="category"><option value="">Без категорії</option>${(d.categories||[]).map(c=>`<option value="${c.id}" ${Number(c.id)===Number(p.category_id)?'selected':''}>${esc(c.name)}</option>`).join('')}</select><select data-f="badge">${['','Bestseller','MEGA SALE','Акція','Новинка','Хіт'].map(x=>`<option value="${x}" ${p.storefront_badge===x?'selected':''}>${x||'Без плашки'}</option>`).join('')}</select><label>Фото <input data-f="photo" type="file" accept="image/jpeg,image/png,image/webp"></label><label><input data-f="active" type="checkbox" ${p.active?'checked':''}> Активний</label><label><input data-f="hidden" type="checkbox" ${p.manually_hidden?'checked':''}> Прихований</label><div class="toolbar"><button class="primary" onclick="saveProduct(this)">Зберегти</button><button onclick="photoProduct(this)">Замінити фото</button></div></article>`).join('')||'<div class="notice">Немає товарів.</div>'}function lockCatalogControls(){if(session.role==='owner'||(session.permissions||[]).includes('catalog.update'))return;document.querySelectorAll('#prod [data-f]').forEach(x=>x.disabled=true);document.querySelectorAll('#prod .toolbar').forEach(x=>x.classList.add('hidden'))}async function products(){try{let d=await req('/api/miniapp/staff/catalog?q='+encodeURIComponent($('#pq').value));$('#prod').innerHTML=prodCards(d);lockCatalogControls()}catch(e){say(e.message)}}async function saveProduct(b){let c=b.closest('[data-p]'),g=n=>c.querySelector(`[data-f=${n}]`);try{await req('/api/miniapp/staff/catalog/'+c.dataset.p,{method:'PUT',body:JSON.stringify({variant_id:c.dataset.v,name:g('name').value,price:g('price').value,description:g('description').value,category_id:g('category').value||null,storefront_badge:g('badge').value,active:g('active').checked,manually_hidden:g('hidden').checked,reason:'website admin'})});say('Збережено')}catch(e){say(e.message)}}async function photoProduct(b){let c=b.closest('[data-p]'),f=c.querySelector('[data-f=photo]').files[0];if(!f)return say('Виберіть фото');let fd=new FormData();fd.append('photo',f);try{await req('/api/miniapp/staff/catalog/'+c.dataset.p+'/photo',{method:'POST',body:fd});say('Фото збережено');products()}catch(e){say(e.message)}}
+async function inventory(v){let d=await req('/api/miniapp/staff/inventory?archived=0');v.innerHTML=`<button class="primary" onclick="startInventory()">Почати інвентаризацію</button><button onclick="inventoryArchive()">Архів</button><div class="stack">${(d.items||[]).map(x=>`<article class="card">Інвентаризація #${esc(x.id)} · ${esc(x.status)} <button onclick="openInventory(${Number(x.id)})">Відкрити</button></article>`).join('')||'<div class="notice">Активних немає.</div>'}</div>`}async function inventoryArchive(){try{let d=await req('/api/miniapp/staff/inventory?archived=1');$('#content').innerHTML='<h1>Архів інвентаризацій</h1><button onclick="load(\'inventory\')">Назад</button>'+((d.items||[]).map(x=>`<article class="card">#${esc(x.id)} · ${esc(x.status)} · ${esc(x.created_at||'')}</article>`).join('')||'<div class="notice">Архів порожній.</div>')}catch(e){say(e.message)}}async function startInventory(){try{let d=await req("/api/miniapp/staff/inventory",{method:"POST",body:"{}"});openInventory(d.count_id)}catch(e){say(e.message)}}async function openInventory(id){try{let d=await req("/api/miniapp/staff/inventory/"+id);$('#content').innerHTML=`<h1>Inventory #${Number(id)} ? ${esc(d.status)}</h1><div class="stack">${(d.items||[]).map(i=>`<article class="card">${i.photo_id?`<img class="photo" src="/api/miniapp/products/${Number(i.photo_id)}/photo">`:''}<b>${esc(i.name)} ? ${esc(i.sku||'')}</b><p>System ${Number(i.system_qty_snapshot)} ? counted ${i.actual_qty===null?'?':Number(i.actual_qty)} ? shortage ${Number(i.shortage_qty||0)}</p><div class="toolbar"><button onclick="setCount(${Number(id)},${Number(i.variant_id)},${Math.max(0,Number(i.actual_qty||0)-1)})">?</button><b>${i.actual_qty===null?'?':Number(i.actual_qty)}</b><button onclick="setCount(${Number(id)},${Number(i.variant_id)},${Number(i.actual_qty||0)+1})">+</button></div></article>`).join('')}</div>${d.status==='counting'&&['owner','admin'].includes(session.role)?`<button class="primary" onclick="confirmInventory(${Number(id)})">Підтвердити інвентаризацію і оновити залишки</button>`:''}`}catch(e){say(e.message)}}async function confirmInventory(id){if(!confirm("Confirm these counts and apply stock differences? A PDF report will be sent to the owner."))return;try{let d=await req(`/api/miniapp/staff/inventory/${id}/confirm`,{method:"POST",body:JSON.stringify({reason:"Confirmed from website admin"})});say(`Reconciled. Shortages: ${d.shortage_units} units across ${d.shortage_skus} products.`);load("inventory")}catch(e){say(e.message)}}async function setCount(id,variant_id,actual_qty){try{await req(`/api/miniapp/staff/inventory/${id}/item`,{method:"PUT",body:JSON.stringify({variant_id,actual_qty})});openInventory(id)}catch(e){say(e.message)}}async function inventoryArchive(){try{let d=await req("/api/miniapp/staff/inventory?archived=1");$('#content').innerHTML=`<h1>Архів інвентаризацій</h1><button onclick="load('inventory')">Back</button>${(d.items||[]).map(x=>`<article class="card">#${esc(x.id)} ? ${esc(x.status)} ? ${esc(x.created_at||'')}</article>`).join('')||'<div class="notice">Архів порожній.</div>'}`}catch(e){say(e.message)}}async function banners(v){let d=await req('/api/miniapp/admin/banners');v.innerHTML=`<p class="muted">Акції та банери для сайту й магазину.</p><div id="bs" class="stack">${(d.banners||[]).map(bannerRow).join('')}</div><button onclick="addBanner()">Додати банер</button><button class="primary" onclick="saveBanners()">Зберегти</button>`}function bannerRow(b={}){return `<article class="card" data-b><input data-k="title" placeholder="Заголовок" value="${esc(b.title||'')}"><select data-k="placement"><option value="website_top" ${b.placement==='website_top'?'selected':''}>Верх сайту</option><option value="website_bottom" ${b.placement==='website_bottom'?'selected':''}>Низ сайту</option><option value="home_top" ${!b.placement||b.placement==='home_top'?'selected':''}>Головна</option></select><textarea data-k="body" placeholder="Текст">${esc(b.body||'')}</textarea><input data-k="image_url" placeholder="URL зображення" value="${esc(b.image_url||'')}"><input data-k="link_url" placeholder="Посилання" value="${esc(b.link_url||'')}"><label><input data-k="active" type="checkbox" ${b.active?'checked':''}> Активний</label><button onclick="this.closest('[data-b]').remove()">Видалити</button></article>`}function addBanner(){$('#bs').insertAdjacentHTML('beforeend',bannerRow({active:true}))}async function saveBanners(){let banners=[...document.querySelectorAll('[data-b]')].map(e=>{let x={};e.querySelectorAll('[data-k]').forEach(i=>x[i.dataset.k]=i.type==='checkbox'?i.checked:i.value);return x});try{await req('/api/miniapp/admin/banners',{method:'PUT',body:JSON.stringify({banners})});say('Банери збережено')}catch(e){say(e.message)}}
+async function delivery(v){let d=await req("/api/site-admin/ttn"),items=d.items||[];v.innerHTML=`<div class="grid"><article class="card">Nova Poshta API key: ${d.configuration?.api_key_configured?"configured":"missing"}</article><article class="card">Sender details: ${d.configuration?.sender_configured?"configured":"incomplete"}</article></div><div class="notice">Замовлення are saved before the carrier request. Safe connection/rate-limit failures retry with backoff. Ambiguous results require checking the carrier cabinet before any manual retry.</div><div class="stack">${items.map(o=>`<article class="card"><div class="row"><b>#${esc(o.order_number)} ? ${esc(o.customer_name||'')}</b><span>${esc(o.state)}</span></div><p>${esc(o.phone||'')} ? TTN ${esc(o.ttn||'not created')} ? attempts ${Number(o.attempts)}</p><small>${esc(o.last_error||'')} ? next: ${esc(o.next_attempt_at||'')}</small>${session.role==='owner'&&['failed','uncertain'].includes(o.state)&&!o.ttn?`<p><button onclick="retryTtn(${Number(o.order_id)})">Retry after cabinet check</button></p>`:''}</article>`).join('')||'<div class="notice">No queued TTN jobs.</div>'}` }async function retryTtn(id){if(!confirm("Confirm you checked Nova Poshta business cabinet and no TTN exists for this order?"))return;try{await req("/api/site-admin/ttn/"+id+"/retry",{method:"POST",body:JSON.stringify({verified_no_existing_ttn:true})});say("Retry queued");load("delivery")}catch(e){say(e.message)}}
+async function staff(v){if(session.role!=="owner")return v.innerHTML="<div class=notice>Лише власнику.</div>";let d=await req("/api/site-admin/staff");session.permission_options=d.permission_options;v.innerHTML=`<div class="notice">Issue an individual website password. Permissions apply to website and Telegram staff actions.</div><article class="card"><h2>Issue staff access</h2><div class="split"><input id="tgid" type="number" placeholder="Telegram ID"><input id="dname" placeholder="Employee name"><input id="duser" placeholder="Username"><input id="dpass" type="password" placeholder="Password, 12+ characters"><select id="drole"><option>manager</option><option>admin</option><option>packer</option><option>courier</option></select></div><h3>Permissions</h3><div class="permission-list">${d.permission_options.map(p=>`<label><input type="checkbox" data-perm value="${esc(p)}"> ${esc(p)}</label>`).join("")}</div><button class="primary" onclick="createStaff()">Create employee account</button></article><div class="stack">${d.items.map(a=>`<article class="card" data-staff="${Number(a.telegram_id)}"><b>${esc(a.display_name)} ? ${esc(a.role)}</b><p><small>Telegram ${esc(a.telegram_id)} ? ${esc(a.username||"no website login")} ? ${a.active?"active":"disabled"}</small></p>${a.role!=="owner"?`<div class="split"><select data-role><option value="admin" ${a.role==="admin"?"selected":""}>admin</option><option value="manager" ${a.role==="manager"?"selected":""}>manager</option><option value="packer" ${a.role==="packer"?"selected":""}>packer</option><option value="courier" ${a.role==="courier"?"selected":""}>courier</option></select><button onclick="resetPassword(${Number(a.telegram_id)})">Reset password</button></div><details><summary>Permissions</summary><div class="permission-list">${d.permission_options.map(p=>`<label><input data-existingperm value="${esc(p)}" type="checkbox" ${(a.effective_permissions||[]).includes(p)?"checked":""}> ${esc(p)}</label>`).join("")}</div><button onclick="saveStaff(${Number(a.telegram_id)})">Save role and permissions</button></details><button onclick="toggleStaff(${Number(a.telegram_id)},${!a.active})">${a.active?"Disable access":"Enable access"}</button>`:`Owner account ${Number(a.telegram_id)===Number(session.telegram_id)?`<button onclick="changeOwnerPassword()">Change owner password</button>`:""}`}</article>`).join("")}</div>`}async function saveStaff(id){let c=document.querySelector(`[data-staff="${id}"]`);try{await req("/api/site-admin/staff/"+id,{method:"PUT",body:JSON.stringify({role:c.querySelector("[data-role]").value,permissions:[...c.querySelectorAll("[data-existingperm]:checked")].map(x=>x.value)})});say("Permissions saved");load("staff")}catch(e){say(e.message)}}async function createStaff(){try{await req('/api/site-admin/staff',{method:'POST',body:JSON.stringify({telegram_id:$('#tgid').value,display_name:$('#dname').value,username:$('#duser').value,password:$('#dpass').value,role:$('#drole').value,permissions:[...document.querySelectorAll('[data-perm]:checked')].map(x=>x.value)})});say('Доступ видано');load('staff')}catch(e){say(e.message)}}async function changeOwnerPassword(){let current_password=prompt("Поточний пароль");if(!current_password)return;let password=prompt("Новий пароль (від 12 символів)");if(!password)return;let confirmPassword=prompt("Повторіть новий пароль");if(password!==confirmPassword)return say("Паролі не збігаються");try{await req("/api/site-admin/staff/"+session.telegram_id,{method:"PUT",body:JSON.stringify({current_password,password})});say("Пароль власника змінено")}catch(e){say(e.message)}}async function resetPassword(id){let password=prompt('Новий пароль, мінімум 12 символів');if(!password)return;try{await req('/api/site-admin/staff/'+id,{method:'PUT',body:JSON.stringify({password})});say('Пароль змінено; старі входи завершено')}catch(e){say(e.message)}}async function toggleStaff(id,active){try{await req('/api/site-admin/staff/'+id,{method:'PUT',body:JSON.stringify({active})});load('staff')}catch(e){say(e.message)}}async function logout(){try{await req('/api/site-admin/logout',{method:'POST',body:'{}'});location.reload()}catch(e){say(e.message)}}boot();
+</script></body></html>"""
+
+
+def _site_admin_session_record():
+    token = request.cookies.get("cloudhub_admin_session", "")
+    if not token or len(token) > 128:
+        return None
+    token_hash = hashlib.sha256(token.encode("ascii", errors="ignore")).hexdigest()
+    with db_cursor() as cur:
+        cur.execute("""SELECT s.telegram_id,s.csrf_token FROM staff_web_sessions s
+                       JOIN staff_web_accounts a ON a.telegram_id=s.telegram_id AND a.active=TRUE
+                       JOIN staff f ON f.telegram_id=s.telegram_id AND f.active=TRUE
+                       WHERE s.token_hash=%s AND s.expires_at>NOW()""", (token_hash,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    staff = get_staff(int(row["telegram_id"]))
+    if not staff:
+        return None
+    with db_cursor() as cur:
+        cur.execute("SELECT state FROM staff_security_state WHERE telegram_id=%s", (staff.telegram_id,))
+        state = cur.fetchone()
+    if state and state.get("state") != "active":
+        return None
+    return {"staff": staff, "csrf_token": str(row["csrf_token"])}
+
+
+def _site_admin_staff():
+    session = _site_admin_session_record()
+    return session["staff"] if session else None
+
+
+def _site_admin_require_csrf() -> None:
+    session = _site_admin_session_record()
+    supplied = request.headers.get("X-Admin-CSRF", "")
+    if not session or not supplied or not hmac.compare_digest(supplied, session["csrf_token"]):
+        raise PermissionError("Admin session expired or CSRF validation failed.")
+
+
+_SITE_ADMIN_PERMISSION_OPTIONS = tuple(sorted({p for values in PERMISSIONS.values() for p in values if p != "*"}))
+_SITE_ADMIN_PBKDF2_ROUNDS = 310_000
+
+
+def _site_admin_password(password: str, salt: Optional[bytes] = None) -> tuple[str, str]:
+    if not isinstance(password, str) or not 12 <= len(password) <= 256:
+        raise ValueError("Password must contain 12 to 256 characters.")
+    salt = salt or secrets.token_bytes(24)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _SITE_ADMIN_PBKDF2_ROUNDS)
+    return salt.hex(), digest.hex()
+
+
+def _site_admin_issue_session(staff: Staff, csrf_token: str):
+    token = secrets.token_urlsafe(48)
+    with db_cursor() as cur:
+        cur.execute("INSERT INTO staff_web_sessions(token_hash,telegram_id,csrf_token,expires_at) VALUES(%s,%s,%s,NOW()+INTERVAL '12 hours')",
+                    (hashlib.sha256(token.encode("ascii")).hexdigest(), staff.telegram_id, csrf_token))
+    response = jsonify({"ok": True, "csrf_token": csrf_token, "telegram_id": staff.telegram_id, "name": staff.display_name,
+                        "role": staff.role, "permissions": sorted(_SITE_ADMIN_PERMISSION_OPTIONS if staff.role == "owner" else
+                            (staff.permission_override if staff.permission_override is not None else PERMISSIONS.get(staff.role, set())))})
+    response.set_cookie("cloudhub_admin_session", token, max_age=12*60*60, httponly=True,
+                        secure=request.is_secure or _public_site_base().startswith("https://"),
+                        samesite="Strict", path="/")
+    return response
+
+
+def _site_admin_audit(actor: Staff, action: str, entity_id: str, after: dict) -> None:
+    with db_cursor() as cur:
+        cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data)
+                       VALUES(%s,%s,%s,'staff_web_account',%s,%s::jsonb)""",
+                    (actor.telegram_id, actor.role, action, entity_id, json_dumps(after)))
+
+
+@miniapp.get("/admin")
+def site_admin_page():
+    return Response(SITE_ADMIN_HTML, mimetype="text/html; charset=utf-8",
+                    headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                             "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+                             "Referrer-Policy": "same-origin",
+                             "Content-Security-Policy": "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"})
+
+
+def _site_admin_origin_allowed() -> bool:
+    origin = urllib.parse.urlsplit(request.headers.get("Origin", ""))
+    if not origin.hostname or origin.netloc.casefold() != request.host.casefold() or origin.scheme not in {"https", "http"}:
+        return False
+    return not _public_site_base().startswith("https://") or origin.scheme == "https"
+
+
+@miniapp.get("/api/site-admin/session")
+def site_admin_session():
+    try:
+        session = _site_admin_session_record()
+        if session:
+            staff = session["staff"]
+            permissions = sorted(_SITE_ADMIN_PERMISSION_OPTIONS if staff.role == "owner" else
+                                 (staff.permission_override if staff.permission_override is not None else PERMISSIONS.get(staff.role, set())))
+            return jsonify({"authenticated": True, "name": staff.display_name, "role": staff.role,
+                            "telegram_id": staff.telegram_id, "permissions": permissions, "csrf_token": session["csrf_token"]})
+        with db_cursor() as cur:
+            cur.execute("SELECT EXISTS(SELECT 1 FROM staff_web_accounts a JOIN staff s USING(telegram_id) WHERE s.role='owner' AND a.active=TRUE) AS configured")
+            configured = bool(cur.fetchone()["configured"])
+        return jsonify({"authenticated": False, "setup_required": not configured})
+    except Exception:
+        log.exception("Site admin session check failed")
+        return jsonify({"error": "Admin sign-in is temporarily unavailable."}), 500
+
+
+@miniapp.post("/api/site-admin/bootstrap")
+def site_admin_bootstrap():
+    try:
+        if not _site_admin_origin_allowed():
+            return jsonify({"error": "Cross-origin request rejected."}), 403
+        if not request.cookies.get("cloudhub_web_session"):
+            return jsonify({"error": "Approve the first owner setup in Telegram first."}), 401
+        user = _miniapp_auth_user()
+        owner = get_staff(user.id)
+        if not owner or owner.role != "owner" or not owner.active:
+            return jsonify({"error": "Only the active store owner can create the first site admin login."}), 403
+        body = request.get_json(silent=True) or {}
+        username = str(body.get("username") or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9._-]{3,40}", username):
+            return jsonify({"error": "Username must be 3–40 characters: a–z, 0–9, dot, dash or underscore."}), 400
+        salt, password_hash = _site_admin_password(body.get("password") or "")
+        with db_cursor() as cur:
+            cur.execute("SELECT EXISTS(SELECT 1 FROM staff_web_accounts a JOIN staff s USING(telegram_id) WHERE s.role='owner' AND a.active=TRUE) AS configured")
+            if cur.fetchone()["configured"]:
+                return jsonify({"error": "Owner web access has already been initialized."}), 409
+            cur.execute("INSERT INTO staff_web_accounts(telegram_id,username,password_salt,password_hash,custom_permissions_enabled,created_by) VALUES(%s,%s,%s,%s,FALSE,%s) ON CONFLICT(telegram_id) DO NOTHING",
+                        (owner.telegram_id, username, salt, password_hash, owner.telegram_id))
+            if cur.rowcount != 1:
+                return jsonify({"error": "Owner web access has already been initialized."}), 409
+        _site_admin_audit(owner, "site_admin.owner_bootstrap", str(owner.telegram_id), {"username": username})
+        return _site_admin_issue_session(owner, secrets.token_urlsafe(32))
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Site admin bootstrap failed")
+        return jsonify({"error": "Could not create the owner site login."}), 500
+
+
+@miniapp.post("/api/site-admin/login")
+def site_admin_login():
+    try:
+        if not _site_admin_origin_allowed():
+            return jsonify({"error": "Cross-origin request rejected."}), 403
+        body = request.get_json(silent=True) or {}
+        username = str(body.get("username") or "").strip().lower()[:40]
+        password = str(body.get("password") or "")
+        if not username or len(password) > 256:
+            return jsonify({"error": "Invalid username or password."}), 401
+        with db_cursor() as cur:
+            cur.execute("""SELECT a.telegram_id,a.password_salt,a.password_hash,a.failed_attempts,a.locked_until,
+                                  a.active account_active,s.display_name,s.role,s.active staff_active
+                           FROM staff_web_accounts a JOIN staff s ON s.telegram_id=a.telegram_id
+                           WHERE a.username=%s FOR UPDATE OF a""", (username,))
+            account = cur.fetchone()
+            if not account or not account["account_active"] or not account["staff_active"]:
+                return jsonify({"error": "Invalid username or password."}), 401
+            if account.get("locked_until") and account["locked_until"] > datetime.now(timezone.utc):
+                return jsonify({"error": "Too many attempts. Try again later."}), 429
+            salt = bytes.fromhex(account["password_salt"])
+            candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _SITE_ADMIN_PBKDF2_ROUNDS).hex()
+            if not hmac.compare_digest(candidate, str(account["password_hash"])):
+                cur.execute("""UPDATE staff_web_accounts SET failed_attempts=failed_attempts+1,
+                               locked_until=CASE WHEN failed_attempts+1>=8 THEN NOW()+INTERVAL '15 minutes' ELSE locked_until END,
+                               updated_at=NOW() WHERE telegram_id=%s""", (account["telegram_id"],))
+                return jsonify({"error": "Invalid username or password."}), 401
+            cur.execute("UPDATE staff_web_accounts SET failed_attempts=0,locked_until=NULL,updated_at=NOW() WHERE telegram_id=%s", (account["telegram_id"],))
+        staff = get_staff(int(account["telegram_id"]))
+        if not staff:
+            return jsonify({"error": "Invalid username or password."}), 401
+        csrf_token = secrets.token_urlsafe(32)
+        return _site_admin_issue_session(staff, csrf_token)
+    except Exception:
+        log.exception("Site admin login failed")
+        return jsonify({"error": "Admin sign-in is temporarily unavailable."}), 500
+
+
+@miniapp.post("/api/site-admin/logout")
+def site_admin_logout():
+    try:
+        _site_admin_require_csrf()
+        token = request.cookies.get("cloudhub_admin_session", "")
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM staff_web_sessions WHERE token_hash=%s", (hashlib.sha256(token.encode("ascii", errors="ignore")).hexdigest(),))
+        response = jsonify({"ok": True})
+        response.delete_cookie("cloudhub_admin_session", path="/", secure=request.is_secure or _public_site_base().startswith("https://"), httponly=True, samesite="Strict")
+        return response
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+
+
+@miniapp.get("/api/site-admin/staff")
+def site_admin_staff_list():
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_owner(user)
+        with db_cursor() as cur:
+            cur.execute("""SELECT s.telegram_id,s.display_name,s.role,s.active,a.username,
+                                 COALESCE(a.custom_permissions_enabled,FALSE) custom_permissions_enabled,
+                                 COALESCE(array_agg(g.permission) FILTER(WHERE g.permission IS NOT NULL),'{}') permissions
+                          FROM staff s LEFT JOIN staff_web_accounts a USING(telegram_id)
+                          LEFT JOIN staff_permission_grants g USING(telegram_id)
+                          GROUP BY s.telegram_id,s.display_name,s.role,s.active,a.username,a.custom_permissions_enabled
+                          ORDER BY s.role,s.display_name""")
+            rows = cur.fetchall()
+        for row in rows:
+            row["effective_permissions"] = sorted(
+                {p for p in (row.get("permissions") or []) if p != "*"}
+                if row.get("custom_permissions_enabled") else PERMISSIONS.get(row["role"], set()) - {"*"}
+            )
+        return jsonify({"items": rows, "permission_options": sorted(_SITE_ADMIN_PERMISSION_OPTIONS)})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Site admin staff list failed")
+        return jsonify({"error": "Could not load staff accounts."}), 500
+
+
+@miniapp.post("/api/site-admin/staff")
+def site_admin_staff_create():
+    try:
+        actor = _miniapp_require_owner(_miniapp_auth_user())
+        body = request.get_json(silent=True) or {}
+        telegram_id = int(body.get("telegram_id") or 0)
+        display_name = " ".join(str(body.get("display_name") or "").split())[:120]
+        username = str(body.get("username") or "").strip().lower()
+        role = str(body.get("role") or "")
+        permissions = body.get("permissions") or []
+        if telegram_id <= 0 or not display_name:
+            return jsonify({"error": "Telegram ID та ім’я працівника обов’язкові."}), 400
+        if role not in {"admin", "manager", "packer", "courier"}:
+            return jsonify({"error": "Недопустима роль."}), 400
+        if not re.fullmatch(r"[a-z0-9._-]{3,40}", username):
+            return jsonify({"error": "Логін має містити 3–40 латинських символів, цифр, крапок, дефісів або підкреслень."}), 400
+        if not isinstance(permissions, list) or any(p not in _SITE_ADMIN_PERMISSION_OPTIONS for p in permissions):
+            return jsonify({"error": "Некоректний список дозволів."}), 400
+        salt, password_hash = _site_admin_password(body.get("password") or "")
+        with db_cursor() as cur:
+            cur.execute("SELECT role FROM staff WHERE telegram_id=%s", (telegram_id,))
+            existing_staff = cur.fetchone()
+            if existing_staff and existing_staff["role"] == "owner":
+                return jsonify({"error": "Owner access cannot be changed through staff issuance."}), 400
+            cur.execute("""INSERT INTO staff(telegram_id,display_name,role,active) VALUES(%s,%s,%s,TRUE)
+                           ON CONFLICT(telegram_id) DO UPDATE SET display_name=EXCLUDED.display_name,role=EXCLUDED.role,active=TRUE,updated_at=NOW()""",
+                        (telegram_id, display_name, role))
+            cur.execute("""INSERT INTO staff_web_accounts(telegram_id,username,password_salt,password_hash,custom_permissions_enabled,created_by)
+                           VALUES(%s,%s,%s,%s,TRUE,%s) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,
+                           password_salt=EXCLUDED.password_salt,password_hash=EXCLUDED.password_hash,custom_permissions_enabled=TRUE,
+                           active=TRUE,failed_attempts=0,locked_until=NULL,updated_at=NOW()""",
+                        (telegram_id, username, salt, password_hash, actor.telegram_id))
+            cur.execute("DELETE FROM staff_permission_grants WHERE telegram_id=%s", (telegram_id,))
+            for permission in sorted(set(permissions)):
+                cur.execute("INSERT INTO staff_permission_grants(telegram_id,permission,granted_by) VALUES(%s,%s,%s)",
+                            (telegram_id, permission, actor.telegram_id))
+            cur.execute("DELETE FROM staff_web_sessions WHERE telegram_id=%s", (telegram_id,))
+        _site_admin_audit(actor, "site_admin.staff_access_issued", str(telegram_id),
+                          {"role": role, "username": username, "permissions": sorted(set(permissions))})
+        return jsonify({"ok": True}), 201
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Site admin staff account issue failed")
+        return jsonify({"error": "Could not save staff access. Check for duplicate username."}), 500
+
+
+@miniapp.put("/api/site-admin/staff/<int:telegram_id>")
+def site_admin_staff_update(telegram_id: int):
+    try:
+        actor = _miniapp_require_owner(_miniapp_auth_user())
+        body = request.get_json(silent=True) or {}
+        if telegram_id == actor.telegram_id:
+            current_password = str(body.get("current_password") or "")
+            new_password = str(body.get("password") or "")
+            with db_cursor() as cur:
+                cur.execute("SELECT password_salt,password_hash FROM staff_web_accounts WHERE telegram_id=%s AND active=TRUE", (telegram_id,))
+                account = cur.fetchone()
+            if not account or not current_password:
+                return jsonify({"error": "Enter your current password."}), 400
+            old_hash = hashlib.pbkdf2_hmac("sha256", current_password.encode("utf-8"),
+                                           bytes.fromhex(account["password_salt"]), _SITE_ADMIN_PBKDF2_ROUNDS).hex()
+            if not hmac.compare_digest(old_hash, str(account["password_hash"])):
+                return jsonify({"error": "Поточний пароль is incorrect."}), 403
+            salt, digest = _site_admin_password(new_password)
+            token = request.cookies.get("cloudhub_admin_session", "")
+            current_hash = hashlib.sha256(token.encode("ascii", errors="ignore")).hexdigest()
+            with db_cursor() as cur:
+                cur.execute("UPDATE staff_web_accounts SET password_salt=%s,password_hash=%s,failed_attempts=0,locked_until=NULL,updated_at=NOW() WHERE telegram_id=%s",
+                            (salt, digest, telegram_id))
+                cur.execute("DELETE FROM staff_web_sessions WHERE telegram_id=%s AND token_hash<>%s", (telegram_id, current_hash))
+            _site_admin_audit(actor, "site_admin.owner_password_changed", str(telegram_id), {"password_changed": True})
+            return jsonify({"ok": True})
+        changes = {}
+        with db_cursor() as cur:
+            cur.execute("SELECT role FROM staff WHERE telegram_id=%s FOR UPDATE", (telegram_id,))
+            target = cur.fetchone()
+            if not target or target["role"] == "owner":
+                return jsonify({"error": "Staff account not found."}), 404
+            if "active" in body:
+                active = bool(body["active"])
+                cur.execute("UPDATE staff SET active=%s,updated_at=NOW() WHERE telegram_id=%s", (active, telegram_id))
+                cur.execute("UPDATE staff_web_accounts SET active=%s,updated_at=NOW() WHERE telegram_id=%s", (active, telegram_id))
+                if not active:
+                    cur.execute("DELETE FROM staff_web_sessions WHERE telegram_id=%s", (telegram_id,))
+                changes["active"] = active
+            if "role" in body:
+                role = str(body["role"])
+                if role not in {"admin", "manager", "packer", "courier"}:
+                    return jsonify({"error": "Недопустима роль."}), 400
+                cur.execute("UPDATE staff SET role=%s,updated_at=NOW() WHERE telegram_id=%s", (role, telegram_id))
+                changes["role"] = role
+            if "password" in body:
+                salt, digest = _site_admin_password(body["password"])
+                cur.execute("UPDATE staff_web_accounts SET password_salt=%s,password_hash=%s,failed_attempts=0,locked_until=NULL,updated_at=NOW() WHERE telegram_id=%s",
+                            (salt, digest, telegram_id))
+                cur.execute("DELETE FROM staff_web_sessions WHERE telegram_id=%s", (telegram_id,))
+                changes["password_reset"] = True
+            if "permissions" in body:
+                permissions = body["permissions"]
+                if not isinstance(permissions, list) or any(p not in _SITE_ADMIN_PERMISSION_OPTIONS for p in permissions):
+                    return jsonify({"error": "Некоректний список дозволів."}), 400
+                cur.execute("DELETE FROM staff_permission_grants WHERE telegram_id=%s", (telegram_id,))
+                for permission in sorted(set(permissions)):
+                    cur.execute("INSERT INTO staff_permission_grants(telegram_id,permission,granted_by) VALUES(%s,%s,%s)",
+                                (telegram_id, permission, actor.telegram_id))
+                cur.execute("UPDATE staff_web_accounts SET custom_permissions_enabled=TRUE,updated_at=NOW() WHERE telegram_id=%s", (telegram_id,))
+                changes["permissions"] = sorted(set(permissions))
+        _site_admin_audit(actor, "site_admin.staff_access_updated", str(telegram_id), changes)
+        return jsonify({"ok": True})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Site admin staff update failed")
+        return jsonify({"error": "Could not update staff account."}), 500
+
+
+@miniapp.get("/api/site-admin/ttn")
+def site_admin_ttn_jobs():
+    try:
+        _miniapp_require_staff(_miniapp_auth_user(), "delivery.read")
+        with db_cursor() as cur:
+            cur.execute("""SELECT j.order_id,j.state,j.attempts,j.next_attempt_at,j.last_error,j.updated_at,
+                                  o.order_number,o.customer_name_snapshot customer_name,o.phone_snapshot phone,o.ttn
+                           FROM np_ttn_jobs j JOIN orders o ON o.id=j.order_id
+                           ORDER BY CASE WHEN j.state IN ('failed','uncertain','processing') THEN 0 ELSE 1 END,
+                                    j.updated_at DESC LIMIT 150""")
+            rows = [{k: _miniapp_json_value(v) for k, v in row.items()} for row in cur.fetchall()]
+        sender_configured = all((CONFIG.nova_poshta_sender_city_ref, CONFIG.nova_poshta_sender_ref,
+                                 CONFIG.nova_poshta_sender_address_ref, CONFIG.nova_poshta_sender_contact_ref,
+                                 CONFIG.nova_poshta_sender_phone))
+        return jsonify({"items": rows, "configuration": {
+            "api_key_configured": bool(CONFIG.nova_poshta_api_key),
+            "sender_configured": bool(sender_configured),
+        }})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Website TTN queue retrieval failed")
+        return jsonify({"error": "Could not load Nova Poshta queue."}), 500
+
+
+@miniapp.post("/api/site-admin/ttn/<int:order_id>/retry")
+def site_admin_ttn_retry(order_id: int):
+    try:
+        actor = _miniapp_require_owner(_miniapp_auth_user())
+        body = request.get_json(silent=True) or {}
+        if body.get("verified_no_existing_ttn") is not True:
+            return jsonify({"error": "Check the Nova Poshta business cabinet before retrying to avoid duplicate waybills."}), 400
+        with db_cursor() as cur:
+            cur.execute("SELECT ttn,delivery_type FROM orders WHERE id=%s FOR UPDATE", (order_id,))
+            order = cur.fetchone()
+            if not order or order["delivery_type"] != "nova_poshta" or order["ttn"]:
+                return jsonify({"error": "Order is missing, not Nova Poshta, or already has a TTN."}), 409
+            cur.execute("""INSERT INTO np_ttn_jobs(order_id,state,attempts,next_attempt_at,last_error,lease_until)
+                           VALUES(%s,'pending',0,NOW(),'Manual retry approved after cabinet check',NULL)
+                           ON CONFLICT(order_id) DO UPDATE SET state='pending',attempts=0,next_attempt_at=NOW(),
+                             last_error='Manual retry approved after cabinet check',lease_until=NULL,updated_at=NOW()
+                           WHERE np_ttn_jobs.state IN ('failed','uncertain')""", (order_id,))
+            if cur.rowcount != 1:
+                return jsonify({"error": "Job is not in a retryable state."}), 409
+            cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data)
+                           VALUES(%s,'owner','nova_poshta.ttn_retry','order',%s,%s::jsonb)""",
+                        (actor.telegram_id, str(order_id), json_dumps({"manual_retry": True, "verified_no_existing_ttn": True})))
+        return jsonify({"ok": True})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Website TTN retry failed order_id=%s", order_id)
+        return jsonify({"error": "Could not queue Nova Poshta retry."}), 500
 
 
 def _miniapp_auth_user():
     """Validate Telegram WebApp initData; never trust a client-supplied Telegram ID."""
     raw = request.headers.get("X-Telegram-Init-Data", "")
     if not raw:
+        if request.path.startswith(("/api/miniapp/staff/", "/api/miniapp/admin/", "/api/site-admin/")):
+            admin_staff = _site_admin_staff()
+            if admin_staff:
+                return _NS(id=int(admin_staff.telegram_id), username="", first_name=admin_staff.display_name, last_name="")
         token = request.cookies.get("cloudhub_web_session", "")
         if token and len(token) <= 128:
             token_hash = hashlib.sha256(token.encode("ascii", errors="ignore")).hexdigest()
@@ -11125,6 +11612,9 @@ def _miniapp_auth_user():
             if session_user:
                 return _NS(id=int(session_user["telegram_id"]), username=session_user.get("username"),
                            first_name=session_user.get("first_name") or "", last_name=session_user.get("last_name") or "")
+        admin_staff = _site_admin_staff()
+        if admin_staff:
+            return _NS(id=int(admin_staff.telegram_id), username="", first_name=admin_staff.display_name, last_name="")
         raise PermissionError("Увійдіть через Telegram, щоб продовжити.")
     if len(raw) > 8192:
         raise PermissionError("Некоректні дані Telegram-сесії.")
@@ -11172,6 +11662,21 @@ def _public_product_url(product_id: int, name: str, base: Optional[str] = None) 
     return f"{(base or _public_site_base()).rstrip('/')}/product/{int(product_id)}/{_public_slug(name)}"
 
 
+def _public_banner_markup(placement: str) -> str:
+    try:
+        banners = [b for b in _miniapp_get_banners(active_only=True) if b.get("placement") == placement]
+        rendered = []
+        for banner in banners:
+            image = f'<img src="{html.escape(banner["image_url"], quote=True)}" alt="{html.escape(banner["title"], quote=True)}" loading="lazy">' if banner.get("image_url") else ""
+            href = banner.get("link_url") or ""
+            tag, target = ("a", f' href="{html.escape(href, quote=True)}" target="_blank" rel="noopener noreferrer"') if href.startswith("https://") else ("section", "")
+            rendered.append(f'<{tag} class="site-promo"{target}>{image}<b>{html.escape(banner["title"])}</b><p>{html.escape(banner.get("body") or "")}</p></{tag}>')
+        return "".join(rendered)
+    except Exception:
+        log.exception("Public website banner rendering failed")
+        return ""
+
+
 def _public_site_page(title: str, description: str, body: str, canonical: str,
                       structured_data: Optional[dict] = None,
                       robots: str = "index,follow") -> Response:
@@ -11179,15 +11684,19 @@ def _public_site_page(title: str, description: str, body: str, canonical: str,
     if structured_data:
         encoded = json.dumps(structured_data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
         structured = f'<script type="application/ld+json">{encoded}</script>'
+    promo_top = _public_banner_markup("website_top")
+    promo_bottom = _public_banner_markup("website_bottom")
     page = f'''<!doctype html><html lang="uk"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="description" content="{html.escape(description, quote=True)}"><meta name="robots" content="{html.escape(robots, quote=True)}">
 <link rel="canonical" href="{html.escape(canonical, quote=True)}"><meta property="og:type" content="website">
 <meta property="og:site_name" content="Cloud Hub"><meta property="og:title" content="{html.escape(title, quote=True)}">
 <meta property="og:description" content="{html.escape(description, quote=True)}"><title>{html.escape(title)}</title>{structured}
-<style>:root{{color-scheme:dark;--bg:#100b20;--panel:#1b1430;--line:#392956;--muted:#c8bbd8;--accent:#a278ff}}*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(ellipse at 50% -15%,#39205f,#17102a 42%,var(--bg) 78%);color:#fbf8ff;font:16px system-ui,-apple-system,sans-serif;min-height:100vh}}header,main,footer{{width:min(1120px,100% - 32px);margin:auto}}header{{padding:24px 0 18px;border-bottom:1px solid #392956}}header a,.crumb a{{color:#d6bdff;text-decoration:none}}header strong{{font-size:22px;color:#e5cfff}}header nav{{float:right;display:flex;gap:18px;padding-top:5px}}main{{padding:22px 0 54px}}h1{{font-size:clamp(25px,5vw,38px);margin:10px 0}}.muted{{color:var(--muted)}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-top:20px}}.card{{padding:14px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#211735,#171126);color:inherit;text-decoration:none;transition:transform .18s,border-color .18s}}.card:hover{{transform:translateY(-2px);border-color:#a278ff}}.photo{{width:100%;aspect-ratio:1/1;object-fit:contain;background:#100d18;border-radius:12px}}.price{{font-weight:800;color:#e6d4ff}}.detail{{display:grid;grid-template-columns:minmax(240px,440px) minmax(250px,1fr);gap:24px;align-items:start}}.detail .photo{{position:sticky;top:16px}}.pill{{display:inline-block;padding:5px 10px;border:1px solid var(--line);border-radius:99px;margin:4px 4px 4px 0;color:var(--muted)}}.button{{display:inline-block;margin-top:14px;padding:12px 18px;border-radius:12px;background:#8055dc;color:#fff;text-decoration:none;font-weight:700}}footer{{border-top:1px solid var(--line);padding:18px 0 30px;color:var(--muted);font-size:13px}}@media(max-width:620px){{header nav{{float:none;margin-top:10px}}.detail{{grid-template-columns:1fr}}.detail .photo{{position:static;max-width:440px}}}}</style></head>
-<body><header><a href="/"><strong>☁ Cloud Hub</strong></a><nav><a href="/">Каталог</a><a href="/miniapp">Магазин</a></nav></header><main>{body}</main>
+<style>:root{{color-scheme:dark;--bg:#100b20;--panel:#1b1430;--line:#392956;--muted:#c8bbd8;--accent:#a278ff}}*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(ellipse at 50% -15%,#39205f,#17102a 42%,var(--bg) 78%);color:#fbf8ff;font:16px system-ui,-apple-system,sans-serif;min-height:100vh}}header,main,footer{{width:min(1120px,100% - 32px);margin:auto}}header{{padding:24px 0 18px;border-bottom:1px solid #392956}}header a,.crumb a{{color:#d6bdff;text-decoration:none}}header strong{{font-size:22px;color:#e5cfff}}header nav{{float:right;display:flex;flex-wrap:wrap;gap:16px;padding-top:5px}}main{{padding:22px 0 54px}}h1{{font-size:clamp(25px,5vw,38px);margin:10px 0}}.muted{{color:var(--muted)}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-top:20px}}.card{{padding:14px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#211735,#171126);color:inherit;text-decoration:none;transition:transform .18s,border-color .18s}}.card:hover{{transform:translateY(-2px);border-color:#a278ff}}.photo{{width:100%;aspect-ratio:1/1;object-fit:contain;background:#100d18;border-radius:12px}}.price{{font-weight:800;color:#e6d4ff}}.detail{{display:grid;grid-template-columns:minmax(240px,440px) minmax(250px,1fr);gap:24px;align-items:start}}.detail .photo{{position:sticky;top:16px}}.pill{{display:inline-block;padding:5px 10px;border:1px solid var(--line);border-radius:99px;margin:4px 4px 4px 0;color:var(--muted)}}.button{{display:inline-block;margin-top:14px;padding:12px 18px;border-radius:12px;background:#8055dc;color:#fff;text-decoration:none;font-weight:700}}footer{{border-top:1px solid var(--line);padding:18px 0 30px;color:var(--muted);font-size:13px}}.site-scroll-controls{{position:fixed;right:max(14px,calc((100vw - 1140px)/2));bottom:22px;z-index:20;display:grid;gap:8px}}.site-scroll-controls button{{width:48px;height:48px;border:1px solid #b694ff;border-radius:50%;background:linear-gradient(145deg,#8756e8,#5934ac);color:white;font-size:23px;font-weight:800;box-shadow:0 5px 20px #0008,0 0 14px #9b65ff66;cursor:pointer;transition:transform .18s,opacity .18s}}.site-scroll-controls button:hover{{transform:translateY(-2px)}}@media(max-width:620px){{header nav{{float:none;margin-top:12px;gap:12px}}.detail{{grid-template-columns:1fr}}.detail .photo{{position:static;max-width:440px}}.site-scroll-controls{{right:12px;bottom:16px}}.site-scroll-controls button{{width:44px;height:44px}}}}</style></head>
+<body><header><a href="/"><strong>☁ Cloud Hub</strong></a><nav><a href="/">Каталог</a><a href="/delivery">Доставка</a><a href="/support">Підтримка</a><a href="/account">Кабінет</a><a href="/shop">Магазин</a></nav></header>{promo_top}<main>{body}</main>{promo_bottom}
 <footer>Cloud Hub · Каталог товарів та актуальні ціни. Інформація про наявність оновлюється з єдиної бази магазину.</footer>
+<div class="site-scroll-controls" aria-label="Прокрутка сторінки"><button type="button" id="siteScrollTop" aria-label="На початок сторінки" title="Вгору">↑</button><button type="button" id="siteScrollBottom" aria-label="У кінець сторінки" title="Вниз">↓</button></div>
+<script>(()=>{{const top=document.getElementById('siteScrollTop'),bottom=document.getElementById('siteScrollBottom');top.addEventListener('click',()=>window.scrollTo({{top:0,behavior:'smooth'}}));bottom.addEventListener('click',()=>window.scrollTo({{top:document.documentElement.scrollHeight,behavior:'smooth'}}))}})();</script>
 <script>(()=>{{try{{const key='cloudhub.visitor.v1';let id=localStorage.getItem(key);if(!id){{id=crypto.randomUUID?crypto.randomUUID().replace(/-/g,''):Array.from({{length:32}},()=>Math.floor(Math.random()*16).toString(16)).join('');localStorage.setItem(key,id)}}let source=sessionStorage.getItem('cloudhub.first.source.v1');if(!source){{const p=new URLSearchParams(location.search);source=p.get('utm_source')||p.get('source')||((document.referrer&&new URL(document.referrer).host!==location.host)?new URL(document.referrer).host:'direct');sessionStorage.setItem('cloudhub.first.source.v1',source)}}const send=(type,ref='')=>fetch('/api/miniapp/analytics/event',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{visitor_id:id,event_type:type,event_ref:String(ref||'').slice(0,80)}}),keepalive:true}}).catch(()=>{{}});send('visit',source);if(location.pathname.startsWith('/product/'))send('product_view',location.pathname.split('/')[2]);else if(location.pathname.startsWith('/category/'))send('category_view',location.pathname.split('/')[2]);const q=new URLSearchParams(location.search).get('q');if(q)send('search',q)}}catch(e){{}}}})();</script></body></html>'''
     return Response(page, mimetype="text/html; charset=utf-8", headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
 
@@ -11196,7 +11705,13 @@ def _public_catalog_card(row: dict, base: Optional[str] = None) -> str:
     name = " ".join(x for x in (str(row.get("name") or ""), str(row.get("variant_name") or "")) if x)
     product_id = int(row.get("product_id") or 0)
     photo = f'<img class="photo" src="/api/miniapp/products/{int(row["photo_id"])}/photo" alt="{html.escape(name, quote=True)}" loading="lazy">' if row.get("photo_id") else '<div class="photo" aria-label="Фото товару відсутнє"></div>'
-    return f'<a class="card" href="{html.escape(_public_product_url(product_id, str(row.get("name") or name), base), quote=True)}">{photo}<span class="pill">{html.escape(str(row.get("brand") or "Cloud Hub"))}</span><h2>{html.escape(name)}</h2><p class="price">{html.escape(str(row.get("price") or ""))} грн</p><p class="muted">{html.escape(str(row.get("description") or "")[:180])}</p></a>'
+    badge = str(row.get("storefront_badge") or "").strip()
+    if not badge and int(row.get("low_stock_threshold") or 0) > 0 and int(row.get("available") or 0) <= int(row.get("low_stock_threshold") or 0):
+        badge = "Мало залишилось"
+    badge_html = f'<span class="product-badge">{html.escape(badge)}</span>' if badge else ""
+    sale = row.get("compare_at_price") is not None and row.get("compare_at_price") > row.get("price")
+    price_html = (f'<del>{html.escape(str(row["compare_at_price"]))} грн</del> ' if sale else "") + f'{html.escape(str(row.get("price") or ""))} грн'
+    return f'<a class="card" href="{html.escape(_public_product_url(product_id, str(row.get("name") or name), base), quote=True)}">{badge_html}{photo}<span class="pill">{html.escape(str(row.get("brand") or "Cloud Hub"))}</span><h2>{html.escape(name)}</h2><p class="price">{price_html}</p><p class="muted">{html.escape(str(row.get("description") or "")[:180])}</p></a>'
 
 
 @miniapp.get("/")
@@ -11216,19 +11731,157 @@ def miniapp_public_home():
 <p class="muted">Переглядайте асортимент, фотографії, описи, ціни й актуальну наявність. Дані синхронізуються з магазином і Telegram Mini App.</p>
 <form action="/" method="get"><label for="site-search">Пошук товарів</label><div class="row"><input id="site-search" name="q" value="{html.escape(query, quote=True)}" placeholder="Назва, бренд або SKU" style="flex:1;min-width:0;padding:12px;border-radius:12px;background:#19122b;color:white;border:1px solid #44315f"><button class="button" style="border:0;cursor:pointer">Знайти</button></div></form>
 <nav aria-label="Категорії">{category_links}</nav>{query_note}<section class="grid">{cards or '<p>За цим запитом товарів не знайдено. Перегляньте всі категорії каталогу.</p>'}</section>
-<p><a class="button" href="/miniapp">Відкрити магазин Cloud Hub</a></p></section>'''
+<p><a class="button" href="/miniapp">Відкрити цей товар у Telegram</a></p></section>'''
     title = (f"{query} — товари та ціни | Cloud Hub" if query else "Каталог товарів Cloud Hub — фото, ціни та наявність")
     description = (f"Пошук у каталозі Cloud Hub за запитом {query}: фото, описи, актуальні ціни й наявність." if query else "Каталог Cloud Hub: фото й описи товарів, актуальні ціни та наявність. Дані синхронізовані з онлайн-магазином.")
     item_list = {"@context": "https://schema.org", "@type": "ItemList", "name": "Каталог товарів Cloud Hub", "numberOfItems": len(products), "itemListElement": [{"@type": "ListItem", "position": i + 1, "url": _public_product_url(int(row.get("product_id") or 0), str(row.get("name") or ""), base), "name": " ".join(x for x in (str(row.get("name") or ""), str(row.get("variant_name") or "")) if x)} for i, row in enumerate(products)]}
     return _public_site_page(title, description, body, base + "/", item_list, "noindex,follow" if query else "index,follow")
 
 
+@miniapp.get("/shop")
 @miniapp.get("/miniapp")
 def miniapp_home():
     # Public product pages already provide crawlable SEO metadata. Rebuilding a
     # 1,000-product JSON-LD document on every app open delayed the first screen.
     return Response(MINIAPP_HTML, mimetype="text/html; charset=utf-8",
-                    headers={"Cache-Control": "public, max-age=300"})
+                    headers={"Cache-Control": "public, max-age=300", "X-Robots-Tag": "noindex, nofollow"})
+
+
+@miniapp.get("/delivery")
+def miniapp_public_delivery():
+    base = _public_site_base()
+    body = """<section><p class="pill">Cloud Hub · доставка</p><h1>Доставка та отримання замовлення</h1>
+<div class="grid"><article class="card"><h2>Львів</h2><p>Доступні способи та часові вікна доставки по Львову показуються під час оформлення замовлення залежно від адреси й розкладу.</p></article>
+<article class="card"><h2>Нова пошта</h2><p>Оберіть відділення або поштомат у формі замовлення. Номер ТТН з’явиться у статусі замовлення після створення накладної.</p></article></div>
+<p class="muted">Якщо служба доставки тимчасово недоступна, замовлення зберігається; статус відправлення оновиться після відновлення зв’язку.</p><a class="button" href="/shop">Перейти до магазину</a></section>"""
+    return _public_site_page("Доставка Cloud Hub — Львів та Нова пошта", "Умови доставки Cloud Hub: локальна доставка по Львову та доставка Новою поштою. Доступність і дані замовлення уточнюються під час оформлення.", body, base + "/delivery")
+
+
+@miniapp.get("/support")
+def miniapp_public_support():
+    base = _public_site_base()
+    body = """<section><p class="pill">Cloud Hub · підтримка</p><h1>Допомога з замовленням</h1>
+<p>Почніть звернення в магазині: команда підтримки відповість у вашому тікеті, а історію можна переглянути в особистому кабінеті.</p>
+<a class="button" href="/shop?support=1">Відкрити підтримку</a><p class="muted">Для питань про доставку перегляньте <a href="/delivery">умови доставки</a>.</p></section>"""
+    return _public_site_page("Підтримка Cloud Hub — звернення та замовлення", "Створіть звернення до підтримки Cloud Hub, отримайте відповідь і переглядайте історію тікетів.", body, base + "/support")
+
+
+@miniapp.get("/account")
+def miniapp_public_account():
+    base = _public_site_base()
+    body = """<section><p class="pill">Cloud Hub · особистий кабінет</p><h1>Ваші замовлення та бонуси</h1>
+<p>Увійдіть через Telegram, щоб переглядати статус і історію замовлень, бонусний баланс, обране та звернення до підтримки. Для підтвердження особи використовується Telegram.</p>
+<a class="button" href="/shop">Увійти до магазину</a></section>"""
+    return _public_site_page("Особистий кабінет Cloud Hub", "Вхід до Cloud Hub через Telegram: замовлення, бонуси, обране та підтримка.", body, base + "/account", robots="noindex,nofollow")
+
+
+@miniapp.post("/api/site/quick-order")
+def website_quick_order():
+    """Create a durable, no-login callback request in the shared staff CRM."""
+    try:
+        body = request.get_json(silent=True) or {}
+        variant_id = int(body.get("variant_id") or 0)
+        contact_raw = " ".join(str(body.get("contact") or "").split())[:100]
+        customer_name = " ".join(str(body.get("name") or "").split())[:120]
+        comment = " ".join(str(body.get("comment") or "").split())[:1000]
+        if variant_id <= 0 or body.get("age_confirmed") is not True:
+            return jsonify({"error": "Оберіть товар і підтвердьте, що вам є 18 років."}), 400
+        if body.get("privacy_accepted") is not True:
+            return jsonify({"error": "Для запиту потрібна згода на обробку контактних даних."}), 400
+        phone = normalize_phone(contact_raw)
+        if 10 <= len(phone) <= 15:
+            contact = phone
+        else:
+            telegram_name = contact_raw.lstrip("@").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", telegram_name):
+                return jsonify({"error": "Вкажіть номер телефону або Telegram @username."}), 400
+            contact = "@" + telegram_name
+        request_number = "WH-" + datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6].upper()
+        with db_cursor() as cur:
+            cur.execute("""SELECT v.id,v.sku,v.variant_name,v.price,v.stock_qty,v.reserved_qty,v.active variant_active,
+                                  p.name,p.active product_active,p.manually_hidden
+                           FROM product_variants v JOIN products p ON p.id=v.product_id
+                           WHERE v.id=%s AND p.archived_at IS NULL FOR UPDATE OF v""", (variant_id,))
+            product = cur.fetchone()
+            if not product or not product["product_active"] or product["manually_hidden"] or not product["variant_active"]:
+                return jsonify({"error": "Цей товар зараз недоступний."}), 404
+            if int(product["stock_qty"]) - int(product["reserved_qty"]) < 1:
+                return jsonify({"error": "Цей варіант щойно закінчився. Оновіть сторінку каталогу."}), 409
+            cur.execute("""SELECT request_number FROM website_purchase_requests
+                           WHERE contact=%s AND created_at>NOW()-INTERVAL '45 seconds'
+                           ORDER BY created_at DESC LIMIT 1""", (contact,))
+            recent = cur.fetchone()
+            if recent:
+                return jsonify({"error": "Запит уже прийнято. Команда скоро зв’яжеться з вами."}), 429
+            cur.execute("""INSERT INTO website_purchase_requests(request_number,variant_id,product_name_snapshot,
+                           variant_name_snapshot,sku_snapshot,unit_price,contact,customer_name,comment,privacy_accepted,privacy_version)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s) RETURNING id""",
+                        (request_number, variant_id, product["name"], product["variant_name"], product["sku"],
+                         product["price"], contact, customer_name, comment, CONFIG.privacy_consent_version))
+            request_id = int(cur.fetchone()["id"])
+            text = (f"🛍 <b>Запит купити в один клік {html.escape(request_number)}</b>\n"
+                    f"{html.escape(str(product['name']))} {html.escape(str(product['variant_name'] or ''))}\n"
+                    f"SKU: {html.escape(str(product['sku']))} · {product['price']} грн\n"
+                    f"Контакт: {html.escape(contact)}\nІм’я: {html.escape(customer_name or 'не вказано')}\n"
+                    f"Коментар: {html.escape(comment or '—')}\nID запиту: {request_id}")
+            payload = {"text": text, "buttons": [["Відкрити адмінку", _public_site_base() + "/admin"]]}
+            for recipient_id in staff_recipient_ids(cur, ("owner", "admin", "manager")):
+                enqueue_notification(cur, recipient_id, "orders", payload,
+                                     f"website_purchase_request:{request_id}:{recipient_id}")
+        return jsonify({"ok": True, "request_number": request_number}), 201
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc) or "Некоректні дані запиту."}), 400
+    except Exception:
+        log.exception("Website quick purchase request failed")
+        return jsonify({"error": "Не вдалося надіслати запит. Спробуйте ще раз трохи пізніше."}), 500
+
+
+@miniapp.get("/api/miniapp/staff/quick-orders")
+def miniapp_staff_quick_orders():
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_staff(user, "orders.read")
+        query = " ".join((request.args.get("q") or "").split())[:100]
+        pattern = f"%{query}%"
+        with db_cursor() as cur:
+            cur.execute("""SELECT id,request_number,product_name_snapshot,variant_name_snapshot,sku_snapshot,
+                                  unit_price,contact,customer_name,comment,state,created_at
+                           FROM website_purchase_requests WHERE (%s='' OR request_number ILIKE %s OR contact ILIKE %s
+                             OR customer_name ILIKE %s OR product_name_snapshot ILIKE %s)
+                           ORDER BY created_at DESC LIMIT 100""", (query, pattern, pattern, pattern, pattern))
+            rows = [{k: _miniapp_json_value(v) for k, v in row.items()} for row in cur.fetchall()]
+        return jsonify({"items": rows})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Website quick purchase CRM list failed")
+        return jsonify({"error": "Не вдалося завантажити запити з сайту."}), 500
+
+
+@miniapp.put("/api/miniapp/staff/quick-orders/<int:request_id>")
+def miniapp_staff_quick_order_update(request_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "orders.update")
+        state = str((request.get_json(silent=True) or {}).get("state") or "")
+        if state not in {"new", "contacted", "converted", "closed"}:
+            return jsonify({"error": "Оберіть коректний статус запиту."}), 400
+        with db_cursor() as cur:
+            cur.execute("UPDATE website_purchase_requests SET state=%s,updated_at=NOW() WHERE id=%s RETURNING request_number",
+                        (state, request_id))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Запит не знайдено."}), 404
+            cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data)
+                           VALUES(%s,%s,'website.quick_order_status','website_purchase_request',%s,%s::jsonb)""",
+                        (actor.telegram_id, actor.role, str(request_id), json_dumps({"state": state, "request_number": row["request_number"]})))
+        return jsonify({"ok": True})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Website quick purchase CRM update failed")
+        return jsonify({"error": "Не вдалося змінити статус запиту."}), 500
+
 
 @miniapp.get("/product/<int:product_id>/<slug>")
 def miniapp_public_product(product_id: int, slug: str):
@@ -11249,8 +11902,9 @@ def miniapp_public_product(product_id: int, slug: str):
     description = f"{product.get('name') or 'Товар'} — {category}, {product.get('brand_name') or 'Cloud Hub'}. {product_description}"[:280]
     title = f"{product.get('name')} — ціна та наявність | Cloud Hub"
     variant_html = "".join(f'<li><b>{html.escape(str(v.get("variant_name") or v.get("sku") or "Варіант"))}</b> · {html.escape(str(v.get("price")))} грн · є в наявності</li>' for v in variants)
-    telegram_product_url = f"https://t.me/Cloud_hub_vape_bot?startapp=product_{int(variants[0]['id'])}"
-    body = f'<p class="crumb"><a href="/">Каталог</a> / <a href="/category/{int(product.get("category_id") or 0)}/{_public_slug(category)}">{html.escape(category)}</a></p><article class="detail">{image}<div><span class="pill">{html.escape(str(product.get("brand_name") or "Cloud Hub"))}</span><h1>{html.escape(str(product.get("name") or "Товар"))}</h1><p class="price">Від {html.escape(str(min_price))} грн</p><p class="muted">{html.escape(description)}</p><h2>Варіанти та наявність</h2><ul>{variant_html}</ul><a class="button" href="{html.escape(telegram_product_url, quote=True)}">Відкрити магазин і оформити замовлення</a></div></article>'
+    first_variant_id = int(variants[0]["id"])
+    variant_options = "".join(f'<option value="{int(v["id"])}" data-price="{html.escape(str(v["price"]), quote=True)}" data-stock="{max(0, int(v.get("stock_qty") or 0) - int(v.get("reserved_qty") or 0))}"{ " selected" if int(v["id"]) == first_variant_id else ""}>{html.escape(str(v.get("variant_name") or v.get("sku") or "Variant"))} · {html.escape(str(v["price"]))} грн</option>' for v in variants)
+    body = f'<p class="crumb"><a href="/">Каталог</a> / <a href="/category/{int(product.get("category_id") or 0)}/{_public_slug(category)}">{html.escape(category)}</a></p><article class="detail">{image}<div><span class="pill">{html.escape(str(product.get("brand_name") or "Cloud Hub"))}</span><h1>{html.escape(str(product.get("name") or "Product"))}</h1><label for="site-variant">Оберіть об’єм або варіант</label><select id="site-variant" style="padding:12px;background:#19122b;color:white;border:1px solid #44315f;border-radius:12px;width:100%">{variant_options}</select><p id="site-price" class="price">{html.escape(str(variants[0]["price"]))} грн · в наявності {max(0,int(variants[0].get("stock_qty") or 0)-int(variants[0].get("reserved_qty") or 0))}</p><p class="muted">{html.escape(description)}</p><a id="site-buy" class="button" href="/shop?variant={first_variant_id}">Купити та оформити замовлення</a><script>document.getElementById("site-variant").addEventListener("change",e=>{{let o=e.target.selectedOptions[0];document.getElementById("site-price").textContent=o.dataset.price+" UAH ? stock "+o.dataset.stock;document.getElementById("site-buy").href="/shop?variant="+encodeURIComponent(o.value)}})</script></div></article>'
     schema = {"@context": "https://schema.org", "@type": "Product", "name": str(product.get("name") or ""), "description": description, "sku": str(variants[0].get("sku") or ""), "brand": {"@type": "Brand", "name": str(product.get("brand_name") or "Cloud Hub")}, "category": category, "image": [photo_url] if photo_url else [], "offers": {"@type": "Offer", "url": canonical, "priceCurrency": "UAH", "price": str(min_price), "availability": "https://schema.org/InStock", "itemCondition": "https://schema.org/NewCondition"}}
     return _public_site_page(title, description, body, canonical, schema)
 
@@ -11292,7 +11946,7 @@ def miniapp_public_sitemap():
 @miniapp.get("/robots.txt")
 def miniapp_public_robots():
     base = _public_site_base()
-    return Response(f"User-agent: *\nAllow: /\nAllow: /api/miniapp/products/\nDisallow: /api/\nSitemap: {base}/sitemap.xml\n", mimetype="text/plain; charset=utf-8", headers={"Cache-Control": "public, max-age=3600"})
+    return Response(f"User-agent: *\nAllow: /\nAllow: /api/miniapp/products/\nDisallow: /api/\nDisallow: /admin\nSitemap: {base}/sitemap.xml\n", mimetype="text/plain; charset=utf-8", headers={"Cache-Control": "public, max-age=3600"})
 
 
 @miniapp.post("/api/miniapp/web-login")
@@ -11763,7 +12417,7 @@ def _miniapp_get_banners(active_only: bool = False) -> list[dict]:
         title = str(b.get("title") or "").strip()[:100]
         if not title: continue
         placement = str(b.get("placement") or "home_top")
-        if placement not in ("home_top", "catalog_bottom", "cart_top", "bot_welcome"):
+        if placement not in ("home_top", "catalog_bottom", "cart_top", "bot_welcome", "website_top", "website_bottom"):
             placement = "home_top"
         item = {"title": title, "body": str(b.get("body") or "").strip()[:500],
                 "image_url": str(b.get("image_url") or "").strip()[:1000],
@@ -11779,7 +12433,11 @@ def _miniapp_get_banners(active_only: bool = False) -> list[dict]:
 
 def _miniapp_require_banner_manager(user):
     if not request.headers.get("X-Telegram-Init-Data", "").strip():
-        raise PermissionError("Керування доступне лише у Telegram Mini App.")
+        web_staff = _site_admin_staff()
+        if not web_staff or int(web_staff.telegram_id) != int(user.id):
+            raise PermissionError("Sign in with an authorized staff account.")
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            _site_admin_require_csrf()
     staff = get_staff(user.id)
     if not staff or not staff.active or not staff.can("catalog.update"):
         raise PermissionError("Керувати банерами може лише уповноважений працівник.")
@@ -11944,7 +12602,7 @@ def miniapp_refresh_tracking():
                 cur.execute("""UPDATE support_tickets SET status='closed',updated_at=NOW()
                                WHERE customer_telegram_id=%s AND order_id=%s AND status<>'closed'""",(user.id,order["id"]))
             cur.execute("""INSERT INTO audit_log(action,entity_type,entity_id,after_data,reason)
-                           VALUES('nova_poshta.tracking_refreshed','order',%s,%s::jsonb,'Customer requested tracking refresh')""",
+                           VALUES('nova_poshta.tracking_refreshed','order',%s,%s::jsonb,'Клієнт requested tracking refresh')""",
                         (str(order["id"]), json_dumps({"status": status})))
         return jsonify({"tracking_status": status, "updated_at": datetime.now(timezone.utc).isoformat()})
     except PermissionError as exc:
@@ -11954,6 +12612,19 @@ def miniapp_refresh_tracking():
     except Exception:
         log.exception("Mini App tracking refresh failed")
         return jsonify({"error": "Не вдалося оновити статус Нової пошти. Спробуйте пізніше."}), 502
+
+
+@miniapp.get("/api/miniapp/admin/banners")
+def miniapp_get_admin_banners():
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_banner_manager(user)
+        return jsonify({"banners": _miniapp_get_banners(False)})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Admin banner list failed")
+        return jsonify({"error": "Could not load banners."}), 500
 
 
 @miniapp.put("/api/miniapp/admin/banners")
@@ -11972,7 +12643,7 @@ def miniapp_save_banners():
             if image_url and not image_url.startswith("https://"): return jsonify({"error":"Посилання на зображення має починатися з https://"}),400
             if link_url and not link_url.startswith("https://"): return jsonify({"error":"Посилання банера має починатися з https://"}),400
             placement = str(b.get("placement") or "home_top")
-            if placement not in ("home_top", "catalog_bottom", "cart_top", "bot_welcome"):
+            if placement not in ("home_top", "catalog_bottom", "cart_top", "bot_welcome", "website_top", "website_bottom"):
                 return jsonify({"error":"Оберіть коректне місце розміщення банера."}),400
             clean.append({"title":title,"body":str(b.get("body") or "").strip()[:500],"image_url":image_url,"link_url":link_url,"placement":placement,"active":bool(b.get("active"))})
         with db_cursor() as cur:
@@ -11987,7 +12658,11 @@ def miniapp_save_banners():
 
 def _miniapp_require_owner(user):
     if not request.headers.get("X-Telegram-Init-Data", "").strip():
-        raise PermissionError("Керування доступне лише у Telegram Mini App.")
+        web_staff = _site_admin_staff()
+        if not web_staff or int(web_staff.telegram_id) != int(user.id):
+            raise PermissionError("Sign in with a staff account to continue.")
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            _site_admin_require_csrf()
     staff = get_staff(user.id)
     if not staff or not staff.active or staff.role != "owner":
         raise PermissionError("Панель доступна лише власнику магазину.")
@@ -12002,7 +12677,11 @@ def _miniapp_require_owner(user):
 def _miniapp_require_staff(user, permission: str):
     """Authenticate Mini App staff actions using the same roles and security locks as the bot."""
     if not request.headers.get("X-Telegram-Init-Data", "").strip():
-        raise PermissionError("Керування доступне лише у Telegram Mini App.")
+        web_staff = _site_admin_staff()
+        if not web_staff or int(web_staff.telegram_id) != int(user.id):
+            raise PermissionError("Sign in with a staff account to continue.")
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            _site_admin_require_csrf()
     staff = get_staff(user.id)
     if not staff or not staff.active or not staff.can(permission):
         raise PermissionError("Недостатньо прав для цієї дії.")
@@ -12872,6 +13551,10 @@ class NovaPoshtaAPIError(RuntimeError):
     pass
 
 
+class NovaPoshtaRetryableError(RuntimeError):
+    """The request is known not to have reached the provider; safe to retry."""
+
+
 class NovaPoshtaAmbiguousResult(RuntimeError):
     """Network/result ambiguity: the carrier may have created a document."""
 
@@ -12894,7 +13577,26 @@ def _np_api(model: str, method: str, properties: dict, timeout: int = 25) -> dic
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        # A 429 is an explicit rejection before processing. Server errors may be ambiguous.
+        if exc.code == 429:
+            raise NovaPoshtaRetryableError("Nova Poshta rate limit; retry scheduled.") from exc
+        if exc.code >= 500:
+            raise NovaPoshtaAmbiguousResult(
+                f"Nova Poshta HTTP {exc.code}; check the business cabinet before retrying."
+            ) from exc
+        raise NovaPoshtaAPIError(f"Nova Poshta HTTP {exc.code}.") from exc
     except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        reason_text = str(reason).casefold()
+        if any(term in reason_text for term in (
+            "connection refused", "network is unreachable", "no route to host",
+            "name or service not known", "temporary failure in name resolution",
+            "nodename nor servname provided", "no address associated",
+        )):
+            raise NovaPoshtaRetryableError(
+                "Nova Poshta is unreachable before request delivery; retry scheduled."
+            ) from exc
         raise NovaPoshtaAmbiguousResult(
             "Немає однозначної відповіді від Нової пошти. Автоматичний повтор зупинено, щоб не створити дубль ТТН."
         ) from exc
@@ -13099,6 +13801,25 @@ def _np_send_ttn_notifications(order_id: int, ttn: str) -> None:
             )
 
 
+def _np_schedule_safe_retry(order_id: int, error: str) -> bool:
+    """Retry only definitive pre-delivery/rate-limit failures, with bounded backoff."""
+    with db_cursor() as cur:
+        cur.execute("""UPDATE np_ttn_jobs
+                       SET state=CASE WHEN attempts<8 THEN 'pending' ELSE 'failed' END,
+                           next_attempt_at=NOW()+(LEAST(3600,60*POWER(2,LEAST(attempts-1,6))) * INTERVAL '1 second'),
+                           last_error=%s,lease_until=NULL,updated_at=NOW()
+                       WHERE order_id=%s RETURNING state,attempts,next_attempt_at""",
+                    (error[:2000], order_id))
+        row = cur.fetchone()
+        if row:
+            cur.execute("UPDATE orders SET np_ttn_error=%s,updated_at=NOW() WHERE id=%s", (error[:2000], order_id))
+            cur.execute("""INSERT INTO delivery_events(order_id,event_type,details)
+                           VALUES(%s,'ttn_retry_scheduled',%s::jsonb)""",
+                        (order_id, json_dumps({"state": row["state"], "attempts": row["attempts"],
+                                               "next_attempt_at": _miniapp_json_value(row["next_attempt_at"]), "error": error[:1000]})))
+    return bool(row and row["state"] == "pending")
+
+
 def process_one_np_ttn_job() -> bool:
     """Claim one queued job. Ambiguous network outcomes are never blindly retried."""
     with db_cursor() as cur:
@@ -13128,6 +13849,10 @@ def process_one_np_ttn_job() -> bool:
 
     try:
         result = _np_create_ttn_for_order(order_id)
+    except NovaPoshtaRetryableError as exc:
+        retrying = _np_schedule_safe_retry(order_id, str(exc))
+        _np_notify_np_issue(order_id, str(exc), "retrying" if retrying else "failed")
+        return True
     except NovaPoshtaAmbiguousResult as exc:
         _np_finish_job(order_id, "uncertain", str(exc))
         _np_notify_np_issue(order_id, str(exc), "uncertain")
