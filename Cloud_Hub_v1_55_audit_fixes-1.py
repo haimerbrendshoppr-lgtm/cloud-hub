@@ -87,6 +87,7 @@ import os
 import re
 import secrets
 import hashlib
+import gzip
 import signal
 import sys
 import threading
@@ -106,7 +107,7 @@ from types import SimpleNamespace as _NS
 from zoneinfo import ZoneInfo
 
 try:
-    from flask import Flask, jsonify, request, Response
+    from flask import Flask, jsonify, request, Response, send_file
 except ImportError as exc:
     raise SystemExit("Missing Mini App dependency Flask. Install with: pip install Flask") from exc
 
@@ -10917,6 +10918,31 @@ def fallback(message):
 # ---------------------------------------------------------------------------
 
 miniapp = Flask("cloudhub_miniapp")
+
+@miniapp.after_request
+def _compress_small_text_responses(response):
+    """Reduce the large bootstrap JSON transfer without changing API payloads."""
+    accept_encoding = request.headers.get("Accept-Encoding", "")
+    content_type = response.headers.get("Content-Type", "")
+    if ("gzip" not in accept_encoding.lower() or response.direct_passthrough
+            or response.status_code < 200 or response.status_code in (204, 304)
+            or response.headers.get("Content-Encoding")
+            or not (content_type.startswith("application/json") or content_type.startswith("text/"))):
+        return response
+    try:
+        raw = response.get_data()
+        if len(raw) < 700:
+            return response
+        compressed = gzip.compress(raw, compresslevel=5, mtime=0)
+        if len(compressed) >= len(raw):
+            return response
+        response.set_data(compressed)
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["Content-Length"] = str(len(compressed))
+        response.headers.add("Vary", "Accept-Encoding")
+    except Exception:
+        log.exception("Could not gzip response")
+    return response
 miniapp.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 MINIAPP_HTML = r"""<!doctype html>
@@ -10962,12 +10988,12 @@ function loadProductPhotos(){if(photoObserver)photoObserver.disconnect();const i
 function editDistance(a,b){if(Math.abs(a.length-b.length)>2)return 99;let prev=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){let curr=[i],rowMin=i;for(let j=1;j<=b.length;j++){let v=Math.min(curr[j-1]+1,prev[j]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));curr[j]=v;rowMin=Math.min(rowMin,v)}if(rowMin>2)return 99;prev=curr}return prev[b.length]}
 function productMatches(p,q){if(!q)return true;let fields=`${p.name} ${p.brand||''} ${p.sku||''} ${p.variant_name||''}`.toLowerCase();if(fields.includes(q))return true;let needles=q.split(/\s+/).filter(Boolean),words=fields.split(/[^\p{L}\p{N}]+/u).filter(Boolean);return needles.every(n=>{if(words.some(w=>w.includes(n)))return true;if(n.length<4)return false;let max=n.length>=8?2:1;return words.some(w=>Math.abs(w.length-n.length)<=max&&editDistance(n,w)<=max)})}
 function renderProducts(){setActiveTab('shopBtn');hideSections();let q=$('search').value.toLowerCase().trim();let arr=products.filter(p=>(!category||(category===0?popularProductIds.has(Number(p.product_id)):(p.storefront_category_id??p.category_id)===category))&&productMatches(p,q));let empty=q?'Нічого не знайдено. Перевірте написання або пошукайте коротше.':category===0?'Популярні товари ще не мають підтверджених продажів.':category?'У цій категорії зараз немає товарів у наявності.':'Каталог наразі порожній.';$('products').innerHTML=productCards(arr)||`<div class="notice">${empty}</div>`}
-async function load(){try{let d=await api('/api/miniapp/bootstrap');track('visit',visitSource());authenticated=Boolean(d.authenticated||inTelegram);webSession=Boolean(d.web_session);$("webLogout").classList.toggle("hidden",!webSession);products=d.products;popularProductIds=new Set((d.popular_product_ids||[]).map(Number));favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;canViewSupport=d.can_view_support;canReplySupport=d.can_reply_support;canManageInventory=Boolean(d.can_manage_inventory);canConfirmInventory=Boolean(d.can_confirm_inventory);let staffMode=canManageOwner||canManageCatalog||canEditCatalog||canViewCustomers||canViewOrders||canViewSupport||canManageInventory||canConfirmInventory||canManageBanners;document.body.classList.toggle('staff-mode',staffMode);banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі товари</button>'+(popularProductIds.size?'<button class="chip" onclick="setCat(0,this)">Популярне</button>':'')+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();if(webSession&&guestCart.length){try{for(const line of guestCart)await api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:line.variant_id,quantity:line.quantity})});guestCart=[];localStorage.removeItem(GUEST_CART_KEY)}catch(e){msg('Guest cart sync failed; it remains saved here.')}}await loadCart();if(canManageBanners)renderBannerAdmin();if(canManageOwner){renderOwnerEntry();renderAnalyticsEntry()}if(staffMode){renderStaffEntry();loadStaffTools()}if(canManageInventory)renderInventoryEntry()}catch(e){msg(e.message)}}
+async function load(){try{let d=await api('/api/miniapp/bootstrap');track('visit',visitSource());authenticated=Boolean(d.authenticated||inTelegram);webSession=Boolean(d.web_session);$("webLogout").classList.toggle("hidden",!webSession);products=d.products;popularProductIds=new Set((d.popular_product_ids||[]).map(Number));favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;canViewSupport=d.can_view_support;canReplySupport=d.can_reply_support;canManageInventory=Boolean(d.can_manage_inventory);canConfirmInventory=Boolean(d.can_confirm_inventory);let staffMode=canManageOwner||canManageCatalog||canEditCatalog||canViewCustomers||canViewOrders||canViewSupport||canManageInventory||canConfirmInventory||canManageBanners;document.body.classList.toggle('staff-mode',staffMode);banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі товари</button>'+(popularProductIds.size?'<button class="chip" onclick="setCat(0,this)">Популярне</button>':'')+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();let directVariant=new URLSearchParams(location.search).get('variant');if(!directVariant){let startParam=tg?.initDataUnsafe?.start_param||'';let match=startParam.match(/^(?:product|variant)_(\d+)$/);if(match)directVariant=match[1]}if(directVariant&&products.some(p=>Number(p.variant_id)===Number(directVariant)))openProduct(Number(directVariant));if(webSession&&guestCart.length){try{await Promise.all(guestCart.map(line=>api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:line.variant_id,quantity:line.quantity}))));guestCart=[];localStorage.removeItem(GUEST_CART_KEY)}catch(e){msg('Guest cart sync failed; it remains saved here.')}}await loadCart();if(canManageBanners)renderBannerAdmin();if(canManageOwner){renderOwnerEntry();renderAnalyticsEntry()}if(staffMode){renderStaffEntry();loadStaffTools()}if(canManageInventory)renderInventoryEntry()}catch(e){msg(e.message)}}
 async function toggleFavorite(productId){if(!authenticated){msg('Щоб зберегти обране, увійдіть через Telegram.');return}try{let add=!favorites.has(Number(productId));let d=await api('/api/miniapp/favorites',{method:'POST',body:JSON.stringify({product_id:productId,active:add})});favorites=new Set((d.product_ids||[]).map(Number));msg(add?'Додано в обране ♥':'Прибрано з обраного');if(!$('favorites').classList.contains('hidden'))await loadFavorites();else renderProducts()}catch(e){msg(e.message)}}
 async function loadFavorites(){track('favorites_view');setActiveTab('favoritesBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('favorites').classList.remove('hidden');if(!authenticated){$('favorites').innerHTML='<h2>Обране</h2>'+telegramPrompt();return}try{if(!favorites.size){$('favorites').innerHTML='<h2>Обране</h2><div class="notice">В обраному поки немає товарів</div>';return}let items=products.filter(p=>favorites.has(Number(p.product_id)));$('favorites').innerHTML='<h2>Обране</h2>'+ (items.length?productCards(items):'<div class="notice">В обраному поки немає доступних товарів</div>')}catch(e){$('favorites').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function loadLoyalty(){track('loyalty_view');setActiveTab('loyaltyBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('loyaltyPanel').classList.remove('hidden');if(!authenticated){$('loyaltyPanel').innerHTML='<h2>Бонуси</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/profile');let share=d.referral_link?`<a class="banner" href="https://t.me/share/url?url=${encodeURIComponent(d.referral_link)}&text=${encodeURIComponent('Приєднуйся до Cloud Hub за моїм посиланням')}" target="_blank" rel="noopener"><div><b>Запросити друга</b><p>Після першого отриманого замовлення ви обоє отримаєте по 50 бонусів. Код: ${esc(d.referral_code)}</p></div></a>`:`<div class="notice">Код запрошення: ${esc(d.referral_code||'')}. Якщо посилання ще не готове, поділіться кодом із другом.</div>`;$('loyaltyPanel').innerHTML=`<h2>Бонусна карта</h2><div class="grid"><div class="card"><small>Доступно</small><h3>${money(d.bonus_available||0)}</h3></div><div class="card"><small>Нарахуємо після отримання</small><h3>${money(d.bonus_pending||0)}</h3></div></div><div class="notice">Картка: <b>${esc(d.loyalty_card_number||'—')}</b><br>1 бонус = 1 грн. Бонусами можна оплатити до 100% вартості товарів.</div>${share}<button onclick="loadOwnerDashboard()" ${canManageOwner?'':'class="hidden"'}>Панель власника</button>`}catch(e){$('loyaltyPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function openSupport(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('supportPanel').classList.remove('hidden');$('supportPanel').innerHTML='<h2>Чат підтримки</h2>';if(!authenticated){$('supportPanel').innerHTML+='<div class="notice">Звернення зберігаються у вашому акаунті Telegram, щоб ми могли відповісти напряму.</div>'+telegramPrompt();return}await loadCustomerSupport()}
-async function loadCustomerSupport(){try{let d=await api('/api/miniapp/support');$('supportPanel').innerHTML='<h2>Чат підтримки</h2>'+((d.items||[]).map(t=>`<article class="card"><b>Звернення #${t.id}</b> · ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Підтримка':'Ви'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}<textarea id="reply-${t.id}" maxlength="4000" placeholder="Ваше повідомлення" ${t.status==='closed'?'disabled':''}></textarea><button onclick="sendSupportMessage(${t.id})" ${t.status==='closed'?'disabled':''}>Відповісти</button></article>`).join('')||'<div class="notice">Поки немає звернень. Напишіть нам, і власник або менеджер відповість у цьому чаті.</div>')+'<div class="card"><h3>Нове звернення</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="Чим можемо допомогти?"></textarea><button class="primary" onclick="sendSupportMessage(0)">Надіслати</button></div>'}catch(e){$('supportPanel').innerHTML='<h2>Чат підтримки</h2><div class="notice">'+esc(e.message)+'</div>'}}
+async function loadCustomerSupport(archived=false){try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));let tabs=`<div class="support-tabs"><button class="${!archived?'primary':''}" onclick="loadCustomerSupport(false)">&#1040;&#1082;&#1090;&#1080;&#1074;&#1085;&#1110;</button><button class="${archived?'primary':''}" onclick="loadCustomerSupport(true)">&#1040;&#1088;&#1093;&#1110;&#1074; (${(d.items||[]).length})</button></div>`;let cards=(d.items||[]).map(t=>`<article class="card"><b>&#1047;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1085;&#1103; #${Number(t.id)}</b> ? ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'&#1055;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1072;':'&#1042;&#1080;'} ? ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${t.status==='closed'?'<div class="notice">&#1062;&#1077; &#1079;&#1072;&#1072;&#1088;&#1093;&#1110;&#1074;&#1086;&#1074;&#1072;&#1085;&#1077; &#1079;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1085;&#1103;. &#1044;&#1086;&#1076;&#1072;&#1090;&#1080; &#1087;&#1086;&#1074;&#1110;&#1076;&#1086;&#1084;&#1083;&#1077;&#1085;&#1085;&#1103; &#1085;&#1077;&#1084;&#1086;&#1078;&#1085;&#1072;.</div>':`<textarea id="reply-${Number(t.id)}" maxlength="4000" placeholder="&#1042;&#1072;&#1096;&#1077; &#1087;&#1086;&#1074;&#1110;&#1076;&#1086;&#1084;&#1083;&#1077;&#1085;&#1085;&#1103;"></textarea><button onclick="sendSupportMessage(${Number(t.id)})">&#1042;&#1110;&#1076;&#1087;&#1086;&#1074;&#1110;&#1089;&#1090;&#1080;</button>`}</article>`).join('');let empty='<div class="notice">'+(archived?'&#1040;&#1088;&#1093;&#1110;&#1074; &#1097;&#1077; &#1087;&#1086;&#1088;&#1086;&#1078;&#1085;&#1110;&#1081;.':'&#1053;&#1077;&#1084;&#1072;&#1108; &#1074;&#1110;&#1076;&#1082;&#1088;&#1080;&#1090;&#1080;&#1093; &#1079;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1100;. &#1053;&#1072;&#1087;&#1080;&#1096;&#1110;&#1090;&#1100; &#1085;&#1072;&#1084; ? &#1084;&#1080; &#1076;&#1086;&#1087;&#1086;&#1084;&#1086;&#1078;&#1077;&#1084;&#1086;.')+'</div>';let newForm=!archived?'<div class="card"><h3>&#1053;&#1086;&#1074;&#1077; &#1079;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1085;&#1103;</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="&#1063;&#1080;&#1084; &#1084;&#1086;&#1078;&#1077;&#1084;&#1086; &#1076;&#1086;&#1087;&#1086;&#1084;&#1086;&#1075;&#1090;&#1080;?"></textarea><button class="primary" onclick="sendSupportMessage(0)">&#1053;&#1072;&#1076;&#1110;&#1089;&#1083;&#1072;&#1090;&#1080;</button></div>':'<button class="primary" onclick="loadCustomerSupport(false)">&#1055;&#1086;&#1095;&#1072;&#1090;&#1080; &#1085;&#1086;&#1074;&#1080;&#1081; &#1095;&#1072;&#1090;</button>'; $('supportPanel').innerHTML='<h2>&#1063;&#1072;&#1090; &#1087;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1080;</h2>'+tabs+(cards||empty)+newForm}catch(e){$('supportPanel').innerHTML='<h2>&#1063;&#1072;&#1090; &#1087;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1080;</h2><div class="notice">'+esc(e.message)+'</div>'}}
 async function sendSupportMessage(ticketId){let field=$(ticketId?'reply-'+ticketId:'newSupportMessage'),message=(field?.value||'').trim();if(!message){msg('Напишіть повідомлення');return}try{await api('/api/miniapp/support',{method:'POST',body:JSON.stringify({ticket_id:ticketId,message})});msg('Повідомлення надіслано підтримці');await loadCustomerSupport()}catch(e){msg(e.message)}}
 function setCat(id,el){track("category_view",id??"all");category=id;document.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));el.classList.add('active');renderProducts()}
 function saveGuestCart(){try{localStorage.setItem(GUEST_CART_KEY,JSON.stringify(guestCart))}catch(e){msg('Браузер не дозволив зберегти кошик. Перевірте налаштування приватності.')}}
@@ -10997,7 +11023,7 @@ async function searchStaffCustomers(){let q=prompt('Картка клієнта:
 async function openStaffCustomer(id){try{let d=await api(`/api/miniapp/staff/customers/${id}`),c=d.customer;$('staffContent').innerHTML=`<button onclick="searchStaffCustomers()">← До пошуку</button><div class="card"><h3>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</h3><p>Телефон: ${esc(c.phone||'—')}<br>Telegram: ${esc(c.telegram_id||'—')} · @${esc(c.username||'—')}<br>Картка: ${esc(c.loyalty_card_number||'—')}<br>Доступні бонуси: ${money(c.bonus_available)} · Очікують: ${money(c.bonus_pending)}</p><h4>Замовлення</h4>${d.orders.map(o=>`<div class="notice">${esc(o.order_number)} · ${esc(o.status)} · ${money(o.grand_total)} · ${esc(o.created_at||'')}</div>`).join('')||'Немає замовлень'}<h4>Бонусний журнал</h4>${d.loyalty.map(x=>`<div class="notice">${esc(x.transaction_type)} ${money(x.amount)} · ${esc(x.state)} · ${esc(x.reason||'')}</div>`).join('')||'Операцій немає'}</div>`}catch(e){msg(e.message)}}
 async function loadStaffOrders(){try{let q=prompt('Пошук за номером, клієнтом, телефоном або ТТН')||'';let d=await api('/api/miniapp/staff/orders?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(o=>`<article class="card"><b>${esc(o.order_number)}</b> · ${esc(o.status)}<p>${esc(o.customer_name)} · ${esc(o.phone)}<br>${esc(o.city)}, ${esc(o.delivery_branch)}<br>Сума: ${money(o.grand_total)} · сплачено: ${money(o.paid_amount)}<br>ТТН: ${esc(o.ttn||'—')}</p>${canUpdateOrders?`<select data-order-status="${o.id}"><option value="new">Прийнято</option><option value="confirmed">Підтверджено</option><option value="packing">Збирається</option><option value="packed">Зібрано</option><option value="ready_to_ship">Готове до відправлення</option><option value="shipped">Відправлено</option><option value="delivered">Отримано</option><option value="completed">Завершено</option><option value="cancelled">Скасовано</option><option value="problem">Потрібна перевірка</option></select><button onclick="updateStaffOrder(${o.id})">Зберегти статус</button>`:''}</article>`).join('')||'<div class="notice">Замовлень не знайдено.</div>'}catch(e){msg(e.message)}}
 async function updateStaffOrder(id){try{let status=document.querySelector(`[data-order-status="${id}"]`).value;await api(`/api/miniapp/staff/orders/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус замовлення оновлено');await loadStaffOrders()}catch(e){msg(e.message)}}
-async function loadStaffSupport(){try{let d=await api('/api/miniapp/staff/support');$('staffContent').innerHTML='<h3>Звернення підтримки</h3>'+((d.items||[]).map(t=>`<button class="card" onclick="openStaffSupport(${t.id})"><b>#${t.id}</b> · ${esc(t.subject)} · ${esc(t.status)}<br><small>Telegram ${esc(t.customer_telegram_id)} · повідомлень ${t.message_count}</small></button>`).join('')||'<div class="notice">Відкритих звернень немає.</div>')}catch(e){msg(e.message)}}
+async function loadStaffSupport(status=staffSupportStatus,query=staffSupportQuery){staffSupportStatus=status;staffSupportQuery=String(query||'').trim();try{let d=await api('/api/miniapp/staff/support?status='+encodeURIComponent(status)+'&q='+encodeURIComponent(staffSupportQuery));let c=d.counts||{};let tabs=[['active','&#1054;&#1089;&#1090;&#1072;&#1085;&#1085;&#1110; 5',Math.min(Number(c.active||0),5)],['archive','&#1040;&#1088;&#1093;&#1110;&#1074;',c.archive||0],['all','&#1059;&#1089;&#1110; &#1090;&#1110;&#1082;&#1077;&#1090;&#1080;',Object.values(c).reduce((a,x)=>a+Number(x||0),0)-Number(c.active||0)-Number(c.archive||0)]];let tabHtml=tabs.map(([key,label,count])=>`<button class="${status===key?'primary':''}" onclick="loadStaffSupport('${key}','')">${label} ? ${count}</button>`).join('');let cards=(d.items||[]).map(t=>`<button class="card support-ticket-row" onclick="openStaffSupport(${Number(t.id)})"><span class="row"><b>#${Number(t.id)} ? ${esc(t.subject||'&#1047;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1085;&#1103;')}</b><span class="pill">${esc(supportStatusLabel(t.status))}</span></span><small>&#1050;&#1083;&#1110;&#1108;&#1085;&#1090; ${esc(t.customer_telegram_id)}${t.order_id?' ? &#1047;&#1072;&#1084;&#1086;&#1074;&#1083;&#1077;&#1085;&#1085;&#1103; #'+esc(t.order_id):''} ? ${Number(t.message_count)} &#1087;&#1086;&#1074;&#1110;&#1076;&#1086;&#1084;&#1083;&#1077;&#1085;&#1100;</small><p>${t.latest_sender==='staff'?'&#1042;&#1080;: ':'&#1050;&#1083;&#1110;&#1108;&#1085;&#1090;: '}${esc(t.latest_message||'&#1055;&#1086;&#1074;&#1110;&#1076;&#1086;&#1084;&#1083;&#1077;&#1085;&#1100; &#1097;&#1077; &#1085;&#1077;&#1084;&#1072;&#1108;')}</p><small>&#1054;&#1085;&#1086;&#1074;&#1083;&#1077;&#1085;&#1086;: ${esc(t.updated_at||'')}</small></button>`).join('');$('staffContent').innerHTML=`<div class="support-desk"><div class="row"><div><h2>&#1055;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1072;</h2><p class="muted">&#1053;&#1072;&#1081;&#1089;&#1074;&#1110;&#1078;&#1110;&#1096;&#1110; &#1090;&#1110;&#1082;&#1077;&#1090;&#1080;, &#1072;&#1088;&#1093;&#1110;&#1074; &#1110; &#1087;&#1086;&#1096;&#1091;&#1082; &#1091; &#1095;&#1072;&#1090;&#1072;&#1093;</p></div><button onclick="loadStaffSupport()">&#1054;&#1085;&#1086;&#1074;&#1080;&#1090;&#1080;</button></div><div class="support-tabs">${tabHtml}</div><form class="support-search" onsubmit="event.preventDefault();loadStaffSupport(staffSupportStatus,this.elements.q.value)"><input name="q" value="${esc(staffSupportQuery)}" placeholder="&#1055;&#1086;&#1096;&#1091;&#1082; &#1090;&#1077;&#1082;&#1089;&#1090;&#1091; &#1095;&#1072;&#1090;&#1091;, &#1090;&#1077;&#1084;&#1110; &#1072;&#1073;&#1086; ID &#1082;&#1083;&#1110;&#1108;&#1085;&#1090;&#1072;"><button class="primary">&#1064;&#1091;&#1082;&#1072;&#1090;&#1080;</button>${staffSupportQuery?'<button type="button" onclick="loadStaffSupport(staffSupportStatus,\'\')">&#1054;&#1095;&#1080;&#1089;&#1090;&#1080;&#1090;&#1080;</button>':''}</form><div class="support-ticket-list">${cards||'<div class="notice">&#1047;&#1074;&#1077;&#1088;&#1085;&#1077;&#1085;&#1100; &#1079;&#1072; &#1094;&#1080;&#1084;&#1080; &#1091;&#1084;&#1086;&#1074;&#1072;&#1084;&#1080; &#1085;&#1077;&#1084;&#1072;&#1108;.</div>'}</div></div>`}catch(e){msg(e.message)}}
 async function openStaffSupport(id){try{let d=await api(`/api/miniapp/staff/support/${id}`),t=d.ticket;$('staffContent').innerHTML=`<button onclick="loadStaffSupport()">← До списку звернень</button><h3>Звернення #${t.id} · ${esc(t.status)}</h3>${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Працівник':'Клієнт'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${canReplySupport&&t.status!=='closed'?`<textarea id="staffSupportReply" maxlength="4000" placeholder="Відповідь клієнту"></textarea><button class="primary" onclick="replyStaffSupport(${t.id})">Відповісти</button><button onclick="setStaffSupportStatus(${t.id},'closed')">Закрити звернення</button>`:''}`}catch(e){msg(e.message)}}
 async function replyStaffSupport(id){let message=$('staffSupportReply')?.value?.trim();if(!message){msg('Напишіть відповідь');return}try{await api(`/api/miniapp/staff/support/${id}/reply`,{method:'POST',body:JSON.stringify({message})});msg('Відповідь надіслано клієнту');await openStaffSupport(id)}catch(e){msg(e.message)}}
 async function setStaffSupportStatus(id,status){try{await api(`/api/miniapp/staff/support/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус звернення оновлено');await loadStaffSupport()}catch(e){msg(e.message)}}async function loadOwnerDashboard(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Панель власника</h2><div class="notice">Завантажую статистику…</div>';try{let d=await api('/api/miniapp/admin/dashboard');$('ownerPanel').innerHTML=`<h2>Статистика магазину</h2><div class="grid"><div class="card"><small>Замовлень сьогодні</small><h3>${d.orders_today}</h3></div><div class="card"><small>Сума замовлень сьогодні</small><h3>${money(d.order_value_today)}</h3></div><div class="card"><small>Оплачено сьогодні</small><h3>${money(d.paid_today)}</h3></div><div class="card"><small>Замовлень за місяць</small><h3>${d.orders_month}</h3></div><div class="card"><small>Сума замовлень за місяць</small><h3>${money(d.order_value_month)}</h3></div><div class="card"><small>Оплачено за місяць</small><h3>${money(d.paid_month)}</h3></div><div class="card"><small>Середнє замовлення</small><h3>${money(d.average_order)}</h3></div><div class="card"><small>Отримано замовлень цього місяця</small><h3>${d.delivered_month}</h3></div><div class="card"><small>Клієнтів</small><h3>${d.customers}</h3></div><div class="card"><small>Очікують обробки</small><h3>${d.pending_orders}</h3></div><div class="card"><small>Бонусне зобов’язання</small><h3>${money(d.bonus_liability)}</h3></div><div class="card"><small>Активні сертифікати</small><h3>${d.active_certificates} · ${money(d.active_certificate_value)}</h3></div><div class="card"><small>Запрошено друзів</small><h3>${d.referrals_rewarded} / ${d.referrals}</h3></div></div><h3>Коригування бонусів</h3><div class="formgrid"><input id="loyaltyLookup" placeholder="Картка, телефон або Telegram ID"><select id="loyaltyOperation"><option value="earn">Нарахувати</option><option value="redeem">Списати</option></select><input id="loyaltyAmount" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума"><input id="loyaltyReason" maxlength="250" placeholder="Обов’язкова причина"><button class="primary" onclick="adjustLoyalty()">Застосувати коригування</button></div><small>Операція записується в бонусний журнал та аудит.</small><h3>Випуск сертифіката</h3><div class="formgrid"><input id="certCustomer" placeholder="Картка клієнта, телефон або Telegram ID"><input id="certCode" maxlength="40" placeholder="Код або залиште порожнім для генерації"><input id="certValue" type="number" min="0.01" max="100000" step="0.01" placeholder="Номінал, грн"><button onclick="createCertificate()">Створити сертифікат</button></div>`}catch(e){$('ownerPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
@@ -11014,7 +11040,7 @@ function showCart(){track('cart_view');setActiveTab('cartBtn');hideSections();$(
 function startSnowfall(){let box=$('snowfallFx');if(!box)return;box.replaceChildren();for(let i=0;i<18;i++){let flake=document.createElement('span');flake.className='snowflake';flake.textContent=i%3?'✦':'❄';flake.style.left=(5+Math.random()*90)+'%';flake.style.animationDelay=(Math.random()*.9)+'s';flake.style.fontSize=(9+Math.random()*9)+'px';box.append(flake)}setTimeout(()=>box.replaceChildren(),3300)}
 async function webLogout(){try{await api('/api/miniapp/web-login/logout',{method:'POST',body:'{}'});window.location.reload()}catch(e){msg(e.message)}}
 function renderInventoryEntry(){if(document.getElementById('inventoryBtn'))return;let btn=document.createElement('button');btn.id='inventoryBtn';btn.textContent='Інвентаризація';btn.onclick=loadInventory;$('staffToolsBtn')?.after(btn)}
-async function loadInventory(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризація</h2><div class="notice">Створюю список товарів для перерахунку…</div>';try{let d=await api('/api/miniapp/staff/inventory',{method:'POST',body:'{}'});await renderInventoryCount(d.count_id)}catch(e){$('staffPanel').innerHTML='<h2>Інвентаризація</h2><div class="notice">'+esc(e.message)+'</div>'}}
+async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>&#1030;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1111;</h2><div class="notice">&#1047;&#1072;&#1074;&#1072;&#1085;&#1090;&#1072;&#1078;&#1091;&#1102; &#1110;&#1089;&#1090;&#1086;&#1088;&#1110;&#1102;...</div>';try{let d=await api('/api/miniapp/staff/inventory?archived='+(archived?'1':'0'));let items=d.items||[];let cards=items.map(x=>`<button class="card support-ticket-row" onclick="renderInventoryCount(${Number(x.id)})"><div class="row"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'&#1047;&#1072;&#1074;&#1077;&#1088;&#1096;&#1077;&#1085;&#1072;':x.status==='counting'?'&#1059; &#1087;&#1088;&#1086;&#1094;&#1077;&#1089;&#1110;':esc(x.status)}</b><span class="pill">${Number(x.counted_count)}/${Number(x.sku_count)} SKU</span></div><small>${esc(x.created_at||'')}${x.confirmed_at?' ? &#1055;&#1110;&#1076;&#1090;&#1074;&#1077;&#1088;&#1076;&#1078;&#1077;&#1085;&#1072; '+esc(x.confirmed_at):''}</small></button>`).join('');let actions=`<div class="formgrid"><button onclick="loadInventory(${archived?'false':'true'})">${archived?'? &#1044;&#1086; &#1086;&#1089;&#1090;&#1072;&#1085;&#1085;&#1110;&#1093; 2':'&#1040;&#1088;&#1093;&#1110;&#1074; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081; ? '+Number(d.archive_count||0)}</button>${!archived&&d.can_start?'<button class="primary" onclick="startInventory()">&#1055;&#1086;&#1095;&#1072;&#1090;&#1080; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1102;</button>':''}</div>`;$('staffPanel').innerHTML=`<h2>${archived?'&#1040;&#1088;&#1093;&#1110;&#1074; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081;':'&#1054;&#1089;&#1090;&#1072;&#1085;&#1085;&#1110; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1111;'}</h2>${actions}<div class="support-ticket-list">${cards||'<div class="notice">&#1055;&#1086;&#1082;&#1080; &#1085;&#1077;&#1084;&#1072;&#1108; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081;.</div>'}</div>`}catch(e){$('staffPanel').innerHTML='<div class="notice">'+esc(e.message)+'</div>'}}
 async function renderInventoryCount(id) {
   try {
     let d=await api('/api/miniapp/staff/inventory/'+id);
@@ -11067,7 +11093,7 @@ function showCart(){track('cart_view');setActiveTab('cartBtn');hideSections();$(
 function renderStaffEntry(){if(document.getElementById('staffToolsBtn'))return;let btn=document.createElement('button');btn.id='staffToolsBtn';btn.textContent='Робоча панель';btn.onclick=loadStaffTools;$('banners').after(btn)}
 async function searchStaffCustomers(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>CRM · пошук клієнтів</h2><input id="crmQuery" placeholder="Ім’я, телефон, картка, Telegram ID" onkeydown="if(event.key===\'Enter\')runCrmSearch()"><button class="primary" onclick="runCrmSearch()">Знайти</button><div id="staffContent"></div>';}
 async function runCrmSearch(){let q=$('crmQuery').value.trim();if(q.length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=(d.items||[]).map(c=>`<button class="card crm-result" onclick="openStaffCustomer(${c.id})"><b>${esc(c.full_name||c.first_name||'Клієнт')}</b><br><small>${esc(c.phone||'Телефон не вказано')} · ${esc(c.loyalty_card_number||'Без картки')}</small><br><small>Замовлень: ${c.order_count} · Сума: ${money(c.lifetime_value)} · Бонуси: ${money(c.bonus_available)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
-async function loadInventory(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризації</h2><button class="primary" onclick="startInventory()">＋ Почати інвентаризацію</button><div class="notice">Історія та чернетки</div><div id="inventoryHistory">Завантажую…</div>';try{let d=await api('/api/miniapp/staff/inventory');$('inventoryHistory').innerHTML=(d.items||[]).map(x=>`<button class="card" onclick="renderInventoryCount(${x.id})"><b>#${x.id} · ${x.status==='confirmed'?'Завершена':x.status==='counting'?'У процесі':esc(x.status)}</b><br><small>${esc(x.created_at)} · Пораховано ${x.counted_count}/${x.sku_count}</small></button>`).join('')||'<div class="notice">Інвентаризацій ще немає.</div>'}catch(e){$('inventoryHistory').textContent=e.message}}
+async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>&#1030;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1111;</h2><div id="inventoryActions"></div><div class="support-tabs"><button class="'+(!archived?'primary':'')+'" onclick="loadInventory(false)">&#1054;&#1089;&#1090;&#1072;&#1085;&#1085;&#1110; 2</button><button class="'+(archived?'primary':'')+'" onclick="loadInventory(true)">&#1040;&#1088;&#1093;&#1110;&#1074; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081;</button></div><div class="notice">'+(archived?'&#1057;&#1090;&#1072;&#1088;&#1110; &#1087;&#1077;&#1088;&#1077;&#1088;&#1072;&#1093;&#1091;&#1085;&#1082;&#1080;':'&#1044;&#1074;&#1110; &#1085;&#1072;&#1081;&#1089;&#1074;&#1110;&#1078;&#1110;&#1096;&#1110; &#1087;&#1077;&#1088;&#1077;&#1088;&#1072;&#1093;&#1091;&#1085;&#1082;&#1080;')+'</div><div id="inventoryHistory">&#1047;&#1072;&#1074;&#1072;&#1085;&#1090;&#1072;&#1078;&#1091;&#1102;...</div>';try{let d=await api('/api/miniapp/staff/inventory'+(archived?'?archived=1':''));$('inventoryActions').innerHTML=!archived&&d.can_start?'<button class="primary" onclick="startInventory()">&#1055;&#1086;&#1095;&#1072;&#1090;&#1080; &#1110;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1102;</button>':'';$('inventoryHistory').innerHTML=(d.items||[]).map(x=>`<button class="card" onclick="renderInventoryCount(${Number(x.id)})"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'&#1047;&#1072;&#1074;&#1077;&#1088;&#1096;&#1077;&#1085;&#1072;':x.status==='counting'?'&#1059; &#1087;&#1088;&#1086;&#1094;&#1077;&#1089;&#1110;':esc(x.status)}</b><br><small>${esc(x.created_at)} ? &#1055;&#1086;&#1088;&#1072;&#1093;&#1086;&#1074;&#1072;&#1085;&#1086; ${Number(x.counted_count)}/${Number(x.sku_count)}</small></button>`).join('')||'<div class="notice">'+(archived?'&#1040;&#1088;&#1093;&#1110;&#1074; &#1087;&#1086;&#1088;&#1086;&#1078;&#1085;&#1110;&#1081;.':'&#1030;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1081; &#1097;&#1077; &#1085;&#1077;&#1084;&#1072;&#1108;.')+'</div>'}catch(e){$('inventoryHistory').textContent=e.message}}
 async function startInventory(){try{let d=await api('/api/miniapp/staff/inventory',{method:'POST',body:'{}'});await renderInventoryCount(d.count_id)}catch(e){msg(e.message)}}
 function loadStaffTools(){hideSections();$('banners').classList.add('hidden');$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML=`<h2>&#1056;&#1086;&#1073;&#1086;&#1095;&#1072; &#1087;&#1072;&#1085;&#1077;&#1083;&#1100;</h2><section class="ops-group"><h3>&#1050;&#1083;&#1110;&#1108;&#1085;&#1090;&#1080; / &#1079;&#1072;&#1084;&#1086;&#1074;&#1083;&#1077;&#1085;&#1085;&#1103;</h3><div class="formgrid">${canViewCustomers?'<button onclick="searchStaffCustomers()">&#1055;&#1086;&#1096;&#1091;&#1082; CRM</button>':''}${canViewOrders?'<button onclick="loadStaffOrders()">&#1047;&#1072;&#1084;&#1086;&#1074;&#1083;&#1077;&#1085;&#1085;&#1103;</button>':''}</div></section><section class="ops-group"><h3>&#1058;&#1086;&#1074;&#1072;&#1088;&#1080; / &#1089;&#1082;&#1083;&#1072;&#1076;</h3><div class="formgrid">${canManageCatalog?'<button onclick="loadStaffCatalog()">&#1056;&#1077;&#1076;&#1072;&#1075;&#1091;&#1074;&#1072;&#1090;&#1080; &#1090;&#1086;&#1074;&#1072;&#1088;&#1080;</button>':''}${canManageInventory?'<button onclick="loadInventory()">&#1030;&#1085;&#1074;&#1077;&#1085;&#1090;&#1072;&#1088;&#1080;&#1079;&#1072;&#1094;&#1110;&#1111;</button>':''}</div></section>${canManageOwner?'<section class="ops-group"><h3>&#1042;&#1083;&#1072;&#1089;&#1085;&#1080;&#1082; / &#1079;&#1074;&#1110;&#1090;&#1080; / &#1082;&#1077;&#1088;&#1091;&#1074;&#1072;&#1085;&#1085;&#1103;</h3><div class="formgrid"><button onclick="loadOwnerAnalytics(this.dataset.period)" data-period="day">&#1040;&#1085;&#1072;&#1083;&#1110;&#1090;&#1080;&#1082;&#1072; &#1076;&#1078;&#1077;&#1088;&#1077;&#1083; / &#1074;&#1086;&#1088;&#1086;&#1085;&#1082;&#1080; / &#1088;&#1077;&#1092;&#1077;&#1088;&#1072;&#1083;&#1110;&#1074;</button><button onclick="loadReplenishment()">&#1047;&#1072;&#1082;&#1091;&#1087;&#1110;&#1074;&#1083;&#1110;</button><button onclick="loadOwnerDashboard()">&#1055;&#1072;&#1085;&#1077;&#1083;&#1100; &#1074;&#1083;&#1072;&#1089;&#1085;&#1080;&#1082;&#1072;</button><button onclick="renderBannerAdmin()">&#1041;&#1072;&#1085;&#1077;&#1088;&#1080;</button></div></section>':''}<section class="ops-group"><h3>&#1055;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1072;</h3><div class="formgrid">${canViewSupport?'<button onclick="loadStaffSupport()">&#1063;&#1072;&#1090; &#1087;&#1110;&#1076;&#1090;&#1088;&#1080;&#1084;&#1082;&#1080;</button>':''}</div></section><div id="staffContent"></div>`}
 async function loadCustomerSupport(archived=false){let panel=$('supportPanel');panel.innerHTML=`<h2>Чат підтримки</h2><div class="formgrid"><button onclick="loadCustomerSupport(false)">Активні</button><button onclick="loadCustomerSupport(true)">Архів</button></div><div class="notice">Тут лише ваші звернення до підтримки — товари й історія замовлень окремо.</div>`;try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));panel.innerHTML+=((d.items||[]).map(t=>`<article class="card"><b>Звернення #${t.id}</b> · ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Підтримка':'Ви'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${!archived&&t.status!=='closed'?`<textarea id="reply-${t.id}" maxlength="4000" placeholder="Напишіть відповідь"></textarea><button onclick="sendSupportMessage(${t.id})">Надіслати</button>`:''}</article>`).join('')||`<div class="notice">${archived?'Архів порожній':'Активних звернень немає'}</div>`)+(archived?'':'<div class="card"><h3>Нове звернення</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="Опишіть, чим допомогти"></textarea><button class="primary" onclick="sendSupportMessage(0)">Надіслати підтримці</button></div>')}catch(e){panel.innerHTML+='<div class="notice">'+esc(e.message)+'</div>'}}
@@ -11199,33 +11225,10 @@ def miniapp_public_home():
 
 @miniapp.get("/miniapp")
 def miniapp_home():
-    page = MINIAPP_HTML
-    try:
-        products = list_catalog(limit=1000)
-        base = _public_site_base()
-        elements = []
-        for row in products:
-            elements.append({
-                "@type": "Product",
-                "name": " ".join(x for x in (str(row.get("name") or ""), str(row.get("variant_name") or "")) if x),
-                "sku": str(row.get("sku") or ""),
-                "brand": {"@type": "Brand", "name": str(row.get("brand") or "Cloud Hub")},
-                "image": [f"{base}/api/miniapp/products/{int(row['photo_id'])}/photo"] if row.get("photo_id") else [],
-                "offers": {"@type": "Offer", "priceCurrency": "UAH", "price": str(row.get("price") or 0),
-                           "availability": "https://schema.org/InStock" if int(row.get("available") or 0) > 0 else "https://schema.org/OutOfStock",
-                           "url": _public_product_url(int(row.get("product_id") or 0), str(row.get("name") or ""), base)},
-            })
-        structured = {"@context": "https://schema.org", "@type": "ItemList", "name": "Cloud Hub — каталог",
-                      "numberOfItems": len(elements), "itemListElement": [
-                          {"@type": "ListItem", "position": i + 1, "item": item} for i, item in enumerate(elements)
-                      ]}
-        encoded = json.dumps(structured, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
-        canonical = base + ("/miniapp" if request.path == "/miniapp" else "/")
-        page = page.replace("</head>", f'<link rel="canonical" href="{html.escape(canonical, quote=True)}"><script type="application/ld+json">{encoded}</script></head>', 1)
-    except Exception:
-        log.exception("Could not render Mini App SEO product metadata")
-    return Response(page, mimetype="text/html", headers={"Cache-Control":"no-store, no-cache, must-revalidate, max-age=0"})
-
+    # Public product pages already provide crawlable SEO metadata. Rebuilding a
+    # 1,000-product JSON-LD document on every app open delayed the first screen.
+    return Response(MINIAPP_HTML, mimetype="text/html; charset=utf-8",
+                    headers={"Cache-Control": "public, max-age=300"})
 
 @miniapp.get("/product/<int:product_id>/<slug>")
 def miniapp_public_product(product_id: int, slug: str):
@@ -11246,6 +11249,7 @@ def miniapp_public_product(product_id: int, slug: str):
     description = f"{product.get('name') or 'Товар'} — {category}, {product.get('brand_name') or 'Cloud Hub'}. {product_description}"[:280]
     title = f"{product.get('name')} — ціна та наявність | Cloud Hub"
     variant_html = "".join(f'<li><b>{html.escape(str(v.get("variant_name") or v.get("sku") or "Варіант"))}</b> · {html.escape(str(v.get("price")))} грн · є в наявності</li>' for v in variants)
+    telegram_product_url = f"https://t.me/Cloud_hub_vape_bot?startapp=product_{int(variants[0]['id'])}"
     body = f'<p class="crumb"><a href="/">Каталог</a> / <a href="/category/{int(product.get("category_id") or 0)}/{_public_slug(category)}">{html.escape(category)}</a></p><article class="detail">{image}<div><span class="pill">{html.escape(str(product.get("brand_name") or "Cloud Hub"))}</span><h1>{html.escape(str(product.get("name") or "Товар"))}</h1><p class="price">Від {html.escape(str(min_price))} грн</p><p class="muted">{html.escape(description)}</p><h2>Варіанти та наявність</h2><ul>{variant_html}</ul><a class="button" href="/miniapp">Відкрити магазин і оформити замовлення</a></div></article>'
     schema = {"@context": "https://schema.org", "@type": "Product", "name": str(product.get("name") or ""), "description": description, "sku": str(variants[0].get("sku") or ""), "brand": {"@type": "Brand", "name": str(product.get("brand_name") or "Cloud Hub")}, "category": category, "image": [photo_url] if photo_url else [], "offers": {"@type": "Offer", "url": canonical, "priceCurrency": "UAH", "price": str(min_price), "availability": "https://schema.org/InStock", "itemCondition": "https://schema.org/NewCondition"}}
     return _public_site_page(title, description, body, canonical, schema)
@@ -11515,28 +11519,47 @@ def miniapp_product_photo(media_id: int):
             media = cur.fetchone()
         if not media:
             return jsonify({"error": "Фото товару не знайдено."}), 404
-        content = b""
         source_path = str(media.get("disk_path") or "").strip()
+        cache_control = "public, max-age=86400" if public_request else "private, max-age=86400"
         if source_path:
             data_root = os.path.realpath(CONFIG.data_dir)
             disk_path = os.path.realpath(source_path if os.path.isabs(source_path) else os.path.join(data_root, source_path))
             if os.path.commonpath((data_root, disk_path)) != data_root or not os.path.isfile(disk_path):
-                return jsonify({"error": "Файл фото недоступний."}), 404
-            with open(disk_path, "rb") as image_file:
-                content = image_file.read(8 * 1024 * 1024 + 1)
+                return jsonify({"error": "???????? ???????? ??????????????????????."}), 404
             content_type = {".png":"image/png", ".webp":"image/webp", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(os.path.splitext(disk_path)[1].lower(), "application/octet-stream")
+            response = send_file(disk_path, mimetype=content_type, conditional=True, max_age=86400)
         elif media.get("telegram_file_id"):
-            file_info = bot.get_file(media["telegram_file_id"])
-            file_url = f"https://api.telegram.org/file/bot{CONFIG.bot_token}/{urllib.parse.quote(file_info.file_path, safe='/')}"
-            with urllib.request.urlopen(file_url, timeout=15) as response:
-                content = response.read(8 * 1024 * 1024 + 1)
-            extension = os.path.splitext(file_info.file_path)[1].lower()
-            content_type = {".png":"image/png", ".webp":"image/webp", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension, "image/jpeg")
+            # Telegram file URLs are temporary and the old handler downloaded the
+            # same original on every image request. Keep one durable copy per file_id.
+            file_id = str(media["telegram_file_id"])
+            cache_dir = os.path.join(os.path.realpath(CONFIG.data_dir), "cache", "product-photos")
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_key = hashlib.sha256(file_id.encode("utf-8")).hexdigest()
+            cache_path = os.path.join(cache_dir, cache_key + ".img")
+            mime_path = os.path.join(cache_dir, cache_key + ".mime")
+            if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+                content_type = open(mime_path, "r", encoding="ascii").read().strip() if os.path.isfile(mime_path) else "image/jpeg"
+            else:
+                file_info = bot.get_file(file_id)
+                file_url = f"https://api.telegram.org/file/bot{CONFIG.bot_token}/{urllib.parse.quote(file_info.file_path, safe='/')}"
+                with urllib.request.urlopen(file_url, timeout=15) as upstream:
+                    content = upstream.read(8 * 1024 * 1024 + 1)
+                if not content or len(content) > 8 * 1024 * 1024:
+                    return jsonify({"error": "???????? ???????? ???????????????? ?????? ??????????????????."}), 413
+                extension = os.path.splitext(file_info.file_path)[1].lower()
+                content_type = {".png":"image/png", ".webp":"image/webp", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension, "image/jpeg")
+                temp_path = cache_path + ".tmp-" + uuid.uuid4().hex
+                with open(temp_path, "wb") as image_file:
+                    image_file.write(content)
+                os.replace(temp_path, cache_path)
+                with open(mime_path, "w", encoding="ascii") as mime_file:
+                    mime_file.write(content_type)
+            response = send_file(cache_path, mimetype=content_type, conditional=True, max_age=86400)
         else:
-            return jsonify({"error": "Для фото не задане джерело."}), 404
-        if not content or len(content) > 8 * 1024 * 1024:
-            return jsonify({"error": "Файл фото порожній або завеликий."}), 413
-        return Response(content, mimetype=content_type, headers={"Cache-Control":"public, max-age=1800" if public_request else "private, max-age=1800", "X-Content-Type-Options":"nosniff"})
+            return jsonify({"error": "?????? ???????? ???? ???????????? ??????????????."}), 404
+        response.headers["Cache-Control"] = cache_control
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
     except PermissionError as exc:
         return jsonify({"error": str(exc)}), 401
     except Exception:
@@ -12001,20 +12024,33 @@ def miniapp_customer_support():
                 cur.execute("""SELECT id,subject,status,created_at,updated_at FROM support_tickets
                                WHERE customer_telegram_id=%s AND subject<>'Запит на роботу'
                                  AND (status='closed')=%s
-                               ORDER BY updated_at DESC,id DESC LIMIT 30""", (user.id, archived))
+                               ORDER BY updated_at DESC,id DESC""", (user.id, archived))
                 tickets = list(cur.fetchall())
+                cur.execute("""SELECT id,order_number,created_at,status FROM orders
+                               WHERE telegram_id_snapshot=%s ORDER BY created_at DESC,id DESC LIMIT 20""", (user.id,))
+                orders = list(cur.fetchall())
             items = []
             for row in tickets:
                 detail = support_ticket_detail(int(row["id"])) or {}
                 items.append({**row, "messages":[{key:message.get(key) for key in ("sender_type","body","created_at")} for message in detail.get("messages", [])]})
-            return jsonify({"items": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in items]})
+            return jsonify({"items": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in items],
+                            "orders": [{k:_miniapp_json_value(v) for k,v in row.items()} for row in orders]})
         body = request.get_json(silent=True) or {}
         text = str(body.get("message") or "").strip()
         if not text or len(text) > 4000:
             return jsonify({"error": "Напишіть повідомлення (до 4000 символів)."}), 400
         ticket_id = int(body.get("ticket_id") or 0)
         if ticket_id <= 0:
-            ticket_id = create_support_ticket(user.id, text)
+            order_number = " ".join(str(body.get("order_number") or "").split())[:80]
+            order_id = None
+            if order_number:
+                with db_cursor() as cur:
+                    cur.execute("SELECT id FROM orders WHERE order_number=%s AND telegram_id_snapshot=%s", (order_number,user.id))
+                    linked_order=cur.fetchone()
+                if not linked_order:
+                    return jsonify({"error":"Замовлення не знайдено у вашому профілі."}),404
+                order_id=int(linked_order["id"])
+            ticket_id = create_support_ticket(user.id, text, order_id=order_id)
         else:
             with db_cursor() as cur:
                 cur.execute("SELECT assigned_to,status FROM support_tickets WHERE id=%s AND customer_telegram_id=%s", (ticket_id,user.id))
@@ -12072,14 +12108,43 @@ def miniapp_staff_support_list():
     try:
         user = _miniapp_auth_user()
         _miniapp_require_staff(user,"support.read")
+        status = (request.args.get("status") or "active").strip().lower()
+        query = " ".join((request.args.get("q") or "").split())[:100]
+        if status not in {"active", "archive", "all"}:
+            return jsonify({"error": "Невідомий розділ звернень."}), 400
+        conditions = ["t.subject<>%s"]
+        params: list[Any] = ["Запит на роботу"]
+        if status == "active":
+            conditions.append("t.status<>'closed'")
+            if not query:
+                conditions.append("t.id IN (SELECT id FROM support_tickets WHERE status<>'closed' AND subject<>%s ORDER BY updated_at DESC,id DESC LIMIT 5)")
+                params.append("Запит на роботу")
+        elif status == "archive":
+            conditions.append("(t.status='closed' OR t.id NOT IN (SELECT id FROM support_tickets WHERE status<>'closed' AND subject<>%s ORDER BY updated_at DESC,id DESC LIMIT 5))")
+            params.append("Запит на роботу")
+        if query:
+            pattern = f"%{query}%"
+            conditions.append("(t.subject ILIKE %s OR t.customer_telegram_id::text ILIKE %s OR EXISTS (SELECT 1 FROM support_messages sm WHERE sm.ticket_id=t.id AND sm.body ILIKE %s))")
+            params.extend([pattern, pattern, pattern])
         with db_cursor() as cur:
-            cur.execute("""SELECT t.id,t.customer_telegram_id,t.subject,t.status,t.assigned_to,t.updated_at,
-                               COUNT(m.id)::int message_count
-                               FROM support_tickets t LEFT JOIN support_messages m ON m.ticket_id=t.id
-                               WHERE t.status<>'closed' AND t.subject<>'Запит на роботу'
-                               GROUP BY t.id ORDER BY t.updated_at DESC,t.id DESC LIMIT 100""")
+            cur.execute("""SELECT status,COUNT(*)::int AS total FROM support_tickets
+                           WHERE subject<>%s GROUP BY status""", ("Запит на роботу",))
+            counts = {row["status"]: int(row["total"]) for row in cur.fetchall()}
+            cur.execute(f"""SELECT t.id,t.customer_telegram_id,t.order_id,t.subject,t.status,t.assigned_to,t.created_at,t.updated_at,
+                                   COUNT(m.id)::int message_count,latest.body AS latest_message,latest.sender_type AS latest_sender
+                            FROM support_tickets t
+                            LEFT JOIN support_messages m ON m.ticket_id=t.id
+                            LEFT JOIN LATERAL (SELECT body,sender_type FROM support_messages WHERE ticket_id=t.id ORDER BY id DESC LIMIT 1) latest ON TRUE
+                            WHERE {' AND '.join(conditions)}
+                            GROUP BY t.id,latest.body,latest.sender_type
+                            ORDER BY t.updated_at DESC,t.id DESC""", params)
             rows=list(cur.fetchall())
-        return jsonify({"items":[{k:_miniapp_json_value(v) for k,v in row.items()} for row in rows]})
+        total_count=sum(counts.values())
+        active_count=sum(counts.get(key, 0) for key in ("new", "open", "waiting_customer"))
+        counts["active"] = active_count
+        counts["archive"] = total_count - min(active_count, 5)
+        return jsonify({"items":[{k:_miniapp_json_value(v) for k,v in row.items()} for row in rows], "counts": counts,
+                        "status": status, "query": query})
     except PermissionError as exc:
         return jsonify({"error":str(exc)}),403
     except Exception:
@@ -12197,15 +12262,22 @@ def miniapp_staff_inventory_start():
 @miniapp.get("/api/miniapp/staff/inventory")
 def miniapp_staff_inventory_list():
     try:
-        user=_miniapp_auth_user();_miniapp_require_staff(user,"inventory.read")
+        user=_miniapp_auth_user();actor=_miniapp_require_staff(user,"inventory.read")
+        archived=request.args.get("archived")=="1"
+        recent_filter = "c.id NOT IN" if archived else "c.id IN"
         with db_cursor() as cur:
-            cur.execute("""SELECT c.id,c.status,c.created_at,c.confirmed_at,
+            cur.execute(f"""SELECT c.id,c.status,c.created_at,c.confirmed_at,
                                   COUNT(i.variant_id) AS sku_count,
                                   COUNT(i.actual_qty) AS counted_count
                            FROM inventory_counts c LEFT JOIN inventory_count_items i ON i.count_id=c.id
-                           GROUP BY c.id ORDER BY c.created_at DESC LIMIT 100""")
+                           WHERE {recent_filter} (SELECT id FROM inventory_counts ORDER BY created_at DESC,id DESC LIMIT 2)
+                           GROUP BY c.id ORDER BY c.created_at DESC,c.id DESC""")
             rows=list(cur.fetchall())
-        return jsonify({"items":[{k:_miniapp_json_value(v) for k,v in r.items()} for r in rows]})
+            cur.execute("SELECT COUNT(*)::int AS total FROM inventory_counts")
+            total_counts=int(cur.fetchone()["total"])
+        return jsonify({"items":[{k:_miniapp_json_value(v) for k,v in r.items()} for r in rows],
+                        "archived":archived,"can_start":actor.role in {"owner","admin","packer"},
+                        "archive_count":max(0,total_counts-2)})
     except PermissionError as exc:return jsonify({"error":str(exc)}),403
     except Exception:
         log.exception("Inventory history retrieval failed")
