@@ -11,6 +11,16 @@ The single-file application is `Cloud_Hub_v1_55_audit_fixes-1.py`. The Render wo
 - Share a referral link; after the friend's first delivered order, each customer receives 50 bonuses.
 - Review order history and delivery tracking status.
 
+## Public website and SEO
+
+- `/` and `/catalog` serve a public, server-rendered catalog from the same PostgreSQL database as the Telegram Mini App.
+- `/product/<id>/<slug>` and `/category/<id>/<slug>` provide crawlable pages with canonical URLs and structured data.
+- `/sitemap.xml` and `/robots.txt` expose public catalog pages to search engines. Product and inventory changes made by staff appear on the next page request.
+- Public pages are read-only. Staff tools and administrative API actions require signed Telegram Mini App data; a normal website login cannot open staff controls.
+- Website and Mini App share the same anonymous visitor key and storefront event table for traffic and product-view analytics.
+
+Owners can issue a single-use staff access code from **Security Center → Створити код-пароль доступу** in the bot; it expires after 24 hours.
+
 ## Owner tools
 
 The owner dashboard shows sales and order summaries, customers, pending orders, loyalty liability, certificates, and referral rewards. The owner can adjust customer bonuses with an audit trail and issue gift certificates.

@@ -6274,6 +6274,7 @@ def security_dashboard(chat_id: int, actor: Staff) -> None:
             callback_data=f"sec:staff:{row['telegram_id']}"))
     kb.add(types.InlineKeyboardButton("🧾 Останні 50 подій безпеки",callback_data="sec:events"))
     kb.add(types.InlineKeyboardButton("➕ Додати працівника",callback_data="sec:help:add"))
+    kb.add(types.InlineKeyboardButton("🔐 Створити код-пароль доступу",callback_data="sec:code:menu"))
     kb.add(types.InlineKeyboardButton("🏠 Головне меню",callback_data="section:home"))
     bot.send_message(chat_id,"\n".join(lines),reply_markup=kb,parse_mode="HTML")
 
@@ -6457,6 +6458,43 @@ def security_add_help_callback(call):
         "Ролі: admin, manager, packer, courier\n"
         "Зміна ролі: /staff_role TELEGRAM_ID РОЛЬ причина",
     )
+
+
+@bot.callback_query_handler(func=lambda c: c.data=="sec:code:menu")
+def security_access_code_menu_callback(call):
+    actor=require_staff(call)
+    if not actor or actor.role!="owner":
+        bot.answer_callback_query(call.id,"Лише власник.",show_alert=True); return
+    if call.message.chat.type!="private":
+        bot.answer_callback_query(call.id,"Відкрийте приватний чат із ботом, щоб код не потрапив у групу.",show_alert=True); return
+    kb=types.InlineKeyboardMarkup(row_width=2)
+    for role,label in (("admin","Адміністратор"),("manager","Менеджер"),("packer","Пакувальник"),("courier","Кур’єр")):
+        kb.add(types.InlineKeyboardButton(label,callback_data=f"sec:code:issue:{role}"))
+    kb.add(types.InlineKeyboardButton("⬅️ До Security Center",callback_data="sec:home"))
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,"Оберіть роль — створю одноразовий код доступу на 24 години. Надішліть його працівнику приватно.",reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sec:code:issue:"))
+def security_issue_access_code_callback(call):
+    actor=require_staff(call)
+    if not actor or actor.role!="owner":
+        bot.answer_callback_query(call.id,"Лише власник.",show_alert=True); return
+    if call.message.chat.type!="private":
+        bot.answer_callback_query(call.id,"Код можна створити тільки у приватному чаті з ботом.",show_alert=True); return
+    role=call.data.rsplit(":",1)[1]
+    if role not in {"admin","manager","packer","courier"}:
+        bot.answer_callback_query(call.id,"Невідома роль.",show_alert=True); return
+    try:
+        code=issue_staff_access_code(role,actor)
+        label={"admin":"Адміністратор","manager":"Менеджер","packer":"Пакувальник","courier":"Кур’єр"}[role]
+        bot.answer_callback_query(call.id,"Код створено")
+        bot.send_message(call.from_user.id,
+                         f"🔐 Одноразовий код доступу · {label}\n\n<code>{safe(code)}</code>\n\nДіє 24 години та використовується один раз. Надішліть працівнику приватно.",
+                         parse_mode="HTML")
+    except Exception as exc:
+        log.exception("Owner access-code creation failed")
+        bot.answer_callback_query(call.id,safe(str(exc))[:180],show_alert=True)
 
 
 @bot.message_handler(commands=["staff_add"])
@@ -10911,7 +10949,7 @@ let toastTimer;function msg(t){let el=$('status');el.textContent=t;el.classList.
 const apiReadCache=new Map(),apiReadPending=new Map();async function api(path,opts={}){let method=(opts.method||'GET').toUpperCase(),key=method+':'+path;if(method==='GET'){let cached=apiReadCache.get(key);if(cached&&Date.now()-cached.at<5000)return cached.data;if(apiReadPending.has(key))return apiReadPending.get(key)}let work=(async()=>{let r=await fetch(path,{...opts,headers:{...headers,...(opts.headers||{})},credentials:'same-origin'});let d=await r.json();if(!r.ok)throw Error(d.error||'Помилка запиту');if(method==='GET')apiReadCache.set(key,{at:Date.now(),data:d});else apiReadCache.clear();return d})();if(method==='GET')apiReadPending.set(key,work);try{return await work}finally{if(method==='GET')apiReadPending.delete(key)}}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function setActiveTab(id){document.querySelectorAll('.bottom button').forEach(b=>{b.classList.toggle('active',b.id===id);b.classList.toggle('primary',b.id===id)});}
-const VISITOR_KEY='cloudhub.visitor.v1';let visitorId=localStorage.getItem(VISITOR_KEY);if(!visitorId){visitorId=(crypto?.randomUUID?crypto.randomUUID().replace(/-/g,''):Array.from({length:32},()=>Math.floor(Math.random()*16).toString(16)).join(''));localStorage.setItem(VISITOR_KEY,visitorId)}function visitSource(){try{let p=new URLSearchParams(location.search),t=tg?.initDataUnsafe?.start_param;if(t)return t.startsWith('ref_')?'telegram_referral':'telegram_deep_link';return p.get('utm_source')||p.get('source')||(document.referrer?new URL(document.referrer).hostname:'direct')}catch(e){return 'direct'}}function track(eventType,eventRef=''){fetch('/api/miniapp/analytics/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({visitor_id:visitorId,event_type:eventType,event_ref:String(eventRef||'').slice(0,80)}),keepalive:true}).catch(()=>{})}
+const VISITOR_KEY='cloudhub.visitor.v1';let visitorId=localStorage.getItem(VISITOR_KEY);if(!visitorId){visitorId=(crypto?.randomUUID?crypto.randomUUID().replace(/-/g,''):Array.from({length:32},()=>Math.floor(Math.random()*16).toString(16)).join(''));localStorage.setItem(VISITOR_KEY,visitorId)}function visitSource(){try{let p=new URLSearchParams(location.search),t=tg?.initDataUnsafe?.start_param;if(t)return t.startsWith('ref_')?'telegram_referral':'telegram_deep_link';let first=sessionStorage.getItem('cloudhub.first.source.v1');if(first)return first;let source=p.get('utm_source')||p.get('source')||(document.referrer&&new URL(document.referrer).host!==location.host?new URL(document.referrer).hostname:'direct');sessionStorage.setItem('cloudhub.first.source.v1',source);return source}catch(e){return 'direct'}}function track(eventType,eventRef=''){fetch('/api/miniapp/analytics/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({visitor_id:visitorId,event_type:eventType,event_ref:String(eventRef||'').slice(0,80)}),keepalive:true}).catch(()=>{})}
 function telegramPrompt(){return '<div class="notice">Ця персональна функція доступна після входу через Telegram.<br><a class="banner" href="https://t.me/Cloud_hub_vape_bot"><div><b>Відкрити Cloud Hub у Telegram</b><p>Каталог доступний тут без входу.</p></div></a></div>'}
 const telegramPromptBase=telegramPrompt;function telegramPrompt(){return telegramPromptBase()+'<button class="primary" onclick="beginWebLogin()">Увійти через Telegram</button>'}
 function hideSections(){['cart','orders','favorites','loyaltyPanel','supportPanel','adminBanners','ownerPanel','staffPanel'].forEach(x=>$(x).classList.add('hidden'));$('products').classList.remove('hidden');$('categories').classList.remove('hidden');$('search').classList.remove('hidden')}
@@ -11095,11 +11133,76 @@ def _miniapp_json_value(value):
     return value
 
 
+def _public_site_base() -> str:
+    return CONFIG.mini_app_url.rstrip("/")
+
+
+def _public_slug(value: str) -> str:
+    value = re.sub(r"[\s/]+", "-", str(value or "").strip().lower())
+    return urllib.parse.quote(value[:120] or "item", safe="-")
+
+
+def _public_product_url(product_id: int, name: str, base: Optional[str] = None) -> str:
+    return f"{(base or _public_site_base()).rstrip('/')}/product/{int(product_id)}/{_public_slug(name)}"
+
+
+def _public_site_page(title: str, description: str, body: str, canonical: str,
+                      structured_data: Optional[dict] = None,
+                      robots: str = "index,follow") -> Response:
+    structured = ""
+    if structured_data:
+        encoded = json.dumps(structured_data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+        structured = f'<script type="application/ld+json">{encoded}</script>'
+    page = f'''<!doctype html><html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="description" content="{html.escape(description, quote=True)}"><meta name="robots" content="{html.escape(robots, quote=True)}">
+<link rel="canonical" href="{html.escape(canonical, quote=True)}"><meta property="og:type" content="website">
+<meta property="og:site_name" content="Cloud Hub"><meta property="og:title" content="{html.escape(title, quote=True)}">
+<meta property="og:description" content="{html.escape(description, quote=True)}"><title>{html.escape(title)}</title>{structured}
+<style>:root{{color-scheme:dark;--bg:#100b20;--panel:#1b1430;--line:#392956;--muted:#c8bbd8;--accent:#a278ff}}*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(ellipse at 50% -15%,#39205f,#17102a 42%,var(--bg) 78%);color:#fbf8ff;font:16px system-ui,-apple-system,sans-serif;min-height:100vh}}header,main,footer{{width:min(1120px,100% - 32px);margin:auto}}header{{padding:24px 0 18px;border-bottom:1px solid #392956}}header a,.crumb a{{color:#d6bdff;text-decoration:none}}header strong{{font-size:22px;color:#e5cfff}}header nav{{float:right;display:flex;gap:18px;padding-top:5px}}main{{padding:22px 0 54px}}h1{{font-size:clamp(25px,5vw,38px);margin:10px 0}}.muted{{color:var(--muted)}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-top:20px}}.card{{padding:14px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#211735,#171126);color:inherit;text-decoration:none;transition:transform .18s,border-color .18s}}.card:hover{{transform:translateY(-2px);border-color:#a278ff}}.photo{{width:100%;aspect-ratio:1/1;object-fit:contain;background:#100d18;border-radius:12px}}.price{{font-weight:800;color:#e6d4ff}}.detail{{display:grid;grid-template-columns:minmax(240px,440px) minmax(250px,1fr);gap:24px;align-items:start}}.detail .photo{{position:sticky;top:16px}}.pill{{display:inline-block;padding:5px 10px;border:1px solid var(--line);border-radius:99px;margin:4px 4px 4px 0;color:var(--muted)}}.button{{display:inline-block;margin-top:14px;padding:12px 18px;border-radius:12px;background:#8055dc;color:#fff;text-decoration:none;font-weight:700}}footer{{border-top:1px solid var(--line);padding:18px 0 30px;color:var(--muted);font-size:13px}}@media(max-width:620px){{header nav{{float:none;margin-top:10px}}.detail{{grid-template-columns:1fr}}.detail .photo{{position:static;max-width:440px}}}}</style></head>
+<body><header><a href="/"><strong>☁ Cloud Hub</strong></a><nav><a href="/">Каталог</a><a href="/miniapp">Магазин</a></nav></header><main>{body}</main>
+<footer>Cloud Hub · Каталог товарів та актуальні ціни. Інформація про наявність оновлюється з єдиної бази магазину.</footer>
+<script>(()=>{{try{{const key='cloudhub.visitor.v1';let id=localStorage.getItem(key);if(!id){{id=crypto.randomUUID?crypto.randomUUID().replace(/-/g,''):Array.from({{length:32}},()=>Math.floor(Math.random()*16).toString(16)).join('');localStorage.setItem(key,id)}}let source=sessionStorage.getItem('cloudhub.first.source.v1');if(!source){{const p=new URLSearchParams(location.search);source=p.get('utm_source')||p.get('source')||((document.referrer&&new URL(document.referrer).host!==location.host)?new URL(document.referrer).host:'direct');sessionStorage.setItem('cloudhub.first.source.v1',source)}}const send=(type,ref='')=>fetch('/api/miniapp/analytics/event',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{visitor_id:id,event_type:type,event_ref:String(ref||'').slice(0,80)}}),keepalive:true}}).catch(()=>{{}});send('visit',source);if(location.pathname.startsWith('/product/'))send('product_view',location.pathname.split('/')[2]);else if(location.pathname.startsWith('/category/'))send('category_view',location.pathname.split('/')[2]);const q=new URLSearchParams(location.search).get('q');if(q)send('search',q)}}catch(e){{}}}})();</script></body></html>'''
+    return Response(page, mimetype="text/html; charset=utf-8", headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
+
+
+def _public_catalog_card(row: dict, base: Optional[str] = None) -> str:
+    name = " ".join(x for x in (str(row.get("name") or ""), str(row.get("variant_name") or "")) if x)
+    product_id = int(row.get("product_id") or 0)
+    photo = f'<img class="photo" src="/api/miniapp/products/{int(row["photo_id"])}/photo" alt="{html.escape(name, quote=True)}" loading="lazy">' if row.get("photo_id") else '<div class="photo" aria-label="Фото товару відсутнє"></div>'
+    return f'<a class="card" href="{html.escape(_public_product_url(product_id, str(row.get("name") or name), base), quote=True)}">{photo}<span class="pill">{html.escape(str(row.get("brand") or "Cloud Hub"))}</span><h2>{html.escape(name)}</h2><p class="price">{html.escape(str(row.get("price") or ""))} грн</p><p class="muted">{html.escape(str(row.get("description") or "")[:180])}</p></a>'
+
+
+@miniapp.get("/")
+@miniapp.get("/catalog")
+def miniapp_public_home():
+    base = _public_site_base()
+    query = " ".join(request.args.get("q", "").split())[:100]
+    products = list_catalog(limit=1000)
+    if query:
+        needle = query.casefold()
+        products = [row for row in products if needle in " ".join(str(row.get(key) or "") for key in ("name", "variant_name", "description", "brand", "sku")).casefold()]
+    categories = list_root_categories()
+    category_links = "".join(f'<a class="pill" href="/category/{int(c["id"])}/{_public_slug(str(c["name"]))}">{html.escape(str(c["name"]))}</a>' for c in categories)
+    cards = "".join(_public_catalog_card(row, base) for row in products)
+    query_note = f'<p class="muted">Результати пошуку: «{html.escape(query)}» · <a href="/">Скинути</a></p>' if query else ""
+    body = f'''<section><p class="pill">Каталог Cloud Hub · спільні ціни та наявність</p><h1>Каталог товарів Cloud Hub</h1>
+<p class="muted">Переглядайте асортимент, фотографії, описи, ціни й актуальну наявність. Дані синхронізуються з магазином і Telegram Mini App.</p>
+<form action="/" method="get"><label for="site-search">Пошук товарів</label><div class="row"><input id="site-search" name="q" value="{html.escape(query, quote=True)}" placeholder="Назва, бренд або SKU" style="flex:1;min-width:0;padding:12px;border-radius:12px;background:#19122b;color:white;border:1px solid #44315f"><button class="button" style="border:0;cursor:pointer">Знайти</button></div></form>
+<nav aria-label="Категорії">{category_links}</nav>{query_note}<section class="grid">{cards or '<p>За цим запитом товарів не знайдено. Перегляньте всі категорії каталогу.</p>'}</section>
+<p><a class="button" href="/miniapp">Відкрити магазин Cloud Hub</a></p></section>'''
+    title = (f"{query} — товари та ціни | Cloud Hub" if query else "Каталог товарів Cloud Hub — фото, ціни та наявність")
+    description = (f"Пошук у каталозі Cloud Hub за запитом {query}: фото, описи, актуальні ціни й наявність." if query else "Каталог Cloud Hub: фото й описи товарів, актуальні ціни та наявність. Дані синхронізовані з онлайн-магазином.")
+    item_list = {"@context": "https://schema.org", "@type": "ItemList", "name": "Каталог товарів Cloud Hub", "numberOfItems": len(products), "itemListElement": [{"@type": "ListItem", "position": i + 1, "url": _public_product_url(int(row.get("product_id") or 0), str(row.get("name") or ""), base), "name": " ".join(x for x in (str(row.get("name") or ""), str(row.get("variant_name") or "")) if x)} for i, row in enumerate(products)]}
+    return _public_site_page(title, description, body, base + "/", item_list, "noindex,follow" if query else "index,follow")
+
+
 @miniapp.get("/miniapp")
 def miniapp_home():
     page = MINIAPP_HTML
     try:
         products = list_catalog(limit=1000)
+        base = _public_site_base()
         elements = []
         for row in products:
             elements.append({
@@ -11107,19 +11210,85 @@ def miniapp_home():
                 "name": " ".join(x for x in (str(row.get("name") or ""), str(row.get("variant_name") or "")) if x),
                 "sku": str(row.get("sku") or ""),
                 "brand": {"@type": "Brand", "name": str(row.get("brand") or "Cloud Hub")},
+                "image": [f"{base}/api/miniapp/products/{int(row['photo_id'])}/photo"] if row.get("photo_id") else [],
                 "offers": {"@type": "Offer", "priceCurrency": "UAH", "price": str(row.get("price") or 0),
                            "availability": "https://schema.org/InStock" if int(row.get("available") or 0) > 0 else "https://schema.org/OutOfStock",
-                           "url": request.url_root.rstrip("/") + "/miniapp"},
+                           "url": _public_product_url(int(row.get("product_id") or 0), str(row.get("name") or ""), base)},
             })
         structured = {"@context": "https://schema.org", "@type": "ItemList", "name": "Cloud Hub — каталог",
                       "numberOfItems": len(elements), "itemListElement": [
                           {"@type": "ListItem", "position": i + 1, "item": item} for i, item in enumerate(elements)
                       ]}
         encoded = json.dumps(structured, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
-        page = page.replace("</head>", f'<link rel="canonical" href="{html.escape(request.url_root.rstrip("/") + "/miniapp", quote=True)}"><script type="application/ld+json">{encoded}</script></head>', 1)
+        canonical = base + ("/miniapp" if request.path == "/miniapp" else "/")
+        page = page.replace("</head>", f'<link rel="canonical" href="{html.escape(canonical, quote=True)}"><script type="application/ld+json">{encoded}</script></head>', 1)
     except Exception:
         log.exception("Could not render Mini App SEO product metadata")
     return Response(page, mimetype="text/html", headers={"Cache-Control":"no-store, no-cache, must-revalidate, max-age=0"})
+
+
+@miniapp.get("/product/<int:product_id>/<slug>")
+def miniapp_public_product(product_id: int, slug: str):
+    product = catalog_get_product(product_id)
+    if not product or not product.get("active") or product.get("manually_hidden") or product.get("archived_at"):
+        return Response("Товар не знайдено", status=404, mimetype="text/plain; charset=utf-8")
+    variants = [v for v in product.get("variants", []) if v.get("active") and int(v.get("stock_qty") or 0) - int(v.get("reserved_qty") or 0) > 0]
+    if not variants:
+        return Response("Товар зараз недоступний", status=404, mimetype="text/plain; charset=utf-8")
+    base = _public_site_base()
+    canonical = _public_product_url(product_id, str(product.get("name") or ""), base)
+    media_id = int(product["media"][0]["id"]) if product.get("media") else 0
+    photo_url = f"{base}/api/miniapp/products/{media_id}/photo" if media_id else ""
+    image = f'<img class="photo" src="{html.escape(photo_url, quote=True)}" alt="{html.escape(str(product.get("name") or ""), quote=True)}" fetchpriority="high">' if photo_url else '<div class="photo" aria-label="Фото товару відсутнє"></div>'
+    min_price = min(v["price"] for v in variants)
+    category = str(product.get("category_name") or "Каталог")
+    product_description = str(product.get("description") or "Перевірте актуальну ціну й наявність у каталозі Cloud Hub.")
+    description = f"{product.get('name') or 'Товар'} — {category}, {product.get('brand_name') or 'Cloud Hub'}. {product_description}"[:280]
+    title = f"{product.get('name')} — ціна та наявність | Cloud Hub"
+    variant_html = "".join(f'<li><b>{html.escape(str(v.get("variant_name") or v.get("sku") or "Варіант"))}</b> · {html.escape(str(v.get("price")))} грн · є в наявності</li>' for v in variants)
+    body = f'<p class="crumb"><a href="/">Каталог</a> / <a href="/category/{int(product.get("category_id") or 0)}/{_public_slug(category)}">{html.escape(category)}</a></p><article class="detail">{image}<div><span class="pill">{html.escape(str(product.get("brand_name") or "Cloud Hub"))}</span><h1>{html.escape(str(product.get("name") or "Товар"))}</h1><p class="price">Від {html.escape(str(min_price))} грн</p><p class="muted">{html.escape(description)}</p><h2>Варіанти та наявність</h2><ul>{variant_html}</ul><a class="button" href="/miniapp">Відкрити магазин і оформити замовлення</a></div></article>'
+    schema = {"@context": "https://schema.org", "@type": "Product", "name": str(product.get("name") or ""), "description": description, "sku": str(variants[0].get("sku") or ""), "brand": {"@type": "Brand", "name": str(product.get("brand_name") or "Cloud Hub")}, "category": category, "image": [photo_url] if photo_url else [], "offers": {"@type": "Offer", "url": canonical, "priceCurrency": "UAH", "price": str(min_price), "availability": "https://schema.org/InStock", "itemCondition": "https://schema.org/NewCondition"}}
+    return _public_site_page(title, description, body, canonical, schema)
+
+
+@miniapp.get("/category/<int:category_id>/<slug>")
+def miniapp_public_category(category_id: int, slug: str):
+    with db_cursor() as cur:
+        cur.execute("SELECT id,name FROM categories WHERE id=%s AND active=TRUE", (category_id,))
+        category = cur.fetchone()
+    if not category:
+        return Response("Категорію не знайдено", status=404, mimetype="text/plain; charset=utf-8")
+    products = list_catalog(category_id=category_id, limit=1000)
+    title = f"{category['name']} — каталог, ціни та наявність | Cloud Hub"
+    description = f"Каталог Cloud Hub: {category['name']}. Актуальні ціни, фото товарів та наявність в одному місці."
+    cards = "".join(_public_catalog_card(row) for row in products)
+    body = f'<p class="crumb"><a href="/">Каталог Cloud Hub</a></p><h1>{html.escape(str(category["name"]))}</h1><p class="muted">{html.escape(description)}</p><section class="grid">{cards or "<p>У цій категорії зараз немає товарів у наявності.</p>"}</section>'
+    canonical = f"{_public_site_base()}/category/{category_id}/{_public_slug(str(category['name']))}"
+    schema = {"@context": "https://schema.org", "@type": "CollectionPage", "name": title, "description": description, "url": canonical, "mainEntity": {"@type": "ItemList", "numberOfItems": len(products), "itemListElement": [{"@type": "ListItem", "position": i + 1, "url": _public_product_url(int(row.get("product_id") or 0), str(row.get("name") or ""))} for i, row in enumerate(products)]}}
+    return _public_site_page(title, description, body, canonical, schema)
+
+
+@miniapp.get("/sitemap.xml")
+def miniapp_public_sitemap():
+    base = _public_site_base()
+    urls = [base + "/"]
+    products = list_catalog(limit=1000)
+    seen_products = set()
+    for row in products:
+        product_id = int(row.get("product_id") or 0)
+        if product_id and product_id not in seen_products:
+            seen_products.add(product_id)
+            urls.append(_public_product_url(product_id, str(row.get("name") or ""), base))
+    for category in list_root_categories():
+        urls.append(f"{base}/category/{int(category['id'])}/{_public_slug(str(category['name']))}")
+    entries = "".join(f"<url><loc>{html.escape(url)}</loc></url>" for url in urls)
+    return Response(f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{entries}</urlset>', mimetype="application/xml; charset=utf-8", headers={"Cache-Control": "public, max-age=900"})
+
+
+@miniapp.get("/robots.txt")
+def miniapp_public_robots():
+    base = _public_site_base()
+    return Response(f"User-agent: *\nAllow: /\nAllow: /api/miniapp/products/\nDisallow: /api/\nSitemap: {base}/sitemap.xml\n", mimetype="text/plain; charset=utf-8", headers={"Cache-Control": "public, max-age=3600"})
 
 
 @miniapp.post("/api/miniapp/web-login")
@@ -11305,7 +11474,8 @@ def miniapp_bootstrap():
         with db_cursor() as cur:
             cur.execute("SELECT product_id FROM favorites WHERE customer_telegram_id=%s ORDER BY created_at DESC", (user.id,))
             favorite_product_ids = [int(row["product_id"]) for row in cur.fetchall()]
-        staff = get_staff(user.id)
+        # Browser sessions are customer-only; all staff tools stay inside Telegram Mini App.
+        staff = get_staff(user.id) if raw_init_data else None
         can_manage = bool(staff and staff.active and staff.can("catalog.update"))
         can_manage_owner = bool(staff and staff.active and staff.role == "owner")
         if staff and staff.active:
@@ -11585,6 +11755,8 @@ def _miniapp_get_banners(active_only: bool = False) -> list[dict]:
 
 
 def _miniapp_require_banner_manager(user):
+    if not request.headers.get("X-Telegram-Init-Data", "").strip():
+        raise PermissionError("Керування доступне лише у Telegram Mini App.")
     staff = get_staff(user.id)
     if not staff or not staff.active or not staff.can("catalog.update"):
         raise PermissionError("Керувати банерами може лише уповноважений працівник.")
@@ -11791,6 +11963,8 @@ def miniapp_save_banners():
 
 
 def _miniapp_require_owner(user):
+    if not request.headers.get("X-Telegram-Init-Data", "").strip():
+        raise PermissionError("Керування доступне лише у Telegram Mini App.")
     staff = get_staff(user.id)
     if not staff or not staff.active or staff.role != "owner":
         raise PermissionError("Панель доступна лише власнику магазину.")
@@ -11804,6 +11978,8 @@ def _miniapp_require_owner(user):
 
 def _miniapp_require_staff(user, permission: str):
     """Authenticate Mini App staff actions using the same roles and security locks as the bot."""
+    if not request.headers.get("X-Telegram-Init-Data", "").strip():
+        raise PermissionError("Керування доступне лише у Telegram Mini App.")
     staff = get_staff(user.id)
     if not staff or not staff.active or not staff.can(permission):
         raise PermissionError("Недостатньо прав для цієї дії.")
