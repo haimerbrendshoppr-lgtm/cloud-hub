@@ -11247,6 +11247,15 @@ def _site_admin_password(password: str, salt: Optional[bytes] = None) -> tuple[s
     return salt.hex(), digest.hex()
 
 
+def _site_admin_environment_login() -> tuple[str, str]:
+    """Owner login configured outside the repository in Render Environment."""
+    username = str(os.getenv("SITE_ADMIN_USERNAME", "owner") or "owner").strip().lower()
+    password = str(os.getenv("SITE_ADMIN_PASSWORD", ""))
+    if not re.fullmatch(r"[a-z0-9._-]{3,40}", username):
+        return "", ""
+    return username, password
+
+
 def _site_admin_issue_session(staff: Staff, csrf_token: str):
     token = secrets.token_urlsafe(48)
     with db_cursor() as cur:
@@ -11294,10 +11303,18 @@ def site_admin_session():
                                  (staff.permission_override if staff.permission_override is not None else PERMISSIONS.get(staff.role, set())))
             return jsonify({"authenticated": True, "name": staff.display_name, "role": staff.role,
                             "telegram_id": staff.telegram_id, "permissions": permissions, "csrf_token": session["csrf_token"]})
-        with db_cursor() as cur:
-            cur.execute("SELECT EXISTS(SELECT 1 FROM staff_web_accounts a JOIN staff s USING(telegram_id) WHERE s.role='owner' AND a.active=TRUE) AS configured")
-            configured = bool(cur.fetchone()["configured"])
-        return jsonify({"authenticated": False, "setup_required": not configured})
+        env_username, env_password = _site_admin_environment_login()
+        if len(env_password) >= 12:
+            with db_cursor() as cur:
+                cur.execute("SELECT EXISTS(SELECT 1 FROM staff WHERE telegram_id=%s AND role='owner' AND active=TRUE) AS configured",
+                            (CONFIG.owner_id,))
+                configured = bool(cur.fetchone()["configured"])
+        else:
+            with db_cursor() as cur:
+                cur.execute("SELECT EXISTS(SELECT 1 FROM staff_web_accounts a JOIN staff s USING(telegram_id) WHERE s.role='owner' AND a.active=TRUE) AS configured")
+                configured = bool(cur.fetchone()["configured"])
+        return jsonify({"authenticated": False, "setup_required": not configured,
+                        "owner_username": env_username or "owner", "environment_password": len(env_password) >= 12})
     except Exception:
         log.exception("Site admin session check failed")
         return jsonify({"error": "Admin sign-in is temporarily unavailable."}), 500
@@ -11348,6 +11365,40 @@ def site_admin_login():
         password = str(body.get("password") or "")
         if not username or len(password) > 256:
             return jsonify({"error": "Invalid username or password."}), 401
+        env_username, env_password = _site_admin_environment_login()
+        if env_password and (len(env_password) < 12 or len(env_password) > 256):
+            return jsonify({"error": "SITE_ADMIN_PASSWORD in Render must contain 12 to 256 characters."}), 503
+        if env_password and hmac.compare_digest(username, env_username) and hmac.compare_digest(password, env_password):
+            owner = get_staff(CONFIG.owner_id)
+            if not owner or owner.role != "owner" or not owner.active:
+                return jsonify({"error": "The configured Telegram owner account is not active."}), 403
+            salt, password_hash = _site_admin_password(env_password)
+            with db_cursor() as cur:
+                cur.execute("SELECT telegram_id FROM staff_web_accounts WHERE username=%s AND telegram_id<>%s",
+                            (env_username, owner.telegram_id))
+                if cur.fetchone():
+                    return jsonify({"error": "SITE_ADMIN_USERNAME is already assigned to another staff account."}), 409
+                cur.execute("SELECT username,password_salt,password_hash FROM staff_web_accounts WHERE telegram_id=%s FOR UPDATE",
+                            (owner.telegram_id,))
+                previous = cur.fetchone()
+                password_changed = bool(previous and (
+                    previous["username"] != env_username or
+                    not hmac.compare_digest(
+                        hashlib.pbkdf2_hmac("sha256", env_password.encode("utf-8"),
+                                            bytes.fromhex(previous["password_salt"]),
+                                            _SITE_ADMIN_PBKDF2_ROUNDS).hex(),
+                        str(previous["password_hash"]))))
+                if not previous or password_changed:
+                    cur.execute("DELETE FROM staff_web_sessions WHERE telegram_id=%s", (owner.telegram_id,))
+                cur.execute("""INSERT INTO staff_web_accounts(telegram_id,username,password_salt,password_hash,
+                               custom_permissions_enabled,created_by) VALUES(%s,%s,%s,%s,FALSE,%s)
+                               ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,
+                               password_salt=EXCLUDED.password_salt,password_hash=EXCLUDED.password_hash,
+                               custom_permissions_enabled=FALSE,active=TRUE,failed_attempts=0,locked_until=NULL,updated_at=NOW()""",
+                            (owner.telegram_id, env_username, salt, password_hash, owner.telegram_id))
+            _site_admin_audit(owner, "site_admin.environment_password_login", str(owner.telegram_id),
+                              {"username": env_username, "password_changed": password_changed})
+            return _site_admin_issue_session(owner, secrets.token_urlsafe(32))
         with db_cursor() as cur:
             cur.execute("""SELECT a.telegram_id,a.password_salt,a.password_hash,a.failed_attempts,a.locked_until,
                                   a.active account_active,s.display_name,s.role,s.active staff_active
