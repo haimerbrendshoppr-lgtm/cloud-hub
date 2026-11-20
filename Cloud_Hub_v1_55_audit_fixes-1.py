@@ -1038,6 +1038,7 @@ def init_db() -> None:
         conn.commit()
     log.info("PostgreSQL schemas initialized; business_db=%s; consent_db=separate; data_dir=%s", CONFIG.database_name, CONFIG.data_dir)
     migrate_v1_20_notification_outbox()
+    _site_admin_sync_environment_account()
 
 
 @contextmanager
@@ -11254,6 +11255,48 @@ def _site_admin_environment_login() -> tuple[str, str]:
     if not re.fullmatch(r"[a-z0-9._-]{3,40}", username):
         return "", ""
     return username, password
+
+
+def _site_admin_sync_environment_account() -> None:
+    """Apply Render's owner password on startup so rotations revoke old sessions."""
+    username, password = _site_admin_environment_login()
+    if not password:
+        return
+    if not 12 <= len(password) <= 256:
+        log.error("SITE_ADMIN_PASSWORD must contain 12 to 256 characters; owner login sync skipped")
+        return
+    try:
+        owner = get_staff(CONFIG.owner_id)
+        if not owner or owner.role != "owner" or not owner.active:
+            log.error("Configured owner staff account is unavailable; owner login sync skipped")
+            return
+        salt, digest = _site_admin_password(password)
+        with db_cursor() as cur:
+            cur.execute("SELECT telegram_id FROM staff_web_accounts WHERE username=%s AND telegram_id<>%s",
+                        (username, owner.telegram_id))
+            if cur.fetchone():
+                log.error("SITE_ADMIN_USERNAME is already assigned to another staff account")
+                return
+            cur.execute("SELECT username,password_salt,password_hash FROM staff_web_accounts WHERE telegram_id=%s FOR UPDATE",
+                        (owner.telegram_id,))
+            previous = cur.fetchone()
+            password_changed = bool(previous and (
+                previous["username"] != username or
+                not hmac.compare_digest(
+                    hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                        bytes.fromhex(previous["password_salt"]),
+                                        _SITE_ADMIN_PBKDF2_ROUNDS).hex(),
+                    str(previous["password_hash"]))))
+            if not previous or password_changed:
+                cur.execute("DELETE FROM staff_web_sessions WHERE telegram_id=%s", (owner.telegram_id,))
+            cur.execute("""INSERT INTO staff_web_accounts(telegram_id,username,password_salt,password_hash,
+                           custom_permissions_enabled,created_by) VALUES(%s,%s,%s,%s,FALSE,%s)
+                           ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,
+                           password_salt=EXCLUDED.password_salt,password_hash=EXCLUDED.password_hash,
+                           custom_permissions_enabled=FALSE,active=TRUE,failed_attempts=0,locked_until=NULL,updated_at=NOW()""",
+                        (owner.telegram_id, username, salt, digest, owner.telegram_id))
+    except Exception:
+        log.exception("Could not sync owner login from Render Environment")
 
 
 def _site_admin_issue_session(staff: Staff, csrf_token: str):
