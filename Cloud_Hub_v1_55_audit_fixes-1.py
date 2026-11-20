@@ -12130,7 +12130,8 @@ def miniapp_home():
     # Public product pages already provide crawlable SEO metadata. Rebuilding a
     # 1,000-product JSON-LD document on every app open delayed the first screen.
     return Response(MINIAPP_HTML, mimetype="text/html; charset=utf-8",
-                    headers={"Cache-Control": "public, max-age=300", "X-Robots-Tag": "noindex, nofollow"})
+                    headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                             "Pragma": "no-cache", "X-Robots-Tag": "noindex, nofollow"})
 
 
 @miniapp.get("/delivery")
