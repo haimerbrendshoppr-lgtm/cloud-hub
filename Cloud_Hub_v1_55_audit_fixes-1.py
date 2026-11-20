@@ -2314,7 +2314,9 @@ def get_staff(telegram_id: int) -> Optional[Staff]:
         row = cur.fetchone()
     if not row:
         return None
-    override = frozenset(row.pop("custom_permissions") or []) if row.pop("custom_permissions_enabled") else None
+    custom_permissions = row.pop("custom_permissions") or []
+    custom_permissions_enabled = bool(row.pop("custom_permissions_enabled"))
+    override = frozenset(custom_permissions) if custom_permissions_enabled else None
     return Staff(**row, permission_override=override)
 
 
