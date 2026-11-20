@@ -537,6 +537,8 @@ CREATE TABLE IF NOT EXISTS website_purchase_requests (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE website_purchase_requests ADD COLUMN IF NOT EXISTS customer_telegram_id BIGINT;
+ALTER TABLE website_purchase_requests ADD COLUMN IF NOT EXISTS age_confirmed BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_website_purchase_requests_recent ON website_purchase_requests(state,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_products_active ON products(active, manually_hidden);
 CREATE INDEX IF NOT EXISTS idx_products_category_brand ON products(category_id,brand_id,active);
@@ -970,6 +972,30 @@ def init_db() -> None:
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
+            # Backfill known blank descriptions once; preserve any later owner edits.
+            description_fixes = [
+                ("Картридж Aspire об’ємом 4 мл з опором 0,6 Ом. Перед покупкою перевірте сумісність із моделлю вашого пристрою.", "123450189"),
+                ("Картридж Aspire об’ємом 4 мл з опором 0,8 Ом. Перед покупкою перевірте сумісність із моделлю вашого пристрою.", "141244297"),
+                ("Chaser Beat Apple Chill, 30 мл: яблучний смак із прохолодним акцентом.", "2995959294"),
+                ("Chaser Beat Blue Ice, 30 мл: освіжаючий смаковий профіль Blue Ice. Склад і міцність зазначені на упаковці.", "395848934959"),
+                ("Chaser Beat Grape Cherry, 30 мл: поєднання винограду та стиглої вишні.", "39585939295"),
+                ("Chaser Beat Cherry Pulse, 30 мл: виразний смак стиглої вишні.", "3949593020"),
+                ("Chaser Beat My Mint Cranberry Mint, 30 мл: журавлина з освіжаючими м’ятними нотами.", "394859394"),
+                ("Картридж на 2 мл з опором 0,6 Ом. Перевірте сумісність за моделлю пристрою та маркуванням на упаковці.", "213122819"),
+                ("Картридж GeekVape на 2 мл з опором 0,8 Ом. Перед покупкою перевірте сумісність із моделлю пристрою.", "123718791"),
+                ("Картридж GeekVape на 2 мл з опором 0,8 Ом. Перед покупкою перевірте сумісність із моделлю пристрою.", "912348591"),
+                ("Картридж Ursa об’ємом 2 мл з опором 0,6 Ом. Перед покупкою перевірте сумісність із моделлю вашого пристрою.", "186710581"),
+                ("Картридж XROS об’ємом 2 мл з опором 0,6 Ом. Перевірте сумісність із поколінням пристрою XROS.", "123112345"),
+                ("Картридж XROS об’ємом 2 мл з опором 0,8 Ом. Перевірте сумісність із поколінням пристрою XROS.", "854729489"),
+                ("Картридж XROS об’ємом 3 мл з опором 0,8 Ом. Перевірте сумісність із поколінням пристрою XROS.", "213123945"),
+                ("Картридж XROS об’ємом 3 мл з опором 0,6 Ом. Перевірте сумісність із поколінням пристрою XROS.", "389157908"),
+                ("MixBar LUX Полуниця Лайм Айс, 15 мл: солодка полуниця, цитрусова лаймова кислинка та прохолодний акцент.", "939405034"),
+                ("MixBar LUX Червоні ягоди, 15 мл: ягідний мікс із насиченим фруктовим смаком.", "395849395"),
+            ]
+            cur.executemany("""UPDATE products p SET description=%s,updated_at=NOW()
+                               FROM product_variants v
+                               WHERE v.product_id=p.id AND v.sku=%s
+                                 AND COALESCE(BTRIM(p.description),'')=''""", description_fixes)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS np_ttn_jobs (
                     id BIGSERIAL PRIMARY KEY,
@@ -3669,21 +3695,35 @@ def send_customer_product_card(chat_id: int, variant_id: int,
                                category_id: int, brand_id: int,
                                message_id: Optional[int] = None) -> None:
     with db_cursor() as cur:
-        cur.execute("""SELECT p.id product_id,p.name,p.description,v.id variant_id,
-                              v.variant_name,v.price,v.stock_qty-v.reserved_qty available
+        cur.execute("""SELECT p.id product_id,p.name,p.description,p.storefront_badge,b.name brand,
+                              v.id variant_id,v.sku,v.variant_name,v.price,v.compare_at_price,
+                              v.stock_qty-v.reserved_qty available
                        FROM product_variants v JOIN products p ON p.id=v.product_id
+                       LEFT JOIN brands b ON b.id=p.brand_id
                        WHERE v.id=%s AND v.active=TRUE AND p.active=TRUE
                          AND p.manually_hidden=FALSE AND p.archived_at IS NULL""", (variant_id,))
         item = cur.fetchone()
     if not item or int(item["available"] or 0) <= 0:
         _render_customer_catalog_message(chat_id, "Цей варіант уже недоступний.", message_id=message_id)
         return
-    caption = (f"<b>{safe(item['name'])}</b>"
+    old_price = item.get("compare_at_price")
+    sale = old_price is not None and old_price > item["price"]
+    price_text = (f"💜 <s>{money(old_price)}</s>  <b>{money(item['price'])}</b> · акція"
+                  if sale else f"💜 Ціна: <b>{money(item['price'])}</b>")
+    badge = str(item.get("storefront_badge") or "").strip()
+    badge_text = f"🏷️ {safe(badge)}\n" if badge else ""
+    caption = (f"☁️ <b>Cloud Hub</b>{' · ' + safe(item['brand']) if item.get('brand') else ''}\n\n"
+               f"<b>{safe(item['name'])}</b>"
                f"{' · ' + safe(item['variant_name']) if item.get('variant_name') else ''}\n"
-               f"{safe(item['description'])}\n\nЦіна: <b>{money(item['price'])}</b>\n"
-               f"✅ В наявності: {item['available']}")
+               f"<i>{safe(item.get('description') or 'Характеристики й сумісність звіряйте з маркуванням на упаковці.')}</i>\n\n"
+               f"{badge_text}"
+               f"{price_text}\n"
+               f"📦 В наявності: <b>{item['available']}</b> · SKU {safe(item['sku'])}\n\n"
+               f"Натисніть «Замовити в 1 клік» — команда напише вам сюди в Telegram.\n"
+               f"Натискаючи кнопку, ви підтверджуєте, що вам є 18 років, і погоджуєтесь передати Telegram для зв’язку.")
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.row(types.InlineKeyboardButton("➕ Додати", callback_data=f"cart:add:{variant_id}"),
+    kb.row(types.InlineKeyboardButton("⚡ Замовити в 1 клік · 18+", callback_data=f"quickorder:buy:{variant_id}"))
+    kb.row(types.InlineKeyboardButton("🧺 Додати в кошик", callback_data=f"cart:add:{variant_id}"),
            types.InlineKeyboardButton("✖️ Скасувати", callback_data=f"catalog:product:{item['product_id']}:{category_id}:{brand_id}"))
     media = catalog_get_media(int(item["product_id"]))
     photo_id = next((m.get("telegram_file_id") for m in media if m.get("telegram_file_id")), None)
@@ -3987,6 +4027,125 @@ def customer_cart_add_callback(call):
         bot.answer_callback_query(call.id, "Не вдалося додати товар. Спробуйте ще раз.", show_alert=True)
         return
     bot.answer_callback_query(call.id, "Додано до кошика")
+
+
+@bot.callback_query_handler(func=lambda c: bool(c.data) and c.data.startswith("quickorder:"))
+def customer_quick_order_callback(call):
+    """Create a one-tap callback request tied to the customer's Telegram account."""
+    try:
+        parts = call.data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "buy" and len(parts) == 3:
+            variant_id = int(parts[2])
+            user = call.from_user
+            telegram_id = int(user.id)
+            bot.send_chat_action(call.message.chat.id, "typing")
+            customer_name = " ".join(x for x in [user.first_name, user.last_name] if x).strip()[:120]
+            contact = "@" + user.username if user.username else f"Telegram ID {telegram_id}"
+            request_number = "TG-" + datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6].upper()
+            with db_cursor() as cur:
+                cur.execute("""SELECT v.id,v.sku,v.variant_name,v.price,v.stock_qty,v.reserved_qty,v.active variant_active,
+                                      p.name,p.active product_active,p.manually_hidden
+                               FROM product_variants v JOIN products p ON p.id=v.product_id
+                               WHERE v.id=%s AND p.archived_at IS NULL FOR UPDATE OF v""", (variant_id,))
+                product = cur.fetchone()
+                if (not product or not product["product_active"] or product["manually_hidden"]
+                        or not product["variant_active"]):
+                    raise ValueError("Цей товар більше недоступний. Оновіть каталог і спробуйте ще раз.")
+                if int(product["stock_qty"]) - int(product["reserved_qty"]) < 1:
+                    raise ValueError("Цей варіант щойно закінчився. Оновіть каталог.")
+                cur.execute("""SELECT id,request_number FROM website_purchase_requests
+                               WHERE customer_telegram_id=%s AND variant_id=%s
+                                 AND created_at>NOW()-INTERVAL '45 seconds'
+                               ORDER BY created_at DESC LIMIT 1""", (telegram_id, variant_id))
+                prior = cur.fetchone()
+                if prior:
+                    request_number = str(prior["request_number"])
+                    request_id = int(prior["id"])
+                    duplicate = True
+                else:
+                    cur.execute("""INSERT INTO website_purchase_requests(
+                                       request_number,variant_id,product_name_snapshot,variant_name_snapshot,
+                                       sku_snapshot,unit_price,contact,customer_name,privacy_accepted,
+                                       privacy_version,customer_telegram_id,age_confirmed)
+                                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,TRUE) RETURNING id""",
+                                (request_number, variant_id, product["name"], product["variant_name"],
+                                 product["sku"], product["price"], contact, customer_name,
+                                 CONFIG.privacy_consent_version, telegram_id))
+                    request_id = int(cur.fetchone()["id"])
+                    duplicate = False
+                    staff_text = (
+                        f"⚡ <b>Замовити в 1 клік · {html.escape(request_number)}</b>\n"
+                        f"{html.escape(str(product['name']))} · {html.escape(str(product['variant_name'] or ''))}\n"
+                        f"SKU: {html.escape(str(product['sku']))} · {product['price']} грн\n"
+                        f"Клієнт: {html.escape(customer_name or 'Ім’я не вказане')} · {html.escape(contact)}\n"
+                        f"Telegram ID: <code>{telegram_id}</code>\n"
+                        "Клієнт підтвердив 18+. Перевірте вік перед підтвердженням/відправленням.")
+                    payload = {"text": staff_text,
+                               "buttons": [["Відкрити адмінку", _public_site_base() + "/admin"]]}
+                    for recipient_id in staff_recipient_ids(cur, ("owner", "admin", "manager")):
+                        enqueue_notification(cur, recipient_id, "orders", payload,
+                                             f"telegram_quick_order:{request_id}:{recipient_id}")
+            result_text = (
+                f"✨ <b>Запит прийнято!</b>\n\n"
+                f"{safe(product['name'])} · {safe(product['variant_name'] or '')}\n"
+                f"💜 {money(product['price'])} · {request_number}\n\n"
+                "Команда зв’яжеться з вами тут у Telegram. Це запит на зв’язок, не оплачене замовлення."
+                + ("\nПовторне натискання вже не створило дубль." if duplicate else ""))
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            kb.add(types.InlineKeyboardButton("💬 Додати коментар (необов’язково)",
+                                              callback_data=f"quickorder:comment:{request_id}"))
+            kb.add(types.InlineKeyboardButton("🛍️ Повернутися до каталогу", callback_data="catalog:back:categories"))
+            bot.answer_callback_query(call.id, "Запит надіслано ✨")
+            _render_customer_catalog_message(call.message.chat.id, result_text, kb,
+                                             call.message.message_id)
+            return
+        if action == "comment" and len(parts) == 3:
+            request_id = int(parts[2])
+            with db_cursor() as cur:
+                cur.execute("SELECT id FROM website_purchase_requests WHERE id=%s AND customer_telegram_id=%s",
+                            (request_id, call.from_user.id))
+                if not cur.fetchone():
+                    raise ValueError("Заявку не знайдено.")
+            bot.answer_callback_query(call.id)
+            prompt = bot.send_message(call.message.chat.id,
+                                      "Напишіть коментар до запиту одним повідомленням. Для скасування надішліть /cancel.")
+            bot.register_next_step_handler(prompt, _customer_quick_order_comment_step, request_id)
+            return
+        raise ValueError("Ця кнопка застаріла. Відкрийте товар ще раз.")
+    except ValueError as exc:
+        bot.answer_callback_query(call.id, str(exc)[:180], show_alert=True)
+    except Exception:
+        log.exception("Telegram one-click request failed")
+        bot.answer_callback_query(call.id, "Не вдалося надіслати запит. Спробуйте ще раз.", show_alert=True)
+
+
+def _customer_quick_order_comment_step(message, request_id: int) -> None:
+    text = (message.text or "").strip()
+    if text.casefold() == "/cancel":
+        bot.send_message(message.chat.id, "Коментар скасовано. Запит залишається у команди.", reply_markup=customer_menu())
+        return
+    if not text or len(text) > 1000:
+        prompt = bot.send_message(message.chat.id, "Коментар має бути від 1 до 1000 символів. Спробуйте ще раз або /cancel.")
+        bot.register_next_step_handler(prompt, _customer_quick_order_comment_step, request_id)
+        return
+    with db_cursor() as cur:
+        cur.execute("""UPDATE website_purchase_requests SET comment=%s,updated_at=NOW()
+                       WHERE id=%s AND customer_telegram_id=%s
+                       RETURNING request_number,product_name_snapshot,variant_name_snapshot""",
+                    (text[:1000], request_id, message.from_user.id))
+        row = cur.fetchone()
+        if not row:
+            bot.send_message(message.chat.id, "Запит не знайдено.", reply_markup=customer_menu())
+            return
+        payload = {"text": (f"💬 Коментар до запиту <b>{html.escape(str(row['request_number']))}</b>\n"
+                            f"{html.escape(str(row['product_name_snapshot']))} · "
+                            f"{html.escape(str(row['variant_name_snapshot'] or ''))}\n"
+                            f"Telegram ID: <code>{message.from_user.id}</code>\n\n{html.escape(text[:1000])}")}
+        for recipient_id in staff_recipient_ids(cur, ("owner", "admin", "manager")):
+            enqueue_notification(cur, recipient_id, "orders", payload,
+                                 f"telegram_quick_order_comment:{request_id}:{uuid.uuid4().hex}:{recipient_id}")
+    bot.send_message(message.chat.id, "💜 Коментар додано до запиту. Дякуємо!", reply_markup=customer_menu())
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("cart:remove:"))
@@ -6341,6 +6500,7 @@ def security_dashboard(chat_id: int, actor: Staff) -> None:
     kb.add(types.InlineKeyboardButton("🧾 Останні 50 подій безпеки",callback_data="sec:events"))
     kb.add(types.InlineKeyboardButton("➕ Додати працівника",callback_data="sec:help:add"))
     kb.add(types.InlineKeyboardButton("🔐 Створити код-пароль доступу",callback_data="sec:code:menu"))
+    kb.add(types.InlineKeyboardButton("🔑 Паролі входу до адмінки",callback_data="sec:webpass:menu"))
     kb.add(types.InlineKeyboardButton("🏠 Головне меню",callback_data="section:home"))
     bot.send_message(chat_id,"\n".join(lines),reply_markup=kb,parse_mode="HTML")
 
@@ -6561,6 +6721,118 @@ def security_issue_access_code_callback(call):
     except Exception as exc:
         log.exception("Owner access-code creation failed")
         bot.answer_callback_query(call.id,safe(str(exc))[:180],show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "sec:webpass:menu")
+def security_web_password_menu_callback(call):
+    actor = require_staff(call)
+    if not actor or actor.role != "owner":
+        bot.answer_callback_query(call.id, "Лише власник.", show_alert=True); return
+    if call.message.chat.type != "private":
+        bot.answer_callback_query(call.id, "Паролі можна видавати лише у приватному чаті з ботом.", show_alert=True); return
+    with db_cursor() as cur:
+        cur.execute("""SELECT s.telegram_id,s.display_name,s.role,a.username
+                       FROM staff s LEFT JOIN staff_web_accounts a USING(telegram_id)
+                       WHERE s.active=TRUE AND s.role<>'owner' ORDER BY s.display_name LIMIT 50""")
+        rows = list(cur.fetchall())
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for row in rows:
+        account_label = f" · {row['username']}" if row.get("username") else " · створити вхід"
+        kb.add(types.InlineKeyboardButton(
+            f"👤 {str(row['display_name'])[:24]}{account_label[:26]}",
+            callback_data=f"sec:webpass:target:{int(row['telegram_id'])}"))
+    kb.add(types.InlineKeyboardButton("⬅️ До Security Center", callback_data="sec:home"))
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.from_user.id,
+                     "🔑 <b>Видати пароль входу до адмінки</b>\nОберіть працівника. Його попередні сесії завершаться.",
+                     reply_markup=kb, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: bool(c.data) and c.data.startswith("sec:webpass:target:"))
+def security_web_password_target_callback(call):
+    actor = require_staff(call)
+    if not actor or actor.role != "owner":
+        bot.answer_callback_query(call.id, "Лише власник.", show_alert=True); return
+    if call.message.chat.type != "private":
+        bot.answer_callback_query(call.id, "Паролі можна видавати лише у приватному чаті.", show_alert=True); return
+    try:
+        target_id = int(call.data.rsplit(":", 1)[1])
+        with db_cursor() as cur:
+            cur.execute("""SELECT s.telegram_id,s.display_name,s.role,s.active,a.username
+                           FROM staff s LEFT JOIN staff_web_accounts a USING(telegram_id)
+                           WHERE s.telegram_id=%s""", (target_id,))
+            target = cur.fetchone()
+        if not target or not target["active"] or target["role"] == "owner":
+            raise ValueError("Працівника не знайдено, або доступ неактивний.")
+        username = str(target.get("username") or f"ch{target_id}")
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(types.InlineKeyboardButton("✅ Згенерувати й видати новий пароль",
+                                          callback_data=f"sec:webpass:issue:{target_id}"))
+        kb.add(types.InlineKeyboardButton("⬅️ До списку працівників", callback_data="sec:webpass:menu"))
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.from_user.id,
+                         f"Працівник: <b>{safe(target['display_name'])}</b> · {safe(ROLE_LABELS.get(target['role'],target['role']))}\n"
+                         f"Логін: <code>{safe(username)}</code>\n\n"
+                         "Підтвердьте видачу. Діючі входи працівника буде завершено.",
+                         reply_markup=kb, parse_mode="HTML")
+    except Exception as exc:
+        bot.answer_callback_query(call.id, safe(str(exc))[:180], show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda c: bool(c.data) and c.data.startswith("sec:webpass:issue:"))
+def security_web_password_issue_callback(call):
+    actor = require_staff(call)
+    if not actor or actor.role != "owner":
+        bot.answer_callback_query(call.id, "Лише власник.", show_alert=True); return
+    if call.message.chat.type != "private":
+        bot.answer_callback_query(call.id, "Паролі можна видавати лише у приватному чаті.", show_alert=True); return
+    try:
+        target_id = int(call.data.rsplit(":", 1)[1])
+        password = secrets.token_urlsafe(18)
+        salt, password_hash = _site_admin_password(password)
+        with db_cursor() as cur:
+            cur.execute("SELECT display_name,role,active FROM staff WHERE telegram_id=%s FOR UPDATE", (target_id,))
+            target = cur.fetchone()
+            if not target or not target["active"] or target["role"] == "owner":
+                raise ValueError("Працівника не знайдено, або доступ неактивний.")
+            cur.execute("SELECT username FROM staff_web_accounts WHERE telegram_id=%s", (target_id,))
+            existing = cur.fetchone()
+            username = str(existing["username"] if existing else f"ch{target_id}")
+            cur.execute("""INSERT INTO staff_web_accounts(
+                               telegram_id,username,password_salt,password_hash,custom_permissions_enabled,created_by)
+                           VALUES(%s,%s,%s,%s,FALSE,%s)
+                           ON CONFLICT(telegram_id) DO UPDATE SET password_salt=EXCLUDED.password_salt,
+                               password_hash=EXCLUDED.password_hash,failed_attempts=0,locked_until=NULL,
+                               active=TRUE,updated_at=NOW()""",
+                        (target_id, username, salt, password_hash, actor.telegram_id))
+            cur.execute("DELETE FROM staff_web_sessions WHERE telegram_id=%s", (target_id,))
+        audit(actor, "site_admin.staff_password_issued_from_bot", "staff_web_account", str(target_id),
+              after={"username": username, "password_reset": bool(existing)})
+        login_url = _public_site_base() + "/admin"
+        staff_text = (f"🔐 <b>Доступ до робочої панелі Cloud Hub</b>\n\n"
+                      f"Посилання: {html.escape(login_url)}\nЛогін: <code>{html.escape(username)}</code>\n"
+                      f"Пароль: <code>{html.escape(password)}</code>\n\n"
+                      "Пароль одноразово виданий власником. Не пересилайте його в групові чати.")
+        delivered = True
+        try:
+            bot.send_message(target_id, staff_text, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            delivered = False
+        bot.answer_callback_query(call.id, "Пароль створено")
+        if delivered:
+            bot.send_message(call.from_user.id,
+                             f"✅ Пароль видано працівнику <b>{safe(target['display_name'])}</b> приватним повідомленням.\n"
+                             f"Логін: <code>{safe(username)}</code> · попередні сесії завершено.",
+                             parse_mode="HTML")
+        else:
+            bot.send_message(call.from_user.id,
+                             f"⚠️ Не вдалося надіслати повідомлення працівнику. Надішліть ці дані йому приватно:\n\n"
+                             f"Посилання: {html.escape(login_url)}\nЛогін: <code>{html.escape(username)}</code>\n"
+                             f"Пароль: <code>{html.escape(password)}</code>", parse_mode="HTML",
+                             disable_web_page_preview=True)
+    except Exception as exc:
+        log.exception("Owner staff website password issuance failed")
+        bot.answer_callback_query(call.id, safe(str(exc))[:180], show_alert=True)
 
 
 @bot.message_handler(commands=["staff_add"])
@@ -11048,7 +11320,7 @@ function hideSections(){['cart','orders','favorites','loyaltyPanel','supportPane
 function bannerMarkup(slot){return banners.filter(b=>b.active&&(b.placement||'home_top')===slot).map(b=>`<a class="banner" href="${esc(b.link_url||'#')}" ${b.link_url?'target="_blank" rel="noopener"':''}>${b.image_url?`<img src="${esc(b.image_url)}" alt="${esc(b.title)}">`:''}<div><b>${esc(b.title)}</b><p>${esc(b.body||'')}</p></div></a>`).join('')}
 function renderBanners(){ $('banners').innerHTML=bannerMarkup('home_top');$('catalogBanners').innerHTML=bannerMarkup('catalog_bottom'); }
 function productCards(arr){return arr.map(p=>{let low=Number(p.low_stock_threshold)>0&&Number(p.available)<=Number(p.low_stock_threshold);let badge=p.storefront_badge|| (low?'⚠ Мало залишилось':'');let sale=Number(p.compare_at_price)>Number(p.price);let photo=p.photo_id?`<img src="/api/miniapp/products/${Number(p.photo_id)}/photo" alt="${esc(p.name)}" loading="lazy" decoding="async" onerror="this.hidden=true;this.parentElement.classList.add('photo-missing')">`:'<span>Фото поки немає</span>';return `<article class="card">${badge?`<span class="product-badge">${esc(badge)}</span>`:''}<div class="product-photo loaded">${photo}</div><small>${esc(p.brand||'')}</small><h3>${esc(p.name)} ${esc(p.variant_name||'')}</h3><small>SKU: ${esc(p.sku)} · В наявності: ${p.available}</small><div class="price ${sale?'sale-price':''}">${sale?`<del>${money(p.compare_at_price)}</del> `:''}${money(p.price)}</div><button onclick="toggleFavorite(${p.product_id})">${favorites.has(Number(p.product_id))?'♥ Обране':'♡ В обране'}</button><button onclick="openProduct(${p.variant_id})">Детальніше</button><button onclick="add(${p.variant_id})">Додати в кошик</button></article>`}).join('')}
-let detailVariantId=0,detailQuantity=1;function openProduct(variantId){let p=products.find(x=>Number(x.variant_id)===Number(variantId));if(!p)return;track('product_view',p.product_id);detailVariantId=Number(variantId);detailQuantity=1;document.getElementById('productDetailOverlay')?.remove();let sale=Number(p.compare_at_price)>Number(p.price);let old=sale?`<del>${money(p.compare_at_price)}</del> `:'';let overlay=document.createElement('div');overlay.id='productDetailOverlay';overlay.className='product-dialog';overlay.innerHTML=`<article class="card product-detail"><button class="dialog-close" aria-label="Закрити" onclick="closeProductDetail()">✕</button>${p.photo_id?`<img class="detail-photo" src="/api/miniapp/products/${Number(p.photo_id)}/photo" alt="${esc(p.name)}">`:'<div class="detail-photo">Фото товару поки немає</div>'}<h2>${esc(p.name)} ${esc(p.variant_name||'')}</h2><small>${esc(p.brand||'')} · SKU ${esc(p.sku)} · В наявності ${Number(p.available)}</small><div class="price ${sale?'sale-price':''}">${old}${money(p.price)}</div><p>${esc(p.description||'Опис товару уточнюйте у підтримки.')}</p><div class="detail-quantity"><button aria-label="Мінус" onclick="stepProductDetail(-1)">−</button><b id="detailQty">1</b><button aria-label="Плюс" onclick="stepProductDetail(1)">+</button></div><button onclick="toggleFavorite(${p.product_id})">♡ В обране</button>${!inTelegram?`<button class="primary" onclick="quickOrder(${p.variant_id})">Купити в 1 клік</button>`:""}<button class="primary" onclick="addDetailToCart()">Додати до кошика</button></article>`;overlay.addEventListener('click',e=>{if(e.target===overlay)closeProductDetail()});document.body.append(overlay);document.body.style.overflow='hidden'}function quickOrder(variantId){let p=products.find(x=>Number(x.variant_id)===Number(variantId));if(!p)return;let card=document.querySelector('#productDetailOverlay .product-detail');card.innerHTML=`<button class="dialog-close" onclick="closeProductDetail()" aria-label="Закрити">✕</button><h2>Купити в 1 клік</h2><p>${esc(p.name)} ${esc(p.variant_name||'')} ? ${money(p.price)}</p><label>Телефон або Telegram<input id="quickContact" placeholder="+380... or @username" autocomplete="tel"></label><label>Ім’я (необов’язко)<input id="quickName" maxlength="120"></label><label>Коментар (необов’язко)<textarea id="quickComment" maxlength="1000" rows="3"></textarea></label><label><input id="quickAge" type="checkbox"> Мені вже є 18 років</label><label><input id="quickPrivacy" type="checkbox"> Згоден/на на обробку контактних даних</label><button class="primary" onclick="submitQuickOrder(${Number(variantId)})">Надіслати запит</button><button onclick="openProduct(${Number(variantId)})">Назад до товару</button>`}async function submitQuickOrder(variantId){let contact=$('#quickContact').value.trim();if(!contact)return msg('Вкажіть номер телефону або Telegram.');if(!$('#quickAge').checked)return msg('Підтвердьте, що вам ё8+.');if(!$('#quickPrivacy').checked)return msg('Потрібна згода на обробку даних.');try{let r=await fetch('/api/site/quick-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({variant_id:variantId,contact,name:$('#quickName').value,comment:$('#quickComment').value,age_confirmed:true,privacy_accepted:true})}),d=await r.json();if(!r.ok)throw Error(d.error||'Не вдалося надіслати запит');document.querySelector('#productDetailOverlay .product-detail').innerHTML=`<h2>Дякуємо! Запит прийнято</h2><p>${esc(d.request_number)}</p><p>Команда зв’яжеться з вами.</p><button class="primary" onclick="closeProductDetail()">Готово</button>`}catch(e){msg(e.message)}}
+let detailVariantId=0,detailQuantity=1;function openProduct(variantId){let p=products.find(x=>Number(x.variant_id)===Number(variantId));if(!p)return;track('product_view',p.product_id);detailVariantId=Number(variantId);detailQuantity=1;document.getElementById('productDetailOverlay')?.remove();let sale=Number(p.compare_at_price)>Number(p.price);let old=sale?`<del>${money(p.compare_at_price)}</del> `:'';let overlay=document.createElement('div');overlay.id='productDetailOverlay';overlay.className='product-dialog';overlay.innerHTML=`<article class="card product-detail"><button class="dialog-close" aria-label="Закрити" onclick="closeProductDetail()">✕</button>${p.photo_id?`<img class="detail-photo" src="/api/miniapp/products/${Number(p.photo_id)}/photo" alt="${esc(p.name)}">`:'<div class="detail-photo">Фото товару поки немає</div>'}<h2>${esc(p.name)} ${esc(p.variant_name||'')}</h2><small>${esc(p.brand||'')} · SKU ${esc(p.sku)} · В наявності ${Number(p.available)}</small><div class="price ${sale?'sale-price':''}">${old}${money(p.price)}</div><p>${esc(p.description||'Основні характеристики вказані в назві та обраному варіанті товару.')}</p><div class="detail-quantity"><button aria-label="Мінус" onclick="stepProductDetail(-1)">−</button><b id="detailQty">1</b><button aria-label="Плюс" onclick="stepProductDetail(1)">+</button></div><button onclick="toggleFavorite(${p.product_id})">♡ В обране</button>${!inTelegram?`<button class="primary" onclick="quickOrder(${p.variant_id})">Купити в 1 клік</button>`:""}<button class="primary" onclick="addDetailToCart()">Додати до кошика</button></article>`;overlay.addEventListener('click',e=>{if(e.target===overlay)closeProductDetail()});document.body.append(overlay);document.body.style.overflow='hidden'}function quickOrder(variantId){let p=products.find(x=>Number(x.variant_id)===Number(variantId));if(!p)return;let card=document.querySelector('#productDetailOverlay .product-detail');card.innerHTML=`<button class="dialog-close" onclick="closeProductDetail()" aria-label="Закрити">✕</button><h2>Купити в 1 клік</h2><p>${esc(p.name)} ${esc(p.variant_name||'')} ? ${money(p.price)}</p><label>Телефон або Telegram<input id="quickContact" placeholder="+380... or @username" autocomplete="tel"></label><label>Ім’я (необов’язко)<input id="quickName" maxlength="120"></label><label>Коментар (необов’язко)<textarea id="quickComment" maxlength="1000" rows="3"></textarea></label><label><input id="quickAge" type="checkbox"> Мені вже є 18 років</label><label><input id="quickPrivacy" type="checkbox"> Згоден/на на обробку контактних даних</label><button class="primary" onclick="submitQuickOrder(${Number(variantId)})">Надіслати запит</button><button onclick="openProduct(${Number(variantId)})">Назад до товару</button>`}async function submitQuickOrder(variantId){let contact=$('#quickContact').value.trim();if(!contact)return msg('Вкажіть номер телефону або Telegram.');if(!$('#quickAge').checked)return msg('Підтвердьте, що вам 18+.');if(!$('#quickPrivacy').checked)return msg('Потрібна згода на обробку даних.');try{let r=await fetch('/api/site/quick-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({variant_id:variantId,contact,name:$('#quickName').value,comment:$('#quickComment').value,age_confirmed:true,privacy_accepted:true})}),d=await r.json();if(!r.ok)throw Error(d.error||'Не вдалося надіслати запит');document.querySelector('#productDetailOverlay .product-detail').innerHTML=`<h2>Дякуємо! Запит прийнято</h2><p>${esc(d.request_number)}</p><p>Команда зв’яжеться з вами.</p><button class="primary" onclick="closeProductDetail()">Готово</button>`}catch(e){msg(e.message)}}
 function stepProductDetail(delta){let p=products.find(x=>Number(x.variant_id)===detailVariantId);if(!p)return;detailQuantity=Math.max(1,Math.min(Number(p.available)||1,detailQuantity+delta));document.getElementById('detailQty').textContent=detailQuantity}async function addDetailToCart(){for(let i=0;i<detailQuantity;i++)await add(detailVariantId);closeProductDetail()}function closeProductDetail(){document.getElementById('productDetailOverlay')?.remove();document.body.style.overflow=''}
 function loadOnePhoto(img){let id=img.dataset.photoId,parent=img.parentElement;if(photoUrls.has(id)){img.onload=()=>parent.classList.add('loaded');img.onerror=()=>{parent.classList.remove('loaded');parent.classList.add('photo-missing');parent.innerHTML='<span>Фото тимчасово недоступне</span>'};img.src=photoUrls.get(id);parent.classList.add('loaded');return}let request=photoRequests.get(id);if(!request){request=fetch(`/api/miniapp/products/${encodeURIComponent(id)}/photo`,{headers:{'X-Telegram-Init-Data':tg?.initData||''}}).then(r=>r.ok?r.blob():null).then(blob=>{if(!blob)return null;let url=URL.createObjectURL(blob);photoUrls.set(id,url);return url}).catch(()=>null);photoRequests.set(id,request)}request.then(url=>{if(!img.isConnected)return;if(!url){parent.classList.remove('loaded');parent.classList.add('photo-missing');parent.innerHTML='<span>Фото тимчасово недоступне</span>';return}img.onload=()=>parent.classList.add('loaded');img.onerror=()=>{parent.classList.remove('loaded');parent.classList.add('photo-missing');parent.innerHTML='<span>Фото тимчасово недоступне</span>'};img.src=url;if(img.complete&&img.naturalWidth)parent.classList.add('loaded')})}
 function loadProductPhotos(){if(photoObserver)photoObserver.disconnect();const images=[...document.querySelectorAll('img[data-photo-id]')];if(!('IntersectionObserver'in window)){images.forEach(loadOnePhoto);return}photoObserver=new IntersectionObserver(entries=>{for(const entry of entries){if(!entry.isIntersecting)continue;photoObserver.unobserve(entry.target);loadOnePhoto(entry.target)}},{rootMargin:'200px'});images.forEach(img=>photoObserver.observe(img))}
@@ -11192,7 +11464,7 @@ async function bootstrapOwner(){try{session=await req('/api/site-admin/bootstrap
 const nav=[['home','Огляд'],['orders','Замовлення'],['customers','CRM клієнтів'],['support','Підтримка'],['catalog','Товари й варіанти'],['inventory','Інвентаризація'],['banners','Банери й акції'],['delivery','Доставка / ТТН'],['staff','Працівники й доступ']];function shell(){$('#app').innerHTML=`<div class="top"><div class="brand">Cloud Hub <small>${esc(session.name)} ? ${esc(session.role)}</small></div><button onclick="logout()">Вийти</button></div><div class="layout"><nav class="nav">${nav.map(([k,v])=>`<button data-n="${k}" onclick="load('${k}')">${v}</button>`).join('')}</nav><main id="content" class="content"></main></div>`;let needs={orders:"orders.read",customers:"customers.read",support:"support.read",catalog:"catalog.read",inventory:"inventory.read",delivery:"delivery.read",banners:"catalog.update"};for(let [k,p] of Object.entries(needs))document.querySelector(`[data-n=${k}]`).classList.toggle("hidden",session.role!=="owner"&&!(session.permissions||[]).includes(p));document.querySelector("[data-n=staff]").classList.toggle("hidden",session.role!=="owner")}
 function begin(k){document.querySelectorAll('[data-n]').forEach(e=>e.classList.toggle('active',e.dataset.n===k));$('#content').innerHTML=`<h1>${nav.find(x=>x[0]===k)?.[1]||k}</h1><div id="view" class="stack"></div>`;return $('#view')}async function load(k){let v=begin(k);try{if(k==='home')return home(v);if(k==='orders')return orders(v);if(k==='customers')return customers(v);if(k==='support')return support(v);if(k==='catalog')return catalog(v);if(k==='inventory')return inventory(v);if(k==='banners')return banners(v);if(k==='delivery')return delivery(v);if(k==='staff')return staff(v)}catch(e){v.innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function home(v){if(session.role==="owner"){let d=await req("/api/miniapp/admin/dashboard"),fields=[["orders_today","Замовлень сьогодні"],["order_value_today","Сума сьогодні"],["orders_month","Замовлень за місяць"],["customers","Клієнтів"],["pending_orders","Очікують"],["delivered_month","Доставлено за місяць"]];v.innerHTML=`<div class="grid">${fields.map(([k,t])=>`<article class="card"><small>${t}</small><h2>${k.includes("value")?money(d[k]):esc(d[k])}</h2></article>`).join("")}</div><div class="card">Shared catalog, orders and customer records for website and Telegram.</div>`;return}let d=await req("/api/miniapp/staff/orders"),items=d.items||[];v.innerHTML=`<div class="grid"><article class="card"><small>Найновіші замовлення</small><h2>${items.length}</h2></article><article class="card"><small>Нові / чекають</small><h2>${items.filter(x=>["new","confirmed","packing"].includes(x.status)).length}</h2></article></div><div class="stack">${items.slice(0,8).map(o=>`<article class="card">#${esc(o.order_number)} ? ${esc(o.customer_name||"")} ? ${money(o.grand_total)} ? ${esc(o.status)}</article>`).join("")}</div>`}
-async function orders(v){v.innerHTML=`<div class="toolbar"><input id="orderq" placeholder="Number, phone or customer"><button onclick="orderSearch()">Search</button></div><div id="orderrows" class="stack"></div>`;await orderSearch()}async function orderSearch(){try{let q=encodeURIComponent($('#orderq').value||''),[d,leads]=await Promise.all([req("/api/miniapp/staff/orders?q="+q),req("/api/miniapp/staff/quick-orders?q="+q)]),editable=session.role==="owner"||(session.permissions||[]).includes("orders.update");let real=(d.items||[]).map(o=>`<article class="card"><div class="row"><b>#${esc(o.order_number)} ? ${esc(o.customer_name||'')}</b><b>${money(o.grand_total)}</b></div><p>${esc(o.phone||'')} ? ${esc(o.status)} ? ${esc(o.ttn||'')}</p>${editable?`<div class="toolbar"><select id="status-${Number(o.id)}"><option value="${esc(o.status)}" selected>${esc(o.status)}</option><option value="confirmed">confirmed</option><option value="packing">packing</option><option value="packed">packed</option><option value="ready_to_ship">ready to ship</option><option value="shipped">shipped</option><option value="delivered">delivered</option><option value="cancelled">cancelled</option><option value="problem">problem</option></select><button onclick="updateOrder(${Number(o.id)})">Зберегти статус</button></div>`:''}</article>`).join('');let quick=(leads.items||[]).map(o=>`<article class="card"><div class="row"><b>One-click ${esc(o.request_number)} ? ${esc(o.product_name_snapshot)} ${esc(o.variant_name_snapshot)}</b><span>${money(o.unit_price)}</span></div><p>${esc(o.contact)} ? ${esc(o.customer_name||'')}</p><p>${esc(o.comment||'No comment')} ? ${esc(o.state)}</p>${editable?`<div class="toolbar"><select id="quick-${Number(o.id)}"><option value="${esc(o.state)}" selected>${esc(o.state)}</option><option value="contacted">contacted</option><option value="converted">converted</option><option value="closed">closed</option></select><button onclick="updateQuickOrder(${Number(o.id)})">Зберегти статус заявки</button></div>`:''}</article>`).join('');$('#orderrows').innerHTML='<h2>Заявки ?купити в 1 ?????</h2>'+(quick||'<div class="notice">Нових заявок немає.</div>')+'<h2>Замовлення</h2>'+(real||'<div class="notice">Замовлень не знайдено.</div>')}catch(e){say(e.message)}}async function updateQuickOrder(id){try{await req("/api/miniapp/staff/quick-orders/"+id,{method:"PUT",body:JSON.stringify({state:$('#quick-'+id).value})});say("Request status updated");orderSearch()}catch(e){say(e.message)}}async function updateOrder(id){try{await req("/api/miniapp/staff/orders/"+id+"/status",{method:"PUT",body:JSON.stringify({status:$('#status-'+id).value})});say("Order status updated");orderSearch()}catch(e){say(e.message)}}function filter(id,q){let s=$('#'+q).value.toLowerCase();document.querySelectorAll('#'+id+' tr').forEach(x=>x.classList.toggle('hidden',!x.dataset.q.includes(s)))}
+async function orders(v){v.innerHTML=`<div class="toolbar"><input id="orderq" placeholder="Number, phone or customer"><button onclick="orderSearch()">Search</button></div><div id="orderrows" class="stack"></div>`;await orderSearch()}async function orderSearch(){try{let q=encodeURIComponent($('#orderq').value||''),[d,leads]=await Promise.all([req("/api/miniapp/staff/orders?q="+q),req("/api/miniapp/staff/quick-orders?q="+q)]),editable=session.role==="owner"||(session.permissions||[]).includes("orders.update");let real=(d.items||[]).map(o=>`<article class="card"><div class="row"><b>#${esc(o.order_number)} ? ${esc(o.customer_name||'')}</b><b>${money(o.grand_total)}</b></div><p>${esc(o.phone||'')} ? ${esc(o.status)} ? ${esc(o.ttn||'')}</p>${editable?`<div class="toolbar"><select id="status-${Number(o.id)}"><option value="${esc(o.status)}" selected>${esc(o.status)}</option><option value="confirmed">confirmed</option><option value="packing">packing</option><option value="packed">packed</option><option value="ready_to_ship">ready to ship</option><option value="shipped">shipped</option><option value="delivered">delivered</option><option value="cancelled">cancelled</option><option value="problem">problem</option></select><button onclick="updateOrder(${Number(o.id)})">Зберегти статус</button></div>`:''}</article>`).join('');let quick=(leads.items||[]).map(o=>`<article class="card"><div class="row"><b>One-click ${esc(o.request_number)} ? ${esc(o.product_name_snapshot)} ${esc(o.variant_name_snapshot)}</b><span>${money(o.unit_price)}</span></div><p>${esc(o.contact)} · ${esc(o.customer_name||'')} · Telegram ${esc(o.customer_telegram_id||'—')}</p><p>${esc(o.comment||'Без коментаря')} · ${esc(o.state)} · ${o.age_confirmed?'18+ підтвердив':'18+ не підтверджено'}</p>${editable?`<div class="toolbar"><select id="quick-${Number(o.id)}"><option value="${esc(o.state)}" selected>${esc(o.state)}</option><option value="contacted">contacted</option><option value="converted">converted</option><option value="closed">closed</option></select><button onclick="updateQuickOrder(${Number(o.id)})">Зберегти статус заявки</button></div>`:''}</article>`).join('');$('#orderrows').innerHTML='<h2>Заявки ?купити в 1 ?????</h2>'+(quick||'<div class="notice">Нових заявок немає.</div>')+'<h2>Замовлення</h2>'+(real||'<div class="notice">Замовлень не знайдено.</div>')}catch(e){say(e.message)}}async function updateQuickOrder(id){try{await req("/api/miniapp/staff/quick-orders/"+id,{method:"PUT",body:JSON.stringify({state:$('#quick-'+id).value})});say("Request status updated");orderSearch()}catch(e){say(e.message)}}async function updateOrder(id){try{await req("/api/miniapp/staff/orders/"+id+"/status",{method:"PUT",body:JSON.stringify({status:$('#status-'+id).value})});say("Order status updated");orderSearch()}catch(e){say(e.message)}}function filter(id,q){let s=$('#'+q).value.toLowerCase();document.querySelectorAll('#'+id+' tr').forEach(x=>x.classList.toggle('hidden',!x.dataset.q.includes(s)))}
 async function customers(v){v.innerHTML='<div class="toolbar"><input id="cq" placeholder="Ім’я, телефон, Telegram ID, бонусна карта"><button class="primary" onclick="crm()">Знайти</button></div><div id="cr" class="stack"></div>'}async function crm(){try{let d=await req('/api/miniapp/staff/customers?q='+encodeURIComponent($('#cq').value));$('#cr').innerHTML=(d.items||[]).map(c=>`<article class="card"><b>${esc(c.full_name||c.first_name||'Клієнт')}</b><p>${esc(c.phone||'')} · ${esc(c.loyalty_card_number||'')}</p><small>Замовлень ${esc(c.order_count||0)} · сума ${money(c.lifetime_value)} · бонуси ${money(c.bonus_available)}</small><button onclick="crmDetail(${Number(c.id)})">Картка клієнта</button></article>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){say(e.message)}}async function crmDetail(id){try{let d=await req('/api/miniapp/staff/customers/'+id),c=d.customer,canOwner=session.role==='owner';let orders=(d.orders||[]).map(o=>`<article class="card">${esc(o.order_number)} ? ${esc(o.status)} ? ${money(o.grand_total)}<br><small>${esc(o.created_at||'')} ? ${esc(o.ttn||'')}</small></article>`).join('')||'<small>Замовлень немає</small>';let ledger=(d.loyalty||[]).map(x=>`<article class="card">${esc(x.transaction_type)} ? ${money(x.amount)} ? ${esc(x.state)}<br><small>${esc(x.reason||'')} ? ${esc(x.created_at||'')}</small></article>`).join('')||'<small>Операцій із бонусами немає</small>';$('#cr').insertAdjacentHTML('afterbegin',`<article class="card"><button onclick="this.parentElement.remove()">Закрити картку</button><h2>${esc(c.full_name||c.first_name||'Клієнт')}</h2><p>${esc(c.phone||'Телефон не вказано')} ? @${esc(c.username||'')} ? Telegram ${esc(c.telegram_id||'')}</p><p>Bonus card ${esc(c.loyalty_card_number||'?')} ? available ${money(c.bonus_available)} ? pending ${money(c.bonus_pending)}</p>${canOwner?`<div class="split"><input id="bonusValue-${id}" type="number" min="0.01" step="0.01" placeholder="Amount"><input id="bonusReason-${id}" placeholder="Required reason"></div><div class="toolbar"><button onclick="adjustКлієнтBonus(${id},'earn')">Нарахувати бонуси</button><button onclick="adjustКлієнтBonus(${id},'redeem')">Списати бонуси</button></div>`:''}<h3>Замовлення</h3><div class="stack">${orders}</div><h3>Історія бонусів</h3><div class="stack">${ledger}</div></article>`)}catch(e){say(e.message)}}async function adjustКлієнтBonus(id,operation){let value=$('#bonusValue-'+id).value,reason=$('#bonusReason-'+id).value;try{let d=await req('/api/miniapp/admin/loyalty-adjust',{method:'POST',body:JSON.stringify({customer_lookup:String(id),operation,amount:value,reason})});say('Bonus balance: '+money(d.available));crmDetail(id)}catch(e){say(e.message)}}
 async function support(v){let d=await req('/api/miniapp/staff/support?status=active');v.innerHTML=`<div class="toolbar"><button onclick="supportList('active')">Активні (${Math.min(5,(d.counts||{}).active||0)})</button><button onclick="supportList('archive')">Архів</button><button onclick="supportList('all')">Усі</button><input id="tq" placeholder="Пошук у повідомленнях"><button onclick="supportSearch()">Шукати</button></div><div id="tickets" class="stack">${ticketCards(d.items||[])}</div>`}function ticketCards(a){return a.map(t=>`<button class="card wide" style="text-align:left" onclick="ticket(${Number(t.id)})">#${Number(t.id)} · ${esc(t.subject||'Звернення')} · ${esc(t.status)}<p>${esc(t.latest_message||'')}</p></button>`).join('')||'<div class="notice">Тікетів немає.</div>'}async function supportList(s){try{let d=await req('/api/miniapp/staff/support?status='+s);$('#tickets').innerHTML=ticketCards(d.items||[])}catch(e){say(e.message)}}async function supportSearch(){try{let d=await req('/api/miniapp/staff/support?status=all&q='+encodeURIComponent($('#tq').value));$('#tickets').innerHTML=ticketCards(d.items||[])}catch(e){say(e.message)}}async function ticket(id){try{let d=await req('/api/miniapp/staff/support/'+id),t=d.ticket,canReply=session.role==='owner'||(session.permissions||[]).includes('support.reply');$('#content').innerHTML=`<button onclick="load('support')">← До черги</button><h1>Тікет #${id}</h1><div class="stack">${(t.messages||[]).map(m=>`<article class="ticket ${m.sender_type==='staff'?'staff':'customer'}">${esc(m.sender_type)} · ${esc(m.created_at||'')}<p>${esc(m.body)}</p></article>`).join('')}</div>${t.status==='closed'?'<div class="notice">Тікет закрито.</div>':'<textarea id="reply" placeholder="Відповідь клієнту"></textarea><button class="primary" onclick="reply(${id})">Надіслати</button><button onclick="closeTicket('+id+')">Закрити тікет</button>'}`}catch(e){say(e.message)}}async function reply(id){try{await req('/api/miniapp/staff/support/'+id+'/reply',{method:'POST',body:JSON.stringify({message:$('#reply').value})});ticket(id)}catch(e){say(e.message)}}async function closeTicket(id){try{await req('/api/miniapp/staff/support/'+id+'/status',{method:'PUT',body:JSON.stringify({status:'closed'})});load('support')}catch(e){say(e.message)}}
 async function catalog(v){let d=await req('/api/miniapp/staff/catalog');v.innerHTML=`<input id="pq" placeholder="Назва або SKU" oninput="products()"><div id="prod" class="stack">${prodCards(d)}</div>`}function prodCards(d){return(d.items||[]).map(p=>`<article class="card" data-p="${p.product_id}" data-v="${p.variant_id}">${p.media_id?`<img class="photo" src="/api/miniapp/products/${p.media_id}/photo">`:''}<div class="row"><b>${esc(p.name)} ${esc(p.variant_name||'')}</b>${money(p.price)}</div><small>SKU ${esc(p.sku||'')} · склад ${Number(p.stock_qty)}</small><div class="split"><input data-f="name" value="${esc(p.name)}" placeholder="Назва"><input data-f="price" type="number" step=".01" value="${Number(p.price)}"></div><textarea data-f="description" placeholder="Опис">${esc(p.description||'')}</textarea><select data-f="category"><option value="">Без категорії</option>${(d.categories||[]).map(c=>`<option value="${c.id}" ${Number(c.id)===Number(p.category_id)?'selected':''}>${esc(c.name)}</option>`).join('')}</select><select data-f="badge">${['','Bestseller','MEGA SALE','Акція','Новинка','Хіт'].map(x=>`<option value="${x}" ${p.storefront_badge===x?'selected':''}>${x||'Без плашки'}</option>`).join('')}</select><label>Фото <input data-f="photo" type="file" accept="image/jpeg,image/png,image/webp"></label><label><input data-f="active" type="checkbox" ${p.active?'checked':''}> Активний</label><label><input data-f="hidden" type="checkbox" ${p.manually_hidden?'checked':''}> Прихований</label><div class="toolbar"><button class="primary" onclick="saveProduct(this)">Зберегти</button><button onclick="photoProduct(this)">Замінити фото</button></div></article>`).join('')||'<div class="notice">Немає товарів.</div>'}function lockCatalogControls(){if(session.role==='owner'||(session.permissions||[]).includes('catalog.update'))return;document.querySelectorAll('#prod [data-f]').forEach(x=>x.disabled=true);document.querySelectorAll('#prod .toolbar').forEach(x=>x.classList.add('hidden'))}async function products(){try{let d=await req('/api/miniapp/staff/catalog?q='+encodeURIComponent($('#pq').value));$('#prod').innerHTML=prodCards(d);lockCatalogControls()}catch(e){say(e.message)}}async function saveProduct(b){let c=b.closest('[data-p]'),g=n=>c.querySelector(`[data-f=${n}]`);try{await req('/api/miniapp/staff/catalog/'+c.dataset.p,{method:'PUT',body:JSON.stringify({variant_id:c.dataset.v,name:g('name').value,price:g('price').value,description:g('description').value,category_id:g('category').value||null,storefront_badge:g('badge').value,active:g('active').checked,manually_hidden:g('hidden').checked,reason:'website admin'})});say('Збережено')}catch(e){say(e.message)}}async function photoProduct(b){let c=b.closest('[data-p]'),f=c.querySelector('[data-f=photo]').files[0];if(!f)return say('Виберіть фото');let fd=new FormData();fd.append('photo',f);try{await req('/api/miniapp/staff/catalog/'+c.dataset.p+'/photo',{method:'POST',body:fd});say('Фото збережено');products()}catch(e){say(e.message)}}
@@ -11910,8 +12182,9 @@ def website_quick_order():
             if recent:
                 return jsonify({"error": "Запит уже прийнято. Команда скоро зв’яжеться з вами."}), 429
             cur.execute("""INSERT INTO website_purchase_requests(request_number,variant_id,product_name_snapshot,
-                           variant_name_snapshot,sku_snapshot,unit_price,contact,customer_name,comment,privacy_accepted,privacy_version)
-                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s) RETURNING id""",
+                           variant_name_snapshot,sku_snapshot,unit_price,contact,customer_name,comment,
+                           privacy_accepted,privacy_version,age_confirmed)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,TRUE) RETURNING id""",
                         (request_number, variant_id, product["name"], product["variant_name"], product["sku"],
                          product["price"], contact, customer_name, comment, CONFIG.privacy_consent_version))
             request_id = int(cur.fetchone()["id"])
@@ -11941,10 +12214,12 @@ def miniapp_staff_quick_orders():
         pattern = f"%{query}%"
         with db_cursor() as cur:
             cur.execute("""SELECT id,request_number,product_name_snapshot,variant_name_snapshot,sku_snapshot,
-                                  unit_price,contact,customer_name,comment,state,created_at
+                                  unit_price,contact,customer_name,comment,state,created_at,
+                                  customer_telegram_id,age_confirmed
                            FROM website_purchase_requests WHERE (%s='' OR request_number ILIKE %s OR contact ILIKE %s
-                             OR customer_name ILIKE %s OR product_name_snapshot ILIKE %s)
-                           ORDER BY created_at DESC LIMIT 100""", (query, pattern, pattern, pattern, pattern))
+                             OR customer_name ILIKE %s OR product_name_snapshot ILIKE %s
+                             OR COALESCE(customer_telegram_id::text,'') ILIKE %s)
+                           ORDER BY created_at DESC LIMIT 100""", (query, pattern, pattern, pattern, pattern, pattern))
             rows = [{k: _miniapp_json_value(v) for k, v in row.items()} for row in cur.fetchall()]
         return jsonify({"items": rows})
     except PermissionError as exc:
