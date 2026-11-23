@@ -14754,6 +14754,23 @@ def owner_np_config(message):
             if not ref:
                 continue
             try:
+                if city_ref:
+                    warehouses = _np_api("Address", "getWarehouses", {
+                        "CityRef": city_ref, "FindByString": "101", "Limit": "100"
+                    }).get("data") or []
+                    matching_warehouses = [
+                        warehouse for warehouse in warehouses
+                        if str(warehouse.get("Number") or "").strip() == "101"
+                    ]
+                    lines.append("<i>Відділення відправника №101 у вказаному місті:</i>")
+                    if matching_warehouses:
+                        for warehouse in matching_warehouses[:5]:
+                            lines.append(
+                                f"• {safe(str(warehouse.get('Description') or 'Відділення №101'))} · "
+                                f"Ref <code>{safe(str(warehouse.get('Ref') or ''))}</code>"
+                            )
+                    else:
+                        lines.append("• API не повернуло відділення №101 для цього міста.")
                 addresses = _np_api("Counterparty", "getCounterpartyAddresses", {"Ref": ref}).get("data") or []
                 contacts = _np_api("Counterparty", "getCounterpartyContactPersons", {"Ref": ref}).get("data") or []
                 lines.append("<i>Адреси відправника:</i>")
