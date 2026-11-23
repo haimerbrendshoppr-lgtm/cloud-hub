@@ -11627,7 +11627,7 @@ async function confirmInventory(countId) {
   } catch(e) { msg(e.message); }
 }
 function renderAnalyticsEntry(){if(!document.getElementById('analyticsBtn')){let btn=document.createElement('button');btn.id='analyticsBtn';btn.textContent='Аналітика відвідувань';btn.onclick=()=>loadOwnerAnalytics('day');$('ownerBtn')?.after(btn)}if(!document.getElementById('replenishmentBtn')){let btn=document.createElement('button');btn.id='replenishmentBtn';btn.textContent='Рекомендації закупівлі';btn.onclick=loadReplenishment;$('analyticsBtn')?.after(btn)}}
-async function loadReplenishment(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">Рахую продажі та запас…</div>';try{let d=await api('/api/miniapp/admin/replenishment');$('ownerPanel').innerHTML=`<h2>Рекомендації закупівлі</h2><div class="notice">Попит рахується за останні 30 днів. Цільовий запас покриває 5 днів доставки, ще 5 днів до наступного циклу закупівлі та 2 дні резерву. Списання не враховуються.</div>${d.items.length?`<div class="grid">${d.items.map(x=>`<article class="card"><h3>${esc(x.product_name)}</h3><small>SKU: ${esc(x.sku)}</small><p>Продано: ${x.sold_units} за 30 днів · у наявності: ${x.available_qty}</p><p>Середнє: ${x.daily_velocity}/день</p><div class="price">Замовити: ${x.suggested_order_qty}</div></article>`).join('')}</div>`:'<div class="notice">За поточним запасом і продажами термінової закупівлі не потрібно.</div>'}`}catch(e){$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">'+esc(e.message)+'</div>'}}
+async function loadReplenishment(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">Рахую продажі та запас…</div>';try{let d=await api('/api/miniapp/admin/replenishment');$('ownerPanel').innerHTML=`<h2>Рекомендації закупівлі</h2><div class="notice">Попит рахується за останні 7 днів. Цільовий запас покриває 5 днів доставки, ще 5 днів до наступного циклу закупівлі та 2 дні резерву. Списання не враховуються.</div>${d.items.length?`<div class="grid">${d.items.map(x=>`<article class="card"><h3>${esc(x.product_name)}</h3><small>SKU: ${esc(x.sku)}</small><p>Продано: ${x.sold_units} за 7 днів · у наявності: ${x.available_qty}</p><p>Середнє: ${x.daily_velocity}/день</p><div class="price">Замовити: ${x.suggested_order_qty}</div></article>`).join('')}</div>`:'<div class="notice">За поточним запасом і продажами термінової закупівлі не потрібно.</div>'}`}catch(e){$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">'+esc(e.message)+'</div>'}}
 async function loadOwnerAnalytics(period='day'){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Аналітика магазину</h2><div class="notice">Завантажую показники…</div>';try{let d=await api('/api/miniapp/admin/analytics?period='+encodeURIComponent(period));let daily=d.daily||[],maxVisitors=Math.max(1,...daily.map(x=>Number(x.visitors)||0)),maxOrders=Math.max(1,...daily.map(x=>Number(x.buyers)||0));let chart=daily.length?`<section class="card"><h3>Відвідування й покупки по часу</h3><div class="bar-chart">${daily.map(x=>`<div class="bar-chart-column" title="${esc(x.label)}: ${Number(x.visitors)||0} відвідувачів, ${Number(x.buyers)||0} замовлень"><div class="bar-pair"><i style="height:${Math.max(4,Math.round((Number(x.visitors)||0)/maxVisitors*112))}px"></i><b style="height:${Math.max(3,Math.round((Number(x.buyers)||0)/maxOrders*112))}px"></b></div><small>${esc(x.label)}</small></div>`).join('')}</div><small class="chart-legend"><i></i> відвідувачі <b></b> оформлені замовлення</small></section>`:'<div class="notice">За цей період ще немає подій для графіка.</div>';let funnel=[['Зайшли',Number(d.visitors)||0],['Відкрили товар',Number(d.product_viewers)||0],['Додали в кошик',Number(d.adders)||0],['Відкрили кошик',Number(d.cart_visitors)||0],['Почали оформлення',Number(d.checkouts)||0],['Надіслали замовлення',Number(d.buyers)||0]],maxF=Math.max(1,...funnel.map(x=>x[1]));let loss=funnel.slice(1).map((x,i)=>({from:funnel[i][0],to:x[0],n:Math.max(0,funnel[i][1]-x[1]),pct:funnel[i][1]?Math.round(Math.max(0,funnel[i][1]-x[1])/funnel[i][1]*100):0})).sort((a,b)=>b.pct-a.pct)[0];let advice=!d.visitors?'Трафіку не було: перевірте рекламу, посилання та запуск бота.':loss?.pct>=50?`Найбільший відтік: «${loss.from} → ${loss.to}» (${loss.pct}%). Перевірте цей крок у магазині.`:'Воронка проходить рівномірно. Порівняйте джерела трафіку й замовлення.';let sources=(d.traffic_sources||[]).map(x=>`<div class="row notice analytics-source"><span>${esc(x.source)}</span><b>${Number(x.visitors)||0} людей · ${Number(x.visits)||0} входів</b></div>`).join('')||'<div class="notice">Джерела з’являться після переходів з мітками кампаній.</div>';let brand=String(period);$('ownerPanel').innerHTML=`<h2>Аналітика · ${({day:'сьогодні',week:'7 днів',month:'30 днів',year:'12 місяців'})[brand]}</h2><label for="analyticsPeriod">Період</label><select id="analyticsPeriod" onchange="loadOwnerAnalytics(this.value)"><option value="day" ${period==='day'?'selected':''}>Сьогодні</option><option value="week" ${period==='week'?'selected':''}>7 днів</option><option value="month" ${period==='month'?'selected':''}>30 днів</option><option value="year" ${period==='year'?'selected':''}>12 місяців</option></select><div class="grid analytics-grid"><div class="card"><small>Відвідувачі</small><h3>${Number(d.visitors)||0}</h3></div><div class="card"><small>Запуски бота</small><h3>${Number(d.bot_starts)||0}</h3></div><div class="card"><small>Переглянули товар</small><h3>${Number(d.product_viewers)||0}</h3></div><div class="card"><small>Додали в кошик</small><h3>${Number(d.adders)||0} · ${Number(d.add_clicks)||0} натискань</h3></div><div class="card"><small>Оформлення розпочато</small><h3>${Number(d.checkouts)||0}</h3></div><div class="card"><small>Замовлення надіслано</small><h3>${Number(d.buyers)||0}</h3></div></div>${chart}<section class="ops-group"><h3>Де зупиняються</h3>${funnel.map((x,i)=>`<div class="funnel-step"><div class="row"><span>${x[0]}</span><b>${x[1]}</b></div><div class="funnel-track"><i style="width:${Math.max(x[1]?4:0,Math.round(x[1]/maxF*100))}%"></i></div></div>`).join('')}<div class="notice">${esc(advice)}</div></section><section class="ops-group"><h3>Джерела переходів</h3>${sources}<h3>Реферали</h3><div class="grid analytics-grid"><div class="card">Запрошено: <b>${Number(d.referrals?.referred)||0}</b></div><div class="card">Зробили перше замовлення: <b>${Number(d.referrals?.converted)||0}</b></div><div class="card">Очікують: <b>${Number(d.referrals?.pending)||0}</b></div><div class="card">Сума замовлень: <b>${money(d.referrals?.referral_revenue||0)}</b></div></div><h3>Найкращі запрошувачі</h3>${(d.top_referrers||[]).map(x=>`<div class="notice analytics-source">${esc(x.referrer)} · код ${esc(x.code)} · ${x.converted}/${x.referred} · ${money(x.revenue)}</div>`).join('')||'<div class="notice">Даних поки немає.</div>'}</section><small>Відвідування анонімні; рекламу порівнюйте за мітками кампаній. Події сайту й Mini App рахуються разом.</small>`}catch(e){$('ownerPanel').innerHTML='<h2>Аналітика</h2><div class="notice">'+esc(e.message)+'<br><button onclick="loadOwnerAnalytics()">Спробувати ще</button></div>'}}
 async function loadStaffCatalog(query=null){try{let q=query===null?(prompt('Пошук за назвою або SKU')||''):query;window.staffCatalogQuery=q;let d=await api('/api/miniapp/staff/catalog?q='+encodeURIComponent(q),{fresh:true}),seen=new Set(),items=Array.isArray(d.items)?d.items:[],cards=items.map(p=>{let first=!seen.has(Number(p.product_id));seen.add(Number(p.product_id));let categoryLabel=(d.categories||[]).find(c=>Number(c.id)===Number(p.category_id));return `<article class="card" data-product="${Number(p.product_id)}" data-variant="${Number(p.variant_id)}"><div class="row"><b>${esc(p.name)} ${esc(p.variant_name||'')}</b><b>${money(p.price)}</b></div>${p.media_id?`<img class="admin-product-photo" loading="lazy" src="/api/miniapp/products/${Number(p.media_id)}/photo" alt="${esc(p.name)}">`:''}<input data-field="name" value="${esc(p.name)}" placeholder="Назва товару"><textarea data-field="description" placeholder="Опис">${esc(p.description||'')}</textarea><input data-field="sku" value="${esc(p.sku)}" placeholder="SKU"><input data-field="price" type="number" min="0" step="0.01" value="${Number(p.price)}" placeholder="Ціна"><select data-field="category"><option value="">Без категорії</option>${(d.categories||[]).map(c=>`<option value="${Number(c.id)}" ${Number(p.category_id)===Number(c.id)?'selected':''}>${c.parent_id?'↳ ':''}${esc(c.name)}</option>`).join('')}</select><select data-field="badge"><option value="" ${!p.storefront_badge?'selected':''}>Без плашки</option><option value="Bestseller" ${p.storefront_badge==='Bestseller'?'selected':''}>Bestseller</option><option value="MEGA SALE" ${p.storefront_badge==='MEGA SALE'?'selected':''}>MEGA SALE</option><option value="Акція" ${p.storefront_badge==='Акція'?'selected':''}>Акція</option></select><div class="notice">Категорія: ${esc(categoryLabel?.name||'Без категорії')} · залишок: ${Number(p.stock_qty)} · зарезервовано: ${Number(p.reserved_qty)}</div>${canEditCatalog?`<label class="check"><input data-field="active" type="checkbox" ${p.active?'checked':''}> Активний у каталозі</label><label class="check"><input data-field="hidden" type="checkbox" ${p.manually_hidden?'checked':''}> Приховати</label><input data-field="reason" placeholder="Причина зміни"><button class="primary" onclick="saveStaffProduct(this)">Зберегти товар</button><label>Нове фото <input data-field="photo" type="file" accept="image/png,image/jpeg,image/webp"></label><button onclick="uploadStaffPhoto(this)">Замінити фото</button><div class="formgrid"><input data-field="delta" type="number" step="1" placeholder="Зміна залишку (+/−)"><input data-field="stockReason" placeholder="Причина коригування"><button onclick="adjustStaffStock(this)">Змінити залишок</button></div>${first?`<details class="variant-editor"><summary>Додати інший об’єм / варіант</summary><div class="formgrid"><select data-new-variant="name"><option value="10 мл">10 мл</option><option value="15 мл">15 мл</option><option value="30 мл">30 мл</option><option value="1 шт.">1 шт.</option><option value="">Інший розмір…</option></select><input data-new-variant="custom-name" placeholder="Свій об’єм або розмір"><input data-new-variant="sku" placeholder="Унікальний SKU"><input data-new-variant="price" type="number" min="0" step="0.01" placeholder="Ціна, грн"><input data-new-variant="stock" type="number" min="0" step="1" value="0" placeholder="Початковий залишок"></div><button onclick="addStaffVariant(${Number(p.product_id)},this)">Додати варіант до цього товару</button></details>`:''}`:''}</article>`}).join('');let createPanel=canEditCatalog?`<section class="ops-group"><div class="row"><h3>Додати товар</h3><button type="button" onclick="loadStaffCategories()">Керування категоріями</button></div><input id="newProductName" placeholder="Назва товару"><select id="newProductCategory"><option value="">Оберіть категорію</option>${(d.categories||[]).map(c=>`<option value="${Number(c.id)}">${c.parent_id?'↳ ':''}${esc(c.name)}</option>`).join('')}</select><textarea id="newProductDescription" placeholder="Опис товару"></textarea><h4>Перший варіант товару</h4><div class="formgrid"><input id="newProductVariantName" placeholder="Об’єм / розмір: 10 мл, 15 мл, 30 мл, 1 шт…"><input id="newProductSku" placeholder="Унікальний SKU"><input id="newProductPrice" type="number" min="0" step="0.01" placeholder="Ціна, грн"><input id="newProductStock" type="number" min="0" step="1" value="0" placeholder="Залишок"></div><button class="primary" onclick="createStaffProduct()">Створити товар</button></section>`:'';$('staffContent').innerHTML=createPanel+`<div class="row"><h3>Товари та варіанти</h3><button onclick="loadStaffCatalog('')">Оновити список</button></div>`+(cards||'<div class="notice">Товари не знайдені.</div>')}catch(e){$('staffContent').innerHTML='<div class="notice">Не вдалося завантажити товари: '+esc(e.message)+'<br><button onclick="loadStaffCatalog(\'\')">Спробувати ще</button></div>'}}
 async function addStaffVariant(productId,button){let box=button.closest('details'),name=(box?.querySelector('[data-new-variant=name]')?.value||box?.querySelector('[data-new-variant=custom-name]')?.value||'').trim(),sku=box?.querySelector('[data-new-variant=sku]')?.value.trim(),price=box?.querySelector('[data-new-variant=price]')?.value,stock=box?.querySelector('[data-new-variant=stock]')?.value;try{await api(`/api/miniapp/staff/catalog/${Number(productId)}/variants`,{method:'POST',body:JSON.stringify({variant_name:name,sku,price,stock})});msg(`Варіант ${name} додано до товару`);await loadStaffCatalog(window.staffCatalogQuery||'')}catch(e){msg(e.message)}}
@@ -12741,9 +12741,9 @@ def miniapp_owner_replenishment():
     try:
         user = _miniapp_auth_user()
         actor = _miniapp_require_owner(user)
-        items = stock_supply_ordering_suggestions(actor, horizon_days=30, limit=150)
+        items = stock_supply_ordering_suggestions(actor, horizon_days=7, limit=150)
         return jsonify({"items": [{k: _miniapp_json_value(v) for k, v in row.items()} for row in items],
-                        "target_days": 12, "sales_horizon_days": 30})
+                        "target_days": 12, "sales_horizon_days": 7})
     except PermissionError as exc:
         return jsonify({"error": str(exc)}), 403
     except Exception:
@@ -14888,7 +14888,7 @@ def miniapp_keepalive_loop() -> None:
 
 def maintenance_loop() -> None:
     last_loyalty_expiry = 0.0
-    last_restock_digest_day = None
+    last_restock_digest_week = None
     while not _maintenance_stop.wait(5):
         try:
             complete_expired_staff_reviews()
@@ -14898,9 +14898,11 @@ def maintenance_loop() -> None:
             send_due_shift_reminders()
             send_owner_delivery_slot_reminder()
             local_now = datetime.now(ZoneInfo(CONFIG.timezone))
-            if local_now.hour >= 8 and local_now.date() != last_restock_digest_day:
-                queue_daily_restock_recommendations()
-                last_restock_digest_day = local_now.date()
+            week_key = (local_now.isocalendar().year, local_now.isocalendar().week)
+            if (local_now.weekday() == 0 and local_now.hour >= 8
+                    and week_key != last_restock_digest_week):
+                queue_weekly_restock_recommendations()
+                last_restock_digest_week = week_key
             dispatch_notification_batch(25)
             if time.time() - last_loyalty_expiry >= 300:
                 expire_loyalty_lots()
@@ -16208,7 +16210,7 @@ def stock_supply_ordering_suggestions(actor: Staff, horizon_days: int = 30,
                                       limit: int = 100) -> list[dict]:
     """Suggest replenishment from recent sales velocity and current available stock.
 
-    This is a planning aid, not an automatic purchase order. It uses 30-day
+    This is a planning aid, not an automatic purchase order. It uses recent
     sales movement as a simple average and deliberately avoids forecasting
     when there is no sale history.
     """
@@ -16257,8 +16259,8 @@ def stock_supply_ordering_suggestions(actor: Staff, horizon_days: int = 30,
     return rows
 
 
-def queue_daily_restock_recommendations() -> int:
-    """Queue one durable daily purchase forecast for the owner and active leads.
+def queue_weekly_restock_recommendations() -> int:
+    """Queue one durable weekly purchase forecast for the owner and active leads.
 
     The forecast is informational only: it never creates a supplier order or
     changes inventory. It uses sales movements (write-offs excluded) and the
@@ -16266,10 +16268,11 @@ def queue_daily_restock_recommendations() -> int:
     a small safety buffer.
     """
     local_now = datetime.now(ZoneInfo(CONFIG.timezone))
-    if local_now.hour < 8:
+    if local_now.weekday() != 0 or local_now.hour < 8:
         return 0
-    day_key = local_now.date().isoformat()
-    prefix = f"stock-replenishment-daily:{day_key}:"
+    iso_calendar = local_now.isocalendar()
+    week_key = f"{iso_calendar.year}-W{iso_calendar.week:02d}"
+    prefix = f"stock-replenishment-weekly:{week_key}:"
     with db_cursor() as cur:
         cur.execute("SELECT 1 FROM notification_outbox WHERE dedupe_key LIKE %s LIMIT 1",
                     (prefix + "%",))
@@ -16278,11 +16281,11 @@ def queue_daily_restock_recommendations() -> int:
 
     # Reuse the same forecast shown in the owner panel; no separate guesswork.
     owner = Staff(CONFIG.owner_id, "Власник", "owner", True)
-    rows = [row for row in stock_supply_ordering_suggestions(owner, horizon_days=30, limit=150)
+    rows = [row for row in stock_supply_ordering_suggestions(owner, horizon_days=7, limit=150)
             if int(row.get("suggested_order_qty") or 0) > 0]
     lines = [
-        f"📦 Щоденний прогноз закупівлі · {local_now.strftime('%d.%m.%Y')}",
-        "Розрахунок: фактичні продажі за 30 днів, цільовий запас на 12 днів.",
+        f"📦 Щотижневий прогноз закупівлі · {local_now.strftime('%d.%m.%Y')}",
+        "Розрахунок: фактичні продажі за останні 7 днів, цільовий запас на 12 днів.",
         "Списання не враховані. Це рекомендація, автоматичне замовлення не створюється.",
         "",
     ]
@@ -16292,7 +16295,7 @@ def queue_daily_restock_recommendations() -> int:
             sku = str(row.get("sku") or "без SKU").replace("\n", " ")[:60]
             lines.append(
                 f"• {product} ({sku}) — замовити {int(row['suggested_order_qty'])} шт.; "
-                f"є {int(row.get('available_qty') or 0)}, продано {int(row.get('sold_units') or 0)} за 30 днів"
+                f"є {int(row.get('available_qty') or 0)}, продано {int(row.get('sold_units') or 0)} за 7 днів"
             )
     else:
         lines.append("Термінових позицій для закупівлі зараз немає.")
@@ -17059,7 +17062,7 @@ def stock_valuation_report_lines(data: dict) -> list[str]:
 def stock_replenishment_report_lines(rows: list[dict]) -> list[str]:
     """Format replenishment recommendations with their calculation basis."""
     lines = [
-        "Розрахунок: продажі за останні 30 днів, середній темп і доступний залишок.",
+        "Розрахунок: продажі за останні 7 днів, середній темп і доступний залишок.",
         "Це рекомендації, не автоматичні замовлення постачальнику.",
         "",
     ]
@@ -17296,7 +17299,7 @@ def stock_console_callback_dispatch(call, staff: Staff) -> bool:
         elif action == "replenishment":
             if staff.role != "owner":
                 raise PermissionError("План закупівель доступний лише власнику.")
-            rows = stock_supply_ordering_suggestions(staff, horizon_days=30, limit=150)
+            rows = stock_supply_ordering_suggestions(staff, horizon_days=7, limit=150)
             stock_report_send(chat_id, "📦 План закупівель",
                               stock_replenishment_report_lines(rows),
                               stock_console_back_keyboard())
