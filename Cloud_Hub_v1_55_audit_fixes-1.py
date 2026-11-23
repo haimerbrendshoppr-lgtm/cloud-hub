@@ -14750,11 +14750,35 @@ def owner_np_config(message):
             ref = str(sender.get("Ref") or "")
             city_ref = str(sender.get("City") or sender.get("CityRef") or "")
             name = str(sender.get("Description") or sender.get("FirstName") or "Відправник")
+            # Some NP FOP sender records return the all-zero City Ref even when
+            # the sender has valid addresses and contacts. Resolve the configured
+            # sender city (or the known shop city) from the public city directory
+            # instead of passing the zero UUID to getWarehouses.
+            city_source = "профіль відправника"
+            if not city_ref or city_ref == "00000000-0000-0000-0000-000000000000":
+                configured_city_ref = str(CONFIG.nova_poshta_sender_city_ref or "").strip()
+                if configured_city_ref and configured_city_ref != "00000000-0000-0000-0000-000000000000":
+                    city_ref = configured_city_ref
+                    city_source = "NOVA_POSHTA_SENDER_CITY_REF"
+                else:
+                    try:
+                        cities = _np_api("Address", "getCities", {
+                            "FindByString": "Львів", "Limit": "30"
+                        }).get("data") or []
+                        exact_city = next((
+                            city for city in cities
+                            if str(city.get("Description") or "").strip().casefold() == "львів"
+                        ), None)
+                        if exact_city:
+                            city_ref = str(exact_city.get("Ref") or "")
+                            city_source = "довідник Нової пошти (Львів)"
+                    except Exception:
+                        log.exception("Nova Poshta sender city fallback failed")
             lines.append(f"\n<b>{index}. {safe(name)}</b>\nSender Ref: <code>{safe(ref)}</code>\nCity Ref: <code>{safe(city_ref)}</code>")
             if not ref:
                 continue
-            try:
-                if city_ref:
+            if city_ref and city_ref != "00000000-0000-0000-0000-000000000000":
+                try:
                     warehouses = _np_api("Address", "getWarehouses", {
                         "CityRef": city_ref, "FindByString": "101", "Limit": "100"
                     }).get("data") or []
@@ -14764,6 +14788,7 @@ def owner_np_config(message):
                     ]
                     lines.append("<i>Відділення відправника №101 у вказаному місті:</i>")
                     if matching_warehouses:
+                        lines.append(f"<i>Місто отримано: {safe(city_source)}</i>")
                         for warehouse in matching_warehouses[:5]:
                             lines.append(
                                 f"• {safe(str(warehouse.get('Description') or 'Відділення №101'))} · "
@@ -14771,16 +14796,30 @@ def owner_np_config(message):
                             )
                     else:
                         lines.append("• API не повернуло відділення №101 для цього міста.")
+                except Exception as inner:
+                    lines.append(f"<i>Не вдалося отримати відділення №101: {safe(str(inner)[:250])}</i>")
+            else:
+                lines.append("<i>Не визначено місто відправника; перевірте NOVA_POSHTA_SENDER_CITY_REF.</i>")
+            # Address and contact lookups do not depend on City Ref. Keep them
+            # independent so one invalid sender-city field cannot hide valid refs.
+            try:
                 addresses = _np_api("Counterparty", "getCounterpartyAddresses", {"Ref": ref}).get("data") or []
+            except Exception as inner:
+                addresses = []
+                lines.append(f"<i>Не вдалося отримати адреси відправника: {safe(str(inner)[:250])}</i>")
+            try:
                 contacts = _np_api("Counterparty", "getCounterpartyContactPersons", {"Ref": ref}).get("data") or []
+            except Exception as inner:
+                contacts = []
+                lines.append(f"<i>Не вдалося отримати контактних осіб: {safe(str(inner)[:250])}</i>")
+            if addresses:
                 lines.append("<i>Адреси відправника:</i>")
                 for addr in addresses[:8]:
                     lines.append(f"• {safe(str(addr.get('Description') or addr.get('AddressDescription') or 'Адреса'))} · Ref <code>{safe(str(addr.get('Ref') or ''))}</code>")
+            if contacts:
                 lines.append("<i>Контактні особи:</i>")
                 for contact in contacts[:8]:
                     lines.append(f"• {safe(str(contact.get('Description') or contact.get('Name') or 'Контакт'))} · Ref <code>{safe(str(contact.get('Ref') or ''))}</code> · {safe(str(contact.get('Phones') or ''))}")
-            except Exception as inner:
-                lines.append(f"<i>Не вдалося отримати адреси/контакти: {safe(str(inner)[:250])}</i>")
         text = "\n".join(lines)
         # Telegram message length safety.
         for start in range(0, len(text), 3800):
