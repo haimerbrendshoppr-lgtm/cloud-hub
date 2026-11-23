@@ -14888,6 +14888,7 @@ def miniapp_keepalive_loop() -> None:
 
 def maintenance_loop() -> None:
     last_loyalty_expiry = 0.0
+    last_restock_digest_day = None
     while not _maintenance_stop.wait(5):
         try:
             complete_expired_staff_reviews()
@@ -14896,6 +14897,10 @@ def maintenance_loop() -> None:
             recover_stale_notification_claims()
             send_due_shift_reminders()
             send_owner_delivery_slot_reminder()
+            local_now = datetime.now(ZoneInfo(CONFIG.timezone))
+            if local_now.hour >= 8 and local_now.date() != last_restock_digest_day:
+                queue_daily_restock_recommendations()
+                last_restock_digest_day = local_now.date()
             dispatch_notification_batch(25)
             if time.time() - last_loyalty_expiry >= 300:
                 expire_loyalty_lots()
@@ -16250,6 +16255,73 @@ def stock_supply_ordering_suggestions(actor: Staff, horizon_days: int = 30,
             0, int(row["suggested_target"]) - int(row["available_qty"])
         )
     return rows
+
+
+def queue_daily_restock_recommendations() -> int:
+    """Queue one durable daily purchase forecast for the owner and active leads.
+
+    The forecast is informational only: it never creates a supplier order or
+    changes inventory. It uses sales movements (write-offs excluded) and the
+    existing 12-day target that covers lead time, the next purchase cycle, and
+    a small safety buffer.
+    """
+    local_now = datetime.now(ZoneInfo(CONFIG.timezone))
+    if local_now.hour < 8:
+        return 0
+    day_key = local_now.date().isoformat()
+    prefix = f"stock-replenishment-daily:{day_key}:"
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM notification_outbox WHERE dedupe_key LIKE %s LIMIT 1",
+                    (prefix + "%",))
+        if cur.fetchone():
+            return 0
+
+    # Reuse the same forecast shown in the owner panel; no separate guesswork.
+    owner = Staff(CONFIG.owner_id, "Власник", "owner", True)
+    rows = [row for row in stock_supply_ordering_suggestions(owner, horizon_days=30, limit=150)
+            if int(row.get("suggested_order_qty") or 0) > 0]
+    lines = [
+        f"📦 Щоденний прогноз закупівлі · {local_now.strftime('%d.%m.%Y')}",
+        "Розрахунок: фактичні продажі за 30 днів, цільовий запас на 12 днів.",
+        "Списання не враховані. Це рекомендація, автоматичне замовлення не створюється.",
+        "",
+    ]
+    if rows:
+        for row in rows:
+            product = str(row.get("product_name") or "Товар").replace("\n", " ")[:100]
+            sku = str(row.get("sku") or "без SKU").replace("\n", " ")[:60]
+            lines.append(
+                f"• {product} ({sku}) — замовити {int(row['suggested_order_qty'])} шт.; "
+                f"є {int(row.get('available_qty') or 0)}, продано {int(row.get('sold_units') or 0)} за 30 днів"
+            )
+    else:
+        lines.append("Термінових позицій для закупівлі зараз немає.")
+    message = "\n".join(lines)
+    # Keep Telegram's message under its limit, truncating only at whole lines.
+    if len(message) > 3800:
+        kept = lines[:4]
+        for line in lines[4:]:
+            candidate = "\n".join(kept + [line, "… список скорочено; повний план доступний у панелі власника."])
+            if len(candidate) > 3800:
+                break
+            kept.append(line)
+        kept.append("… список скорочено; повний план доступний у панелі власника.")
+        message = "\n".join(kept)
+
+    with db_cursor() as cur:
+        # Check again before enqueuing so a worker restart or concurrent loop
+        # cannot produce duplicate notices for the same local calendar day.
+        cur.execute("SELECT 1 FROM notification_outbox WHERE dedupe_key LIKE %s LIMIT 1",
+                    (prefix + "%",))
+        if cur.fetchone():
+            return 0
+        recipients = staff_recipient_ids(cur, roles=("owner", "admin", "manager"))
+        for recipient_id in recipients:
+            enqueue_notification(
+                cur, recipient_id, "stock_replenishment",
+                {"text": message}, f"{prefix}{recipient_id}",
+            )
+    return len(recipients)
 
 
 def stock_lifecycle_healthcheck(actor: Staff) -> dict:
