@@ -11581,7 +11581,8 @@ function playCatPurr(){try{let AC=window.AudioContext||window.webkitAudioContext
 function startSnowfall(){let box=$('snowfallFx'),brand=document.querySelector('.brand-row');if(!box)return;box.replaceChildren();brand?.classList.remove('logo-burst');void brand?.offsetWidth;brand?.classList.add('logo-burst');for(let i=0;i<42;i++){let flake=document.createElement('span');flake.className='snowflake';flake.textContent=['❄','✦','❅','·'][i%4];flake.style.left=(2+Math.random()*96)+'%';flake.style.setProperty('--drift',((Math.random()-.5)*70)+'px');flake.style.animationDelay=(Math.random()*.45)+'s';flake.style.animationDuration=(1.45+Math.random()*.9)+'s';flake.style.fontSize=(8+Math.random()*13)+'px';flake.style.opacity=(.45+Math.random()*.55).toFixed(2);box.append(flake)}setTimeout(()=>{box.replaceChildren();brand?.classList.remove('logo-burst')},3100)}
 async function webLogout(){try{await api('/api/miniapp/web-login/logout',{method:'POST',body:'{}'});window.location.reload()}catch(e){msg(e.message)}}
 function renderInventoryEntry(){if(document.getElementById('inventoryBtn'))return;let btn=document.createElement('button');btn.id='inventoryBtn';btn.textContent='Інвентаризація';btn.onclick=loadInventory;$('staffToolsBtn')?.after(btn)}
-async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризації</h2><div class="notice">Завантажую історію...</div>';try{let d=await api('/api/miniapp/staff/inventory?archived='+(archived?'1':'0'));let items=d.items||[];let cards=items.map(x=>`<button class="card support-ticket-row" onclick="renderInventoryCount(${Number(x.id)})"><div class="row"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'Завершена':x.status==='counting'?'У процесі':esc(x.status)}</b><span class="pill">${Number(x.counted_count)}/${Number(x.sku_count)} SKU</span></div><small>${esc(x.created_at||'')}${x.confirmed_at?' ? Підтверджена '+esc(x.confirmed_at):''}</small></button>`).join('');let actions=`<div class="formgrid"><button onclick="loadInventory(${archived?'false':'true'})">${archived?'? До останніх 2':'Архів інвентаризацій ? '+Number(d.archive_count||0)}</button>${!archived&&d.can_start?'<button class="primary" onclick="startInventory()">Почати інвентаризацію</button>':''}</div>`;$('staffPanel').innerHTML=`<h2>${archived?'Архів інвентаризацій':'Останні інвентаризації'}</h2>${actions}<div class="support-ticket-list">${cards||'<div class="notice">Поки немає інвентаризацій.</div>'}</div>`}catch(e){$('staffPanel').innerHTML='<div class="notice">'+esc(e.message)+'</div>'}}
+async function downloadInventoryPdf(kind){try{let r=await fetch('/api/miniapp/staff/inventory/export.pdf?kind='+encodeURIComponent(kind),{headers:{'X-Telegram-Init-Data':tg?.initData||''},credentials:'same-origin'});if(!r.ok){let d=await r.json().catch(()=>({}));throw Error(d.error||'Не вдалося завантажити PDF')}let blob=await r.blob();if(blob.type!=='application/pdf')throw Error('Сервер повернув не PDF-файл');let url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=kind==='stock'?'cloudhub-zalyshky.pdf':'cloudhub-ruh-tovaru.pdf';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);msg('PDF сформовано — завантаження почалось')}catch(e){msg(e.message)}}
+async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризації</h2><div class="notice">Завантажую історію...</div>';try{let d=await api('/api/miniapp/staff/inventory?archived='+(archived?'1':'0'));let items=d.items||[];let cards=items.map(x=>`<button class="card support-ticket-row" onclick="renderInventoryCount(${Number(x.id)})"><div class="row"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'Завершена':x.status==='counting'?'У процесі':esc(x.status)}</b><span class="pill">${Number(x.counted_count)}/${Number(x.sku_count)} SKU</span></div><small>${esc(x.created_at||'')}${x.confirmed_at?' ? Підтверджена '+esc(x.confirmed_at):''}</small></button>`).join('');let actions=`<div class="formgrid"><button onclick="loadInventory(${archived?'false':'true'})">${archived?'? До останніх 2':'Архів інвентаризацій ? '+Number(d.archive_count||0)}</button>${!archived&&d.can_start?'<button class="primary" onclick="startInventory()">Почати інвентаризацію</button>':''}</div>`;$('staffPanel').innerHTML=`<h2>${archived?'Архів інвентаризацій':'Останні інвентаризації'}</h2>${actions}<div class="support-ticket-list">${cards||'<div class="notice">Поки немає інвентаризацій.</div>'}</div>`;let pdfBar=document.createElement('div');pdfBar.className='formgrid';[['stock','Завантажити залишки PDF'],['movements','Рух товару PDF']].forEach(([kind,label])=>{let button=document.createElement('button');button.type='button';button.textContent=label;button.onclick=()=>downloadInventoryPdf(kind);pdfBar.append(button)});$('staffPanel').prepend(pdfBar);}catch(e){$('staffPanel').innerHTML='<div class="notice">'+esc(e.message)+'</div>'}}
 async function renderInventoryCount(id) {
   try {
     let d=await api('/api/miniapp/staff/inventory/'+id);
@@ -13644,6 +13645,103 @@ def miniapp_staff_inventory_item(count_id: int):
     except Exception:
         log.exception("Mini App inventory item update failed")
         return jsonify({"error":"Не вдалося зберегти кількість."}),500
+
+
+@miniapp.get("/api/miniapp/staff/inventory/export.pdf")
+def miniapp_staff_inventory_export_pdf():
+    try:
+        from io import BytesIO
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, LongTable, TableStyle
+        from xml.sax.saxutils import escape as xml_escape
+
+        actor = _miniapp_require_staff(_miniapp_auth_user(), "inventory.read")
+        kind = str(request.args.get("kind") or "stock")
+        if kind not in {"stock", "movements"}:
+            return jsonify({"error": "Оберіть залишки або рух товару."}), 400
+        now = datetime.now(ZoneInfo(CONFIG.timezone))
+        with db_cursor() as cur:
+            if kind == "stock":
+                cur.execute("""SELECT v.sku,p.name,v.variant_name,c.name category_name,
+                                      v.stock_qty,v.reserved_qty,v.stock_qty-v.reserved_qty available,v.price
+                               FROM product_variants v JOIN products p ON p.id=v.product_id
+                               LEFT JOIN categories c ON c.id=p.category_id
+                               WHERE p.archived_at IS NULL
+                               ORDER BY c.sort_order NULLS LAST,p.name,v.variant_name,v.sku LIMIT 10000""")
+                rows = list(cur.fetchall())
+                headers = ["SKU", "Товар", "Варіант", "Категорія", "На складі", "Резерв", "Доступно", "Ціна"]
+            else:
+                cur.execute("""SELECT im.created_at,v.sku,p.name,v.variant_name,im.movement_type,
+                                      im.quantity_delta,COALESCE(s.display_name,im.actor_telegram_id::text,'—') actor_name,
+                                      COALESCE(im.reason,'') reason
+                               FROM inventory_movements im JOIN product_variants v ON v.id=im.variant_id
+                               JOIN products p ON p.id=v.product_id
+                               LEFT JOIN staff s ON s.telegram_id=im.actor_telegram_id
+                               ORDER BY im.created_at DESC,im.id DESC LIMIT 5000""")
+                rows = list(cur.fetchall())
+                headers = ["Дата", "SKU", "Товар", "Варіант", "Операція", "Зміна", "Працівник", "Причина"]
+            audit(actor, "stock.pdf_exported", "inventory", kind,
+                  after={"rows": len(rows), "downloaded_at": now.isoformat(), "format": "pdf"})
+
+        font_path = _customer_export_font_path()
+        font_name = "CloudHubStockExport"
+        if font_name not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(font_name, font_path))
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle("CHStockTitle", parent=styles["Title"], fontName=font_name,
+                                     fontSize=15, leading=19, alignment=1, spaceAfter=3*mm)
+        meta_style = ParagraphStyle("CHStockMeta", parent=styles["BodyText"], fontName=font_name,
+                                    fontSize=8, leading=10, spaceAfter=2*mm)
+        cell_style = ParagraphStyle("CHStockCell", parent=styles["BodyText"], fontName=font_name,
+                                    fontSize=6.5, leading=8, wordWrap="CJK")
+        header_style = ParagraphStyle("CHStockHeader", parent=cell_style, textColor=colors.white)
+        title = "Актуальні залишки складу" if kind == "stock" else "Рух товару"
+        table_rows = [[Paragraph(xml_escape(str(x)), header_style) for x in headers]]
+        for row in rows:
+            if kind == "stock":
+                values = [row.get("sku"), row.get("name"), row.get("variant_name"), row.get("category_name") or "—",
+                          row.get("stock_qty"), row.get("reserved_qty"), row.get("available"), row.get("price")]
+            else:
+                stamp = row.get("created_at")
+                if stamp:
+                    stamp = stamp.astimezone(ZoneInfo(CONFIG.timezone)).strftime("%d.%m.%Y %H:%M")
+                values = [stamp or "—", row.get("sku"), row.get("name"), row.get("variant_name"),
+                          row.get("movement_type"), row.get("quantity_delta"), row.get("actor_name"), row.get("reason")]
+            table_rows.append([Paragraph(xml_escape(str(value if value is not None else "—")), cell_style)
+                               for value in values])
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=12*mm, leftMargin=12*mm,
+                                topMargin=12*mm, bottomMargin=12*mm, title=f"Cloud Hub — {title}")
+        story = [Paragraph(f"Cloud Hub — {title}", title_style),
+                 Paragraph(f"Сформовано: {now.strftime('%d.%m.%Y %H:%M %Z')} · Завантажив: {xml_escape(actor.display_name)} · Рядків: {len(rows)}", meta_style),
+                 Spacer(1, 2*mm)]
+        widths = ([20, 48, 24, 35, 18, 18, 20, 20] if kind == "stock"
+                  else [26, 19, 48, 22, 25, 15, 36, 39])
+        table = LongTable(table_rows, colWidths=[x*mm for x in widths], repeatRows=1, hAlign="LEFT")
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4d3471")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), .25, colors.HexColor("#c8bfd4")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2eef7")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(table)
+        doc.build(story)
+        buffer.seek(0)
+        filename = f"cloudhub-{kind}-{now.strftime('%Y%m%d-%H%M')}.pdf"
+        return send_file(buffer, mimetype="application/pdf", as_attachment=True, download_name=filename)
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App inventory PDF export failed")
+        return jsonify({"error": "Не вдалося сформувати PDF складу."}), 500
 
 
 @miniapp.post("/api/miniapp/staff/inventory/<int:count_id>/confirm")
