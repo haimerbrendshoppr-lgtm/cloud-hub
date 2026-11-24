@@ -1714,10 +1714,10 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
                                  "per_km": str(quote["tariff_per_km"]), "distance_km": str(quote["distance_km"]),
                                  "duration_minutes": str(quote["duration_minutes"]), "price": str(delivery_total)}
         elif delivery_type == "nova_poshta":
-            if (not city.strip() or not delivery_branch.strip()
-                    or not re.fullmatch(r"[0-9a-fA-F-]{32,64}", str(np_city_ref or ""))
-                    or not re.fullmatch(r"[0-9a-fA-F-]{32,64}", str(np_warehouse_ref or ""))):
-                raise ValueError("Оберіть місто та відділення або поштомат зі списку Нової пошти.")
+            # Store the customer order even if the Nova Poshta directory/API is down.
+            # TTN creation is queued separately and may resolve refs or be retried later.
+            if not city.strip() or not delivery_branch.strip():
+                raise ValueError("Вкажіть місто та відділення/поштомат Нової пошти.")
         selected_slot = None
         if delivery_type.startswith("courier_"):
             if delivery_slot_id is None:
@@ -2056,6 +2056,9 @@ def record_cod_payment(order_id: int, paid_amount: Decimal, actor: Staff,
              json_dumps({"paid_amount": value}), str(note or "").strip()),
         )
         bonus = _award_order_bonuses_tx(cur, paid_order, actor)
+        if order["status"] in {"delivered", "completed"} and order.get("customer_id"):
+            _activate_pending_order_bonus_tx(cur, order_id, int(order["customer_id"]))
+            _award_referral_rewards_tx(cur, int(order["customer_id"]), order_id, actor)
         cur.execute(
             """INSERT INTO audit_log
                (actor_telegram_id,actor_role,action,entity_type,entity_id,
@@ -2795,7 +2798,7 @@ def update_order_status(order_id: int, new_status: str, actor: Staff) -> tuple[b
         return False, "Недостатньо прав."
     with db_cursor() as cur:
         cur.execute(
-            """SELECT o.id,o.status,o.customer_id,c.age_verification_status
+            """SELECT o.id,o.status,o.customer_id,o.payment_status,c.age_verification_status
                FROM orders o LEFT JOIN customers c ON c.id=o.customer_id
                WHERE o.id=%s FOR UPDATE OF o""",
             (order_id,),
@@ -2835,19 +2838,36 @@ def update_order_status(order_id: int, new_status: str, actor: Staff) -> tuple[b
         elif new_status == "cancelled":
             _stock_release_order_reservations(cur, order_id, actor, "released")
             _cancel_pending_order_bonuses_tx(cur, order_id, row.get("customer_id"))
-        elif new_status in ("delivered", "completed"):
-            cur.execute("SELECT customer_id FROM orders WHERE id=%s FOR UPDATE", (order_id,))
-            customer_row = cur.fetchone()
-            cur.execute("UPDATE loyalty_lots SET state='available',available_at=NOW() WHERE source_transaction_id IN (SELECT id FROM loyalty_transactions WHERE order_id=%s AND transaction_type='earn') AND state='pending' RETURNING remaining_amount",
-                        (order_id,))
-            bonus_total = sum((Decimal(str(x['remaining_amount'])) for x in cur.fetchall()), Decimal('0.00'))
-            if bonus_total and customer_row:
-                cur.execute("UPDATE loyalty_accounts SET pending=GREATEST(0,pending-%s),available=available+%s,updated_at=NOW() WHERE customer_id=%s",
-                            (bonus_total,bonus_total,customer_row['customer_id']))
-                cur.execute("UPDATE loyalty_transactions SET state='available' WHERE order_id=%s AND transaction_type='earn' AND state='pending'", (order_id,))
-            if customer_row:
-                _award_referral_rewards_tx(cur, int(customer_row["customer_id"]), order_id, actor)
+        elif new_status in ("delivered", "completed") and row.get("payment_status") == "paid":
+            if row.get("customer_id"):
+                _activate_pending_order_bonus_tx(cur, order_id, int(row["customer_id"]))
+                _award_referral_rewards_tx(cur, int(row["customer_id"]), order_id, actor)
     return True, f"Статус змінено: {STATUS_LABELS[old_status]} → {STATUS_LABELS[new_status]}."
+
+
+def _activate_pending_order_bonus_tx(cur, order_id: int, customer_id: int) -> Decimal:
+    """Release an order's pending bonus only after both receipt and payment."""
+    cur.execute("""UPDATE loyalty_lots SET state='available',available_at=NOW()
+                   WHERE customer_id=%s AND source_transaction_id IN (
+                     SELECT id FROM loyalty_transactions
+                     WHERE order_id=%s AND transaction_type='earn' AND state='pending')
+                     AND state='pending' RETURNING remaining_amount""", (customer_id, order_id))
+    bonus_total = sum((Decimal(str(x["remaining_amount"] or 0)) for x in cur.fetchall()), Decimal("0.00"))
+    if bonus_total:
+        cur.execute("""UPDATE loyalty_accounts SET pending=GREATEST(0,pending-%s),
+                       available=available+%s,updated_at=NOW() WHERE customer_id=%s""",
+                    (bonus_total, bonus_total, customer_id))
+        cur.execute("""UPDATE loyalty_transactions SET state='available'
+                       WHERE order_id=%s AND customer_id=%s AND transaction_type='earn' AND state='pending'""",
+                    (order_id, customer_id))
+    return bonus_total
+
+
+def _np_status_is_received(status: str) -> bool:
+    text = normalize_text(status)
+    return any(term in text for term in (
+        "отримано", "вручено", "доставлено одержувачу", "доставлено адресату", "доставлено клієнту"
+    ))
 
 
 def _award_referral_rewards_tx(cur, referred_customer_id: int, order_id: int, actor: Optional[Staff] = None) -> None:
@@ -4710,8 +4730,8 @@ def _np_checkout_city_search(message) -> None:
         msg = bot.send_message(message.chat.id, "Оберіть місто з довідника Нової пошти:", reply_markup=kb)
     except Exception as exc:
         log.warning("Nova Poshta city lookup failed: %s", type(exc).__name__)
-        msg = bot.send_message(message.chat.id, "Не вдалося завантажити довідник Нової пошти. Спробуйте ще раз трохи пізніше; місто вручну вводити не потрібно.")
-        bot.register_next_step_handler(msg, _np_checkout_city_search)
+        msg = bot.send_message(message.chat.id, "Довідник Нової пошти тимчасово не відповідає. Напишіть місто вручну — замовлення все одно збережеться, а ТТН спробуємо створити окремо.")
+        bot.register_next_step_handler(msg, checkout_np_city_step)
 
 
 def _np_checkout_location_search(message) -> None:
@@ -4738,8 +4758,8 @@ def _np_checkout_location_search(message) -> None:
         bot.send_message(message.chat.id, "Оберіть пункт зі списку Нової пошти:", reply_markup=kb)
     except Exception as exc:
         log.warning("Nova Poshta location lookup failed: %s", type(exc).__name__)
-        msg = bot.send_message(message.chat.id, "Довідник пунктів тимчасово недоступний або нічого не знайдено. Спробуйте інший пошуковий запит.")
-        bot.register_next_step_handler(msg, _np_checkout_location_search)
+        msg = bot.send_message(message.chat.id, "Не вдалося отримати список пунктів. Введіть відділення/поштомат вручну — замовлення збережеться, а ТТН буде оформлюватися окремо.")
+        bot.register_next_step_handler(msg, checkout_np_branch_step)
 
 
 @bot.callback_query_handler(func=lambda c: c.data in ("checkout:start", "checkout:delivery:courier", "checkout:delivery:np", "checkout:submit") or c.data.startswith("checkout:np:"))
@@ -11538,6 +11558,9 @@ def send_owner_delivery_slot_reminder():
             cur.execute("DELETE FROM owner_delivery_slot_reminders WHERE reminder_date=%s AND sent_at IS NULL",(now.date(),))
 
 
+BONUS_ADJUST_PENDING = {}
+
+
 @bot.message_handler(func=lambda m: bool(m.text) and not m.text.lstrip().startswith("/"), content_types=["text"])
 def fallback(message):
     # Staff may paste a one-time access phrase anywhere in the bot chat.
@@ -11550,6 +11573,34 @@ def fallback(message):
         return
     staff = require_staff(message)
     if not staff:
+        return
+    text = message.text.strip()
+    pending_card = BONUS_ADJUST_PENDING.get(int(message.from_user.id))
+    if pending_card:
+        parts = text.split(maxsplit=2)
+        if len(parts) == 3 and parts[0].lower() in {"earn", "redeem"}:
+            BONUS_ADJUST_PENDING.pop(int(message.from_user.id), None)
+            # Route the guided reply through the same audited and validated command handler.
+            loyalty_adjust_command(message, f"/loyalty_adjust {pending_card} {parts[0].lower()} {parts[1]} {parts[2]}")
+            return
+        bot.reply_to(message, "Напишіть одним рядком: <code>earn 50 причина</code> або <code>redeem 20 причина</code>.", parse_mode="HTML")
+        return
+    if re.fullmatch(r"CH-[A-Z0-9]{8,16}", text, re.IGNORECASE):
+        if staff.role != "owner":
+            bot.reply_to(message, "Коригувати бонуси може лише власник.")
+            return
+        with db_cursor() as cur:
+            cur.execute("SELECT id FROM customers WHERE upper(loyalty_card_number)=upper(%s)", (text,))
+            customer = cur.fetchone()
+        if not customer:
+            bot.reply_to(message, "Картку не знайдено. Перевірте номер у CRM-пошуку клієнтів.")
+            return
+        BONUS_ADJUST_PENDING[int(message.from_user.id)] = text.upper()
+        bot.reply_to(message,
+            f"Картку <code>{safe(text.upper())}</code> знайшов. Введіть дію, суму й причину одним рядком:\n"
+            "<code>earn 50 компенсація клієнту</code>\n"
+            "або <code>redeem 20 коригування помилкового нарахування</code>. Операція потрапить в аудит.",
+            parse_mode="HTML")
         return
     bot.reply_to(message, "Не знайшов такої команди. Скористайтеся кнопками меню або /start.")
 
@@ -11616,7 +11667,7 @@ function paintSoundToggle(){let b=document.getElementById('soundToggle');if(!b)r
 function toggleSound(){uiSoundEnabled=!uiSoundEnabled;localStorage.setItem(UI_SOUND_KEY,uiSoundEnabled?'1':'0');if(uiSoundEnabled)playUiSound('success');paintSoundToggle()}
 function playUiSound(kind='tap'){if(!uiSoundEnabled)return;try{let AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;uiSoundContext=uiSoundContext||new AC();if(uiSoundContext.state==='suspended')uiSoundContext.resume();let notes=kind==='success'?[523.25,659.25,783.99]:kind==='favorite'?[659.25,880]:kind==='remove'?[440,349.23]:kind==='add'?[587.33,783.99]:[523.25],start=uiSoundContext.currentTime;notes.forEach((hz,i)=>{let osc=uiSoundContext.createOscillator(),gain=uiSoundContext.createGain(),at=start+i*.075;osc.type='sine';osc.frequency.setValueAtTime(hz,at);gain.gain.setValueAtTime(.0001,at);gain.gain.exponentialRampToValueAtTime(.035,at+.012);gain.gain.exponentialRampToValueAtTime(.0001,at+.13);osc.connect(gain);gain.connect(uiSoundContext.destination);osc.start(at);osc.stop(at+.14)})}catch(e){}}
 paintSoundToggle();
-const headers={'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''};const inTelegram=Boolean(tg?.initData);let authenticated=inTelegram,webSession=false;const GUEST_CART_KEY='cloudhub.guest-cart.v1';let guestCart=[];try{guestCart=JSON.parse(localStorage.getItem(GUEST_CART_KEY)||'[]');if(!Array.isArray(guestCart))guestCart=[]}catch(e){guestCart=[]}let category=null,productPage=1,productPageSize=20,selectedBrandId='',products=[],popularProductIds=new Set(),cart=[],favorites=new Set(),canManageBanners=false,canManageOwner=false,canManageCatalog=false,canEditCatalog=false,canViewCustomers=false,canViewOrders=false,canUpdateOrders=false,canViewSupport=false,canReplySupport=false,canManageInventory=false,canConfirmInventory=false,banners=[],npCityRef="",npWarehouseRef="",checkoutKey="",photoObserver=null;const photoUrls=new Map(),photoRequests=new Map();
+const headers={'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''};const inTelegram=Boolean(tg?.initData);let authenticated=inTelegram,webSession=false;const GUEST_CART_KEY='cloudhub.guest-cart.v1';let guestCart=[];try{guestCart=JSON.parse(localStorage.getItem(GUEST_CART_KEY)||'[]');if(!Array.isArray(guestCart))guestCart=[]}catch(e){guestCart=[]}let category=null,productPage=1,productPageSize=20,selectedBrandId='',products=[],popularProductIds=new Set(),cart=[],favorites=new Set(),canManageBanners=false,canManageOwner=false,canManageCatalog=false,canEditCatalog=false,canViewCustomers=false,canViewOrders=false,canUpdateOrders=false,canConfirmPayment=false,canViewSupport=false,canReplySupport=false,canManageInventory=false,canConfirmInventory=false,banners=[],npCityRef="",npWarehouseRef="",checkoutKey="",photoObserver=null;const photoUrls=new Map(),photoRequests=new Map();
 const $=id=>document.getElementById(id);function money(v){return new Intl.NumberFormat('uk-UA',{maximumFractionDigits:2}).format(Number(v||0))+' грн'}
 let toastTimer;function msg(t){let el=$('status');el.textContent=t;el.classList.remove('hidden');el.setAttribute('role','status');el.style.cssText='position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:1000;width:max-content;max-width:calc(100vw - 32px);padding:13px 18px;border:1px solid #a879ff;border-radius:18px;background:rgba(39,25,65,.97);box-shadow:0 8px 28px #0008;color:#fff;text-align:center;font-weight:700;animation:toastIn .22s ease-out';clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.add('hidden'),2400)}
 const apiReadCache=new Map(),apiReadОчікують=new Map();
@@ -11644,7 +11695,7 @@ function loadProductPhotos(){if(photoObserver)photoObserver.disconnect();const i
 function editDistance(a,b){if(Math.abs(a.length-b.length)>2)return 99;let prev=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){let curr=[i],rowMin=i;for(let j=1;j<=b.length;j++){let v=Math.min(curr[j-1]+1,prev[j]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));curr[j]=v;rowMin=Math.min(rowMin,v)}if(rowMin>2)return 99;prev=curr}return prev[b.length]}
 function productMatches(p,q){if(!q)return true;let fields=`${p.name} ${p.brand||''} ${p.sku||''} ${p.variant_name||''}`.toLowerCase();if(fields.includes(q))return true;let needles=q.split(/\s+/).filter(Boolean),words=fields.split(/[^\p{L}\p{N}]+/u).filter(Boolean);return needles.every(n=>{if(words.some(w=>w.includes(n)))return true;if(n.length<4)return false;let max=n.length>=8?2:1;return words.some(w=>Math.abs(w.length-n.length)<=max&&editDistance(n,w)<=max)})}
 function renderProducts(){setActiveTab('shopBtn');hideSections();let q=$('search').value.toLowerCase().trim();let arr=products.filter(p=>(!category||(category===0?popularProductIds.has(Number(p.product_id)):(p.storefront_category_id??p.category_id)===category))&&(!selectedBrandId||Number(p.brand_id)===Number(selectedBrandId))&&productMatches(p,q));let productIds=[...new Set(arr.map(p=>Number(p.product_id)))],empty=q?'Нічого не знайдено. Перевірте написання або пошукайте коротше.':category===0?'Популярне з’явиться після перших покупок.':category?'У цій категорії зараз немає товарів у наявності.':'Каталог наразі порожній.';let brands=[...new Map(products.filter(p=>p.brand_id&&p.brand).map(p=>[Number(p.brand_id),String(p.brand)])).entries()].sort((a,b)=>a[1].localeCompare(b[1],'uk'));let filter=`<div class="catalog-controls"><select id="brandFilter" aria-label="Фільтр за виробником" onchange="setBrandFilter(this.value)"><option value="">Усі виробники</option>${brands.map(([id,name])=>`<option value="${id}" ${String(id)===String(selectedBrandId)?'selected':''}>${esc(name)}</option>`).join('')}</select><span>Показано ${Math.min(productPage*productPageSize,productIds.length)} із ${productIds.length}</span></div>`;let pageIds=new Set(productIds.slice(0,productPage*productPageSize)),shown=arr.filter(p=>pageIds.has(Number(p.product_id)));let more=pageIds.size<productIds.length?`<div class="load-more-wrap"><button class="primary" onclick="showMoreProducts()">Показати ще ${Math.min(productPageSize,productIds.length-pageIds.size)} товарів</button></div>`:'';$('products').innerHTML=filter+(productCards(shown)||`<div class="notice">${empty}</div>`)+more;loadProductPhotos()}function showMoreProducts(){productPage++;renderProducts()}function setBrandFilter(id){selectedBrandId=id;productPage=1;track('brand_filter',id||'all');renderProducts()}
-async function load(){try{let d=await api('/api/miniapp/bootstrap');track('visit',visitSource());authenticated=Boolean(d.authenticated||inTelegram);webSession=Boolean(d.web_session);$("webLogout").classList.toggle("hidden",!webSession);products=d.products;popularProductIds=new Set((d.popular_product_ids||[]).map(Number));favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;canViewSupport=d.can_view_support;canReplySupport=d.can_reply_support;canManageInventory=Boolean(d.can_manage_inventory);canConfirmInventory=Boolean(d.can_confirm_inventory);let staffMode=canManageOwner||canManageCatalog||canEditCatalog||canViewCustomers||canViewOrders||canViewSupport||canManageInventory||canConfirmInventory||canManageBanners;document.body.classList.toggle('staff-mode',staffMode);banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі товари</button>'+(popularProductIds.size?'<button class="chip" onclick="setCat(0,this)">Популярне</button>':'')+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();let directVariant=new URLSearchParams(location.search).get('variant');if(!directVariant){let startParam=tg?.initDataUnsafe?.start_param||'';let match=startParam.match(/^(?:product|variant)_(\d+)$/);if(match)directVariant=match[1]}if(directVariant&&products.some(p=>Number(p.variant_id)===Number(directVariant)))openProduct(Number(directVariant));if((webSession||inTelegram)&&guestCart.length){try{await Promise.all(guestCart.map(line=>api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:line.variant_id,quantity:line.quantity})})));guestCart=[];localStorage.removeItem(GUEST_CART_KEY)}catch(e){msg('Guest cart sync failed; it remains saved here.')}}loadCart();if(new URLSearchParams(location.search).get('support')==='1')openSupport();if(canManageBanners)renderBannerAdmin();if(canManageOwner){renderOwnerEntry();renderAnalyticsEntry()}if(staffMode){renderStaffEntry();loadStaffTools()}if(canManageInventory)renderInventoryEntry()}catch(e){$('products').innerHTML='<div class="notice">Магазин тимчасово не відповідає. Кошик і ваші дані залишаються збереженими.<br><button class="primary" onclick="load()">Спробувати ще</button></div>';$('products').classList.remove('hidden');msg(e.message)}}
+async function load(){try{let d=await api('/api/miniapp/bootstrap');track('visit',visitSource());authenticated=Boolean(d.authenticated||inTelegram);webSession=Boolean(d.web_session);$("webLogout").classList.toggle("hidden",!webSession);products=d.products;popularProductIds=new Set((d.popular_product_ids||[]).map(Number));favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;canConfirmPayment=Boolean(d.can_confirm_payment);canViewSupport=d.can_view_support;canReplySupport=d.can_reply_support;canManageInventory=Boolean(d.can_manage_inventory);canConfirmInventory=Boolean(d.can_confirm_inventory);let staffMode=canManageOwner||canManageCatalog||canEditCatalog||canViewCustomers||canViewOrders||canViewSupport||canManageInventory||canConfirmInventory||canManageBanners;document.body.classList.toggle('staff-mode',staffMode);banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі товари</button>'+(popularProductIds.size?'<button class="chip" onclick="setCat(0,this)">Популярне</button>':'')+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();let directVariant=new URLSearchParams(location.search).get('variant');if(!directVariant){let startParam=tg?.initDataUnsafe?.start_param||'';let match=startParam.match(/^(?:product|variant)_(\d+)$/);if(match)directVariant=match[1]}if(directVariant&&products.some(p=>Number(p.variant_id)===Number(directVariant)))openProduct(Number(directVariant));if((webSession||inTelegram)&&guestCart.length){try{await Promise.all(guestCart.map(line=>api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:line.variant_id,quantity:line.quantity})})));guestCart=[];localStorage.removeItem(GUEST_CART_KEY)}catch(e){msg('Guest cart sync failed; it remains saved here.')}}loadCart();if(new URLSearchParams(location.search).get('support')==='1')openSupport();if(canManageBanners)renderBannerAdmin();if(canManageOwner){renderOwnerEntry();renderAnalyticsEntry()}if(staffMode){renderStaffEntry();loadStaffTools()}if(canManageInventory)renderInventoryEntry()}catch(e){$('products').innerHTML='<div class="notice">Магазин тимчасово не відповідає. Кошик і ваші дані залишаються збереженими.<br><button class="primary" onclick="load()">Спробувати ще</button></div>';$('products').classList.remove('hidden');msg(e.message)}}
 async function toggleFavorite(productId){if(!authenticated){msg('Щоб зберегти обране, увійдіть через Telegram.');return}try{let add=!favorites.has(Number(productId));let d=await api('/api/miniapp/favorites',{method:'POST',body:JSON.stringify({product_id:productId,active:add})});favorites=new Set((d.product_ids||[]).map(Number));playUiSound(add?'favorite':'remove');msg(add?'Додано в обране ♥':'Прибрано з обраного');if(!$('favorites').classList.contains('hidden'))await loadFavorites();else renderProducts()}catch(e){msg(e.message)}}
 async function loadFavorites(){track('favorites_view');setActiveTab('favoritesBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('favorites').classList.remove('hidden');if(!authenticated){$('favorites').innerHTML='<h2>Обране</h2>'+telegramPrompt();return}try{if(!favorites.size){$('favorites').innerHTML='<h2>Обране</h2><div class="notice">В обраному поки немає товарів</div>';return}let items=products.filter(p=>favorites.has(Number(p.product_id)));$('favorites').innerHTML='<h2>Обране</h2>'+ (items.length?productCards(items):'<div class="notice">В обраному поки немає доступних товарів</div>')}catch(e){$('favorites').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function loadLoyalty(){track('loyalty_view');setActiveTab('loyaltyBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('loyaltyPanel').classList.remove('hidden');if(!authenticated){$('loyaltyPanel').innerHTML='<h2>Бонуси</h2>'+telegramPrompt();return}$('loyaltyPanel').innerHTML='<h2>Бонусна карта</h2><div class="notice" role="status">Завантажую бонусний рахунок…</div>';try{let d=await api('/api/miniapp/profile',{timeoutMs:10000});let share=d.referral_link?`<a class="banner" href="https://t.me/share/url?url=${encodeURIComponent(d.referral_link)}&text=${encodeURIComponent('Приєднуйся до Cloud Hub за моїм посиланням')}" target="_blank" rel="noopener"><div><b>Запросити друга</b><p>Після першого отриманого замовлення ви обоє отримаєте по 50 бонусів. Код: ${esc(d.referral_code)}</p></div></a>`:`<div class="notice">Код запрошення: ${esc(d.referral_code||'')}. Якщо посилання ще не готове, поділіться кодом із другом.</div>`;$('loyaltyPanel').innerHTML=`<h2>Бонусна карта</h2><div class="grid"><div class="card"><small>Доступно</small><h3>${money(d.bonus_available||0)}</h3></div><div class="card"><small>Нарахуємо після отримання</small><h3>${money(d.bonus_pending||0)}</h3></div></div><div class="notice">Картка: <b>${esc(d.loyalty_card_number||'—')}</b><br>1 бонус = 1 грн. Бонусами можна оплатити до 100% вартості товарів.</div>${share}<section class="referral-summary"><h3>Твої запрошення</h3><div class="grid"><article class="card referral-metric"><small>Запросив друзів</small><h3>${Number(d.referrals?.referred||0)}</h3></article><article class="card referral-metric"><small>Отримали замовлення</small><h3>${Number(d.referrals?.converted||0)}</h3></article><article class="card referral-metric"><small>Чекають на перше замовлення</small><h3>${Number(d.referrals?.pending||0)}</h3></article><article class="card referral-metric"><small>Нараховано за рефералів</small><h3>${money(d.referrals?.bonus_earned||0)}</h3></article></div><p class="muted">По 50 бонусів вам і другу нараховуємо після отримання першого замовлення.</p></section><button onclick="loadOwnerDashboard()" ${canManageOwner?'':'class="hidden"'}>Панель власника</button>`}catch(e){$('loyaltyPanel').innerHTML=`<h2>Бонусна карта</h2><div class="notice">${esc(e.message)}<br><button class="primary" onclick="loadLoyalty()">Завантажити ще раз</button></div>`}}
@@ -11658,15 +11709,16 @@ async function add(id){track("add_to_cart",id);if(!authenticated){let p=products
 function cartSnapshotKey(){let id=window.Telegram?.WebApp?.initDataUnsafe?.user?.id;return 'cloudhub.cart.snapshot.v1.'+(id||'web')}function readCartSnapshot(){try{let value=JSON.parse(localStorage.getItem(cartSnapshotKey())||'[]');return Array.isArray(value)?value:[]}catch(e){return []}}function saveCartSnapshot(){try{localStorage.setItem(cartSnapshotKey(),JSON.stringify(cart))}catch(e){}}async function loadCart(force=false){if(!authenticated){cart=guestCart.map(x=>({...x,line_total:Number(x.price)*Number(x.quantity)}));$('cartCount').textContent=cartCount();return true}try{let d=await api('/api/miniapp/cart',{fresh:force,timeoutMs:12000});cart=Array.isArray(d.items)?d.items:[];window.cartStale=false;window.cartLoadError=null;saveCartSnapshot();$('cartCount').textContent=cartCount();return true}catch(e){window.cartLoadError=e;cart=readCartSnapshot();window.cartStale=cart.length>0;$('cartCount').textContent=cartCount();return false}}function changeGuestQuantity(id,delta){let item=guestCart.find(x=>Number(x.variant_id)===Number(id));if(!item)return;let next=Math.min(Number(item.available)||99,item.quantity+delta);if(next<1)guestCart=guestCart.filter(x=>Number(x.variant_id)!==Number(id));else item.quantity=next;saveGuestCart();loadCart().then(showCart)}function renderCartContents(){cart=authenticated?cart:guestCart.map(x=>({...x,line_total:Number(x.price)*Number(x.quantity)}));let total=cart.reduce((sum,x)=>sum+Number(x.line_total||0),0);let note=authenticated?'':'<div class="notice">Кошик збережено в цьому браузері. Увійдіть через Telegram, щоб оформити замовлення.</div>'+telegramPrompt();let warning=window.cartStale?`<div class="notice cart-warning">Показую збережені товари й оновлюю дані з магазину.<button onclick="showCart()">Оновити кошик</button></div>`:'';let rows=cart.length?cart.map(cartRow).join('')+`<section class="cart-summary"><span>Разом</span><strong>${money(total)}</strong>${authenticated?'<button class="primary" onclick="checkoutForm()">Перейти до оформлення</button>':note}</section>`:`<div class="notice">${window.cartLoadError&&authenticated?'Кошик завантажується довше, ніж зазвичай. Спробуйте оновити його.':'Кошик порожній. Додайте товари з каталогу — вони з’являться тут.'}</div>${authenticated?'<button class="primary" onclick="showCart()">Оновити кошик</button>':''}`;$('cart').innerHTML=bannerMarkup('cart_top')+'<h2>Ваш кошик</h2>'+warning+rows;setTimeout(loadProductPhotos,0)}async function showCart(){track('cart_view');setActiveTab('cartBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('cart').classList.remove('hidden');if(!authenticated){window.cartLoadError=null;window.cartStale=false;renderCartContents();return}let snapshot=readCartSnapshot();if(snapshot.length){cart=snapshot;window.cartStale=true;window.cartLoadError=null;renderCartContents()}else{$('cart').innerHTML=bannerMarkup('cart_top')+'<h2>Ваш кошик</h2><div class="notice cart-loading" role="status">Перевіряю ваш кошик…</div>'}let pending=true;let refresh=loadCart(true).then(ok=>{pending=false;if(!$('cart').classList.contains('hidden'))renderCartContents();return ok});setTimeout(()=>{if(pending&&!$('cart').classList.contains('hidden')){if(!cart.length)window.cartLoadError=Error('Кошик ще завантажується');renderCartContents()}},5000);await refresh}async function changeCartQuantity(id,delta){if(!authenticated){changeGuestQuantity(id,delta);return}let item=cart.find(x=>Number(x.variant_id)===Number(id));if(!item)return;let next=Number(item.quantity)+delta;try{await api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:Number(id),quantity:Math.max(0,next)}),timeoutMs:9000});await showCart()}catch(e){msg(e.message)}}
 async function removeCartLine(id){if(!authenticated){guestCart=guestCart.filter(x=>Number(x.variant_id)!==Number(id));saveGuestCart();await loadCart();renderCartContents();return}try{await api('/api/miniapp/cart',{method:'DELETE',body:JSON.stringify({variant_id:Number(id)}),timeoutMs:9000});await showCart()}catch(e){msg(e.message)}}
 let cityTimer=null,branchTimer=null;
-async function suggestCities(){clearTimeout(cityTimer);cityTimer=setTimeout(async()=>{let q=$('npCity')?.value||'';if(q.trim().length<2)return;try{let d=await api('/api/miniapp/np/cities?q='+encodeURIComponent(q));$('cityChoices').innerHTML=(d.items||[]).slice(0,8).map((x,i)=>`<button type="button" onclick="chooseCity(${i})">${esc(x.name)} ${esc(x.area||'')}</button>`).join('');window._npCities=d.items||[]}catch(e){$('cityChoices').textContent='Довідник тимчасово недоступний. Спробуйте пізніше.'}},350)}
+async function suggestCities(){clearTimeout(cityTimer);cityTimer=setTimeout(async()=>{let q=$('npCity')?.value||'';if(q.trim().length<2)return;try{let d=await api('/api/miniapp/np/cities?q='+encodeURIComponent(q));$('cityChoices').innerHTML=(d.items||[]).slice(0,8).map((x,i)=>`<button type="button" onclick="chooseCity(${i})">${esc(x.name)} ${esc(x.area||'')}</button>`).join('');window._npCities=d.items||[]}catch(e){$('cityChoices').textContent='Довідник недоступний. Можна ввести вручну; замовлення все одно збережеться.'}},350)}
 async function chooseCity(i){let c=(window._npCities||[])[i];if(!c)return;$('npCity').value=c.name;npCityRef=c.ref;$('cityChoices').innerHTML='';npWarehouseRef='';$('branchChoices').innerHTML='';suggestBranches()}
-async function suggestBranches(){clearTimeout(branchTimer);branchTimer=setTimeout(async()=>{if(!npCityRef)return;try{let d=await api('/api/miniapp/np/branches?city_ref='+encodeURIComponent(npCityRef));$('branchChoices').innerHTML=(d.items||[]).slice(0,80).map((x,i)=>`<button type="button" onclick="chooseBranch(${i})">${esc(x.name)}</button>`).join('');window._npBranches=d.items||[]}catch(e){$('branchChoices').textContent='Довідник тимчасово недоступний. Спробуйте пізніше.'}},200)}
+async function suggestBranches(){clearTimeout(branchTimer);branchTimer=setTimeout(async()=>{if(!npCityRef)return;try{let d=await api('/api/miniapp/np/branches?city_ref='+encodeURIComponent(npCityRef));$('branchChoices').innerHTML=(d.items||[]).slice(0,80).map((x,i)=>`<button type="button" onclick="chooseBranch(${i})">${esc(x.name)}</button>`).join('');window._npBranches=d.items||[]}catch(e){$('branchChoices').textContent='Довідник недоступний. Можна ввести вручну; замовлення все одно збережеться.'}},200)}
 function chooseBranch(i){let b=(window._npBranches||[])[i];if(!b)return;$('npBranch').value=b.name;npWarehouseRef=b.ref;$('branchChoices').innerHTML=''}
-async function checkoutForm(){track("checkout_start");let d=await api('/api/miniapp/profile');checkoutKey=(window.crypto?.randomUUID?crypto.randomUUID():('ch_'+Date.now()+'_'+Math.random().toString(16).slice(2)));$('cart').innerHTML=`<h2>Оформлення замовлення</h2><div class="formgrid"><input id="buyerName" placeholder="Ім’я та прізвище" value="${esc(d.full_name||'')}"><input id="buyerPhone" placeholder="Телефон +380…" value="${esc(d.phone||'')}"><div class="notice">Доступно бонусів: <b>${money(d.bonus_available||0)}</b>. Можна покрити ними до 100% вартості товарів.</div><input id="bonusAmount" type="number" min="0" step="0.01" max="${Number(d.bonus_available||0)}" value="0" placeholder="Списати бонусів"><input id="certificateCode" maxlength="40" placeholder="Сертифікат (за наявності)"><input id="npCity" placeholder="Місто Нової пошти — оберіть зі списку" autocomplete="off"><div id="cityChoices"></div><input id="npBranch" placeholder="Відділення або поштомат — оберіть зі списку" autocomplete="off"><div id="branchChoices"></div><small>Якщо номінал сертифіката більший за вартість товарів після бонусів, залишок зарахуємо на бонусний рахунок.</small><small>Оберіть місто й пункт доставки з офіційного довідника Нової пошти. Якщо довідник тимчасово недоступний, оформлення можна повторити трохи пізніше.</small><label class="check"><input type="checkbox" id="privacyOk"> Погоджуюся з обробкою даних, необхідних для оформлення та доставки замовлення.</label><button onclick="submitOrder()" class="primary">Підтвердити замовлення</button><button onclick="showCart()">Назад до кошика</button></div>`;$('npCity').addEventListener('input',()=>{npCityRef='';npWarehouseRef='';suggestCities()});$('npBranch').addEventListener('input',()=>{npWarehouseRef='';suggestBranches()})}
+async function checkoutForm(){track("checkout_start");let d=await api('/api/miniapp/profile');checkoutKey=(window.crypto?.randomUUID?crypto.randomUUID():('ch_'+Date.now()+'_'+Math.random().toString(16).slice(2)));$('cart').innerHTML=`<h2>Оформлення замовлення</h2><div class="formgrid"><input id="buyerName" placeholder="Ім’я та прізвище" value="${esc(d.full_name||'')}"><input id="buyerPhone" placeholder="Телефон +380…" value="${esc(d.phone||'')}"><div class="notice">Доступно бонусів: <b>${money(d.bonus_available||0)}</b>. Можна покрити ними до 100% вартості товарів.</div><input id="bonusAmount" type="number" min="0" step="0.01" max="${Number(d.bonus_available||0)}" value="0" placeholder="Списати бонусів"><input id="certificateCode" maxlength="40" placeholder="Сертифікат (за наявності)"><input id="npCity" placeholder="Місто Нової пошти (оберіть зі списку або введіть вручну)" autocomplete="off"><div id="cityChoices"></div><input id="npBranch" placeholder="Відділення або поштомат (зі списку або вручну)" autocomplete="off"><div id="branchChoices"></div><small>Якщо номінал сертифіката більший за вартість товарів після бонусів, залишок зарахуємо на бонусний рахунок.</small><small>Оберіть місто й пункт з довідника або введіть вручну. Замовлення збережеться, навіть якщо довідник чи ТТН API тимчасово недоступні.</small><label class="check"><input type="checkbox" id="privacyOk"> Погоджуюся з обробкою даних, необхідних для оформлення та доставки замовлення.</label><button onclick="submitOrder()" class="primary">Підтвердити замовлення</button><button onclick="showCart()">Назад до кошика</button></div>`;$('npCity').addEventListener('input',()=>{npCityRef='';npWarehouseRef='';suggestCities()});$('npBranch').addEventListener('input',()=>{npWarehouseRef='';suggestBranches()})}
 async function submitOrder(){let body={name:$('buyerName').value,phone:$('buyerPhone').value,city:$('npCity').value,branch:$('npBranch').value,city_ref:npCityRef,warehouse_ref:npWarehouseRef,bonus_amount:$('bonusAmount').value,certificate_code:$('certificateCode').value,privacy_accepted:$('privacyOk').checked,idempotency_key:checkoutKey};try{let d=await api('/api/miniapp/checkout',{method:'POST',body:JSON.stringify(body)});$('cart').innerHTML=`<div class="success-wrap"><div class="success-mark"><svg viewBox="0 0 48 48"><path d="M10 25l9 9L38 14"/></svg></div><h2>Дякуємо за замовлення!</h2><div class="thanks">Ваше замовлення успішно оформлено</div><div class="success-order">${esc(d.order_number)}</div><div class="notice"><b>До сплати: ${money(d.grand_total)}</b><br>Нова пошта: ${esc(body.city)} / ${esc(body.branch)}${Number(d.certificate_remainder_bonus||0)>0?`<br>Залишок сертифіката зараховано бонусами: ${money(d.certificate_remainder_bonus)}`:''}<br>ТТН створюється автоматично. Якщо сервіс перевізника тимчасово недоступний, замовлення вже збережене, а ТТН буде оброблена окремо.</div><button class="primary" onclick="loadЗамовлення()">Мої замовлення</button><button onclick="renderProducts()">Повернутися до каталогу</button></div>`;playUiSound('success');document.querySelector('.success-wrap')?.classList.add('celebrate');catCelebrate();await loadCart()}catch(e){msg(e.message)}}
 
-async function loadЗамовлення(){track('orders_view');setActiveTab('ordersBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');if(!authenticated){$('orders').innerHTML='<h2>Замовлення</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small>${o.ttn?`<div class="notice">ТТН: <b>${esc(o.ttn)}</b><br>Статус Нової пошти: ${esc(o.tracking_status||'Ще не оновлювався')}<br><small>Оновлено: ${esc(o.tracking_updated_at||'—')}</small><button onclick="refreshTracking('${esc(o.order_number)}')">Оновити статус доставки</button></div>`:''}${o.status_history?.length?`<details><summary>Історія статусів</summary><ul>${o.status_history.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></details>`:''}</div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function loadЗамовлення(){track('orders_view');setActiveTab('ordersBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');if(!authenticated){$('orders').innerHTML='<h2>Замовлення</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small>${o.ttn?`<div class="notice">ТТН: <b>${esc(o.ttn)}</b><br>Статус Нової пошти: ${esc(o.tracking_status||'Ще не оновлювався')}<br><small>Оновлено: ${esc(o.tracking_updated_at||'—')}</small><button onclick="refreshTracking('${esc(o.order_number)}')">Оновити статус доставки</button></div>`:''}${o.tracking_status&&/отримано|вручено|доставлено/i.test(o.tracking_status)?`<details><summary>Залишити відгук про отримане замовлення</summary><label>Оцінка<select id="review-rating-${esc(o.order_number)}"><option value=5>5 — чудово</option><option value=4>4 — добре</option><option value=3>3 — нормально</option><option value=2>2 — є зауваження</option><option value=1>1 — погано</option></select></label><textarea id="review-comment-${esc(o.order_number)}" placeholder="Коментар (необов’язково)"></textarea><button class="primary" onclick="sendOrderReview('${esc(o.order_number)}')">Надіслати відгук</button></details>`:''}${o.status_history?.length?`<details><summary>Історія статусів</summary><ul>${o.status_history.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></details>`:''}</div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function refreshTracking(orderNumber){try{let d=await api('/api/miniapp/orders/refresh-tracking',{method:'POST',body:JSON.stringify({order_number:orderNumber})});msg(d.tracking_status||'Статус доставки оновлено');loadЗамовлення()}catch(e){msg(e.message)}}
+async function sendOrderReview(orderNumber){try{let rating=Number($('review-rating-'+orderNumber).value),comment=$('review-comment-'+orderNumber).value||'';await api('/api/miniapp/orders/review',{method:'POST',body:JSON.stringify({order_number:orderNumber,rating,comment})});msg('Дякуємо за відгук ❤️');loadЗамовлення()}catch(e){msg(e.message)}}
 function renderBannerAdmin(){ $('adminBanners').innerHTML=`<h3>Керування банерами</h3><p class="muted">Банери відображаються компактно: на головній, у каталозі або в кошику.</p><div id="bannerRows">${banners.map((b,i)=>bannerRow(b,i)).join('')}</div><button onclick="addBannerRow()">Додати банер</button><button class="primary" onclick="saveBanners()">Зберегти банери</button>`;let btn=document.createElement('button');btn.textContent='Банери (адмін)';btn.onclick=()=>{hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('adminBanners').classList.remove('hidden')};$('banners').after(btn)}
 function renderOwnerEntry(){if(document.getElementById('ownerBtn'))return;let btn=document.createElement('button');btn.id='ownerBtn';btn.textContent='Панель власника';btn.onclick=loadOwnerDashboard;$('banners').after(btn)}
 function renderStaffEntry(){if(document.getElementById('staffToolsBtn'))return;let btn=document.createElement('button');btn.id='staffToolsBtn';btn.textContent='Керування магазином';btn.onclick=loadStaffTools;$('banners').after(btn)}
@@ -11678,8 +11730,9 @@ async function uploadStaffPhoto(btn){let c=btn.closest('[data-product]'),file=c.
 async function adjustStaffStock(btn){let c=btn.closest('[data-product]');try{let d=await api(`/api/miniapp/staff/catalog/variants/${c.dataset.variant}/stock`,{method:'POST',body:JSON.stringify({delta:c.querySelector('[data-field=delta]').value,reason:c.querySelector('[data-field=stockReason]').value})});msg(`Залишок оновлено: ${d.stock_qty}`);await loadStaffCatalog()}catch(e){msg(e.message)}}
 async function searchStaffCustomers(){let q=prompt('Картка клієнта: ім’я, телефон, номер картки або Telegram ID')||'';if(q.trim().length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(c=>`<button class="card" onclick="openStaffКлієнт(${c.id})"><b>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</b><br><small>${esc(c.phone||'Немає телефону')} · картка ${esc(c.loyalty_card_number||'—')}</small><br><small>Бонуси ${money(c.bonus_available)} · замовлень ${c.order_count} · на суму ${money(c.lifetime_value)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
 async function openStaffКлієнт(id){try{let d=await api(`/api/miniapp/staff/customers/${id}`),c=d.customer;$('staffContent').innerHTML=`<button onclick="searchStaffCustomers()">← До пошуку</button><div class="card"><h3>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</h3><p>Телефон: ${esc(c.phone||'—')}<br>Telegram: ${esc(c.telegram_id||'—')} · @${esc(c.username||'—')}<br>Картка: ${esc(c.loyalty_card_number||'—')}<br>Доступні бонуси: ${money(c.bonus_available)} · Очікують: ${money(c.bonus_pending)}</p><h4>Замовлення</h4>${d.orders.map(o=>`<div class="notice">${esc(o.order_number)} · ${esc(o.status)} · ${money(o.grand_total)} · ${esc(o.created_at||'')}</div>`).join('')||'Немає замовлень'}<h4>Бонусний журнал</h4>${d.loyalty.map(x=>`<div class="notice">${esc(x.transaction_type)} ${money(x.amount)} · ${esc(x.state)} · ${esc(x.reason||'')}</div>`).join('')||'Операцій немає'}</div>`}catch(e){msg(e.message)}}
-async function loadStaffOrders(){let host=$('staffContent');host.innerHTML='<h2>Замовлення</h2><div class=\"notice\">Завантажую…</div>';try{let q=prompt('Пошук за номером, клієнтом, телефоном або ТТН')||'';let d=await api('/api/miniapp/staff/orders?q='+encodeURIComponent(q),{fresh:true,timeoutMs:15000}),items=Array.isArray(d.items)?d.items:[];host.innerHTML='<h2>Замовлення</h2>'+ (items.map(o=>`<article class=\"card staff-order-card\"><div class=\"row\"><b>${esc(o.order_number||'Замовлення')}</b><span class=\"pill\">${esc(o.status_label||o.status||'В обробці')}</span></div><p>${esc(o.customer_name||'Клієнт')} · ${esc(o.phone||'—')}<br>${esc(o.city||'')}, ${esc(o.delivery_branch||'')}<br>Сума: ${money(o.grand_total)} · сплачено: ${money(o.paid_amount)}<br>ТТН: ${esc(o.ttn||'—')}</p>${canUpdateOrders?`<label>Статус<select data-order-status=\"${Number(o.id)}\"><option value=\"new\" ${o.status==='new'?'selected':''}>Прийнято</option><option value=\"confirmed\" ${o.status==='confirmed'?'selected':''}>Підтверджено</option><option value=\"packing\" ${o.status==='packing'?'selected':''}>Збирається</option><option value=\"packed\" ${o.status==='packed'?'selected':''}>Зібрано</option><option value=\"ready_to_ship\" ${o.status==='ready_to_ship'?'selected':''}>Готове до відправлення</option><option value=\"shipped\" ${o.status==='shipped'?'selected':''}>Відправлено</option><option value=\"delivered\" ${o.status==='delivered'?'selected':''}>Отримано</option><option value=\"completed\" ${o.status==='completed'?'selected':''}>Завершено</option><option value=\"cancelled\" ${o.status==='cancelled'?'selected':''}>Скасовано</option><option value=\"problem\" ${o.status==='problem'?'selected':''}>Потрібна перевірка</option></select></label><button class=\"primary\" onclick=\"updateStaffOrder(${Number(o.id)})\">Зберегти статус</button>`:''}</article>`).join('')||'<div class=\"notice\">Замовлень не знайдено.</div>')}catch(e){host.innerHTML='<h2>Замовлення</h2><div class=\"notice\">Не вдалося завантажити список: '+esc(e.message)+'<br><button onclick=\"loadStaffOrders()\">Спробувати ще</button></div>'}}
+async function loadStaffOrders(){let host=$('staffContent');host.innerHTML='<h2>Замовлення</h2><div class=\"notice\">Завантажую…</div>';try{let q=prompt('Пошук за номером, клієнтом, телефоном або ТТН')||'';let d=await api('/api/miniapp/staff/orders?q='+encodeURIComponent(q),{fresh:true,timeoutMs:15000}),items=Array.isArray(d.items)?d.items:[];host.innerHTML='<h2>Замовлення</h2>'+ (items.map(o=>`<article class=\"card staff-order-card\"><div class=\"row\"><b>${esc(o.order_number||'Замовлення')}</b><span class=\"pill\">${esc(o.status_label||o.status||'В обробці')}</span></div><p>${esc(o.customer_name||'Клієнт')} · ${esc(o.phone||'—')}<br>${esc(o.city||'')}, ${esc(o.delivery_branch||'')}<br>Сума: ${money(o.grand_total)} · сплачено: ${money(o.paid_amount)}<br>ТТН: ${esc(o.ttn||'—')}</p>${canUpdateOrders?`<label>Статус<select data-order-status=\"${Number(o.id)}\"><option value=\"new\" ${o.status==='new'?'selected':''}>Прийнято</option><option value=\"confirmed\" ${o.status==='confirmed'?'selected':''}>Підтверджено</option><option value=\"packing\" ${o.status==='packing'?'selected':''}>Збирається</option><option value=\"packed\" ${o.status==='packed'?'selected':''}>Зібрано</option><option value=\"ready_to_ship\" ${o.status==='ready_to_ship'?'selected':''}>Готове до відправлення</option><option value=\"shipped\" ${o.status==='shipped'?'selected':''}>Відправлено</option><option value=\"delivered\" ${o.status==='delivered'?'selected':''}>Отримано</option><option value=\"completed\" ${o.status==='completed'?'selected':''}>Завершено</option><option value=\"cancelled\" ${o.status==='cancelled'?'selected':''}>Скасовано</option><option value=\"problem\" ${o.status==='problem'?'selected':''}>Потрібна перевірка</option></select></label><button class=\"primary\" onclick=\"updateStaffOrder(${Number(o.id)})\">Зберегти статус</button>`:''}${canConfirmPayment&&o.payment_status!=='paid'?`<button onclick="confirmStaffPayment(${Number(o.id)},${Number(o.grand_total)})">Підтвердити отримання оплати · ${money(o.grand_total)}</button>`:''}</article>`).join('')||'<div class=\"notice\">Замовлень не знайдено.</div>')}catch(e){host.innerHTML='<h2>Замовлення</h2><div class=\"notice\">Не вдалося завантажити список: '+esc(e.message)+'<br><button onclick=\"loadStaffOrders()\">Спробувати ще</button></div>'}}
 async function updateStaffOrder(id){try{let status=document.querySelector(`[data-order-status="${id}"]`).value;await api(`/api/miniapp/staff/orders/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус замовлення оновлено');await loadStaffOrders()}catch(e){msg(e.message)}}
+async function confirmStaffPayment(id,amount){if(!confirm(`Підтверджуєте, що Cloud Hub отримав оплату ${money(amount)} за це замовлення?`))return;try{await api(`/api/miniapp/staff/orders/${id}/payment`,{method:'POST',body:JSON.stringify({confirmed:true})});msg('Оплату підтверджено. Бонуси стануть доступними після отримання посилки.');await loadStaffOrders()}catch(e){msg(e.message)}}
 let staffSupportStatus='active',staffSupportQuery='';
 function supportStatusLabel(s){return ({new:'\u041d\u043e\u0432\u0435',open:'\u0412\u0456\u0434\u043a\u0440\u0438\u0442\u0435',waiting_customer:'\u041e\u0447\u0456\u043a\u0443\u0454 \u043a\u043b\u0456\u0454\u043d\u0442\u0430',closed:'\u0417\u0430\u043a\u0440\u0438\u0442\u0435'})[s]||s}
 
@@ -12876,7 +12929,7 @@ def miniapp_bootstrap():
         raw_init_data = request.headers.get("X-Telegram-Init-Data", "")
         has_web_session = bool(request.cookies.get("cloudhub_web_session"))
         if not raw_init_data and not has_web_session:
-            return jsonify({"categories": categories, "products": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in products], "popular_product_ids":list_popular_product_ids(), "favorite_product_ids": [], "banners": [], "authenticated":False, "web_session":False, "can_manage_banners": False, "can_manage_owner": False, "can_manage_catalog": False, "can_edit_catalog": False, "can_view_customers": False, "can_view_orders": False, "can_update_orders": False})
+            return jsonify({"categories": categories, "products": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in products], "popular_product_ids":list_popular_product_ids(), "favorite_product_ids": [], "banners": [], "authenticated":False, "web_session":False, "can_manage_banners": False, "can_manage_owner": False, "can_manage_catalog": False, "can_edit_catalog": False, "can_view_customers": False, "can_view_orders": False, "can_update_orders": False, "can_confirm_payment": False})
         user = _miniapp_auth_user()
         upsert_customer(user)
         with db_cursor() as cur:
@@ -12896,7 +12949,7 @@ def miniapp_bootstrap():
             if not security_active:
                 staff = None
         banners = _miniapp_get_banners(active_only=True)
-        return jsonify({"categories": categories, "products": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in products], "popular_product_ids":list_popular_product_ids(), "favorite_product_ids": favorite_product_ids, "banners": banners, "authenticated":True, "web_session":bool(has_web_session and not raw_init_data), "can_manage_banners": can_manage, "can_manage_owner": can_manage_owner, "can_manage_catalog": bool(staff and staff.active and staff.can("catalog.read")), "can_edit_catalog": bool(staff and staff.active and staff.can("catalog.update")), "can_view_customers": bool(staff and staff.active and staff.can("customers.read")), "can_view_orders": bool(staff and staff.active and staff.can("orders.read")), "can_update_orders": bool(staff and staff.active and staff.can("orders.update")), "can_view_support": bool(staff and staff.active and staff.can("support.read")), "can_reply_support": bool(staff and staff.active and staff.can("support.reply")), "can_manage_inventory":bool(staff and staff.active and staff.can("inventory.read")), "can_confirm_inventory":bool(staff and staff.active and staff.role in {"owner","admin"})})
+        return jsonify({"categories": categories, "products": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in products], "popular_product_ids":list_popular_product_ids(), "favorite_product_ids": favorite_product_ids, "banners": banners, "authenticated":True, "web_session":bool(has_web_session and not raw_init_data), "can_manage_banners": can_manage, "can_manage_owner": can_manage_owner, "can_manage_catalog": bool(staff and staff.active and staff.can("catalog.read")), "can_edit_catalog": bool(staff and staff.active and staff.can("catalog.update")), "can_view_customers": bool(staff and staff.active and staff.can("customers.read")), "can_view_orders": bool(staff and staff.active and staff.can("orders.read")), "can_update_orders": bool(staff and staff.active and staff.can("orders.update")), "can_confirm_payment": bool(staff and staff.active and staff.can("finance.payment_confirm")), "can_view_support": bool(staff and staff.active and staff.can("support.read")), "can_reply_support": bool(staff and staff.active and staff.can("support.reply")), "can_manage_inventory":bool(staff and staff.active and staff.can("inventory.read")), "can_confirm_inventory":bool(staff and staff.active and staff.role in {"owner","admin"})})
     except PermissionError as exc:
         return jsonify({"error": str(exc)}), 401
     except Exception:
@@ -13270,7 +13323,7 @@ def miniapp_checkout():
         idem = str(body.get("idempotency_key") or "").strip()
         if not name: return jsonify({"error":"Вкажіть ім’я та прізвище отримувача."}),400
         if not phone: return jsonify({"error":"Вкажіть український номер у форматі +380XXXXXXXXX (рівно 12 цифр без +)."}),400
-        if not city or not branch: return jsonify({"error":"Оберіть місто та відділення/поштомат у довіднику Нової пошти."}),400
+        if not city or not branch: return jsonify({"error":"Вкажіть місто та відділення/поштомат Нової пошти."}),400
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,120}", idem): return jsonify({"error":"Не вдалося підтвердити запит. Натисніть оформлення ще раз."}),400
         if not body.get("privacy_accepted") and not has_current_privacy_consent(user.id, CONFIG.privacy_consent_version):
             return jsonify({"error":"Потрібно підтвердити згоду на обробку даних."}),400
@@ -13343,7 +13396,7 @@ def miniapp_refresh_tracking():
         if not order_number:
             return jsonify({"error": "Не вказано номер замовлення."}), 400
         with db_cursor() as cur:
-            cur.execute("SELECT id,ttn,phone_snapshot FROM orders WHERE order_number=%s AND telegram_id_snapshot=%s", (order_number, user.id))
+            cur.execute("SELECT id,ttn,phone_snapshot,status,payment_status,customer_id FROM orders WHERE order_number=%s AND telegram_id_snapshot=%s", (order_number, user.id))
             order = cur.fetchone()
         if not order:
             return jsonify({"error": "Замовлення не знайдено."}), 404
@@ -13359,7 +13412,23 @@ def miniapp_refresh_tracking():
         with db_cursor() as cur:
             cur.execute("""UPDATE orders SET nova_poshta_tracking_status=%s,nova_poshta_updated_at=NOW(),updated_at=NOW()
                            WHERE id=%s AND telegram_id_snapshot=%s""", (status, order["id"], user.id))
-            if any(term in status.casefold() for term in ("отримано","вручено","доставлено")):
+            delivered = _np_status_is_received(status)
+            if delivered and order["status"] == "shipped":
+                cur.execute("""UPDATE orders SET status='delivered',updated_at=NOW()
+                               WHERE id=%s AND status='shipped' RETURNING id""", (order["id"],))
+                if cur.fetchone():
+                    cur.execute("""INSERT INTO audit_log(action,entity_type,entity_id,before_data,after_data,reason)
+                                   VALUES('order.status_changed','order',%s,%s::jsonb,%s::jsonb,
+                                   'Статус підтверджено довідником Нової пошти')""",
+                                (str(order["id"]), json_dumps({"status": "shipped"}),
+                                 json_dumps({"status": "delivered", "tracking_status": status})))
+                    if order.get("payment_status") == "paid" and order.get("customer_id"):
+                        _activate_pending_order_bonus_tx(cur, int(order["id"]), int(order["customer_id"]))
+                        _award_referral_rewards_tx(cur, int(order["customer_id"]), int(order["id"]))
+                    enqueue_notification(cur, user.id, "delivery", {
+                        "text": "🎉 Нова пошта підтвердила отримання посилки! Будь ласка, залиште короткий відгук у розділі «Замовлення» Cloud Hub.",
+                        "buttons": []}, f"order:{order['id']}:delivered:customer")
+            if delivered:
                 cur.execute("""UPDATE support_tickets SET status='closed',updated_at=NOW()
                                WHERE customer_telegram_id=%s AND order_id=%s AND status<>'closed'""",(user.id,order["id"]))
             cur.execute("""INSERT INTO audit_log(action,entity_type,entity_id,after_data,reason)
@@ -13529,7 +13598,7 @@ def miniapp_order_review():
                            WHERE order_number=%s AND telegram_id_snapshot=%s""",(order_number,user.id));order=cur.fetchone()
             if not order:return jsonify({"error":"Замовлення не знайдено."}),404
             status=str(order.get("nova_poshta_tracking_status") or "").lower()
-            if not any(x in status for x in ("отримано","вручено","доставлено")):
+            if not _np_status_is_received(status):
                 return jsonify({"error":"Відгук можна залишити після отримання замовлення."}),409
             cur.execute("""INSERT INTO order_reviews(order_id,customer_telegram_id,rating,comment)
                            VALUES(%s,%s,%s,%s) ON CONFLICT(order_id) DO NOTHING RETURNING id""",
@@ -14200,7 +14269,7 @@ def miniapp_staff_orders():
         pattern = f"%{query}%"
         with db_cursor() as cur:
             cur.execute("""SELECT o.id,o.order_number,o.customer_name_snapshot customer_name,o.phone_snapshot phone,
-                                  o.status,o.grand_total,o.paid_amount,o.city,o.delivery_branch,o.ttn,o.created_at,
+                                  o.status,o.payment_status,o.grand_total,o.paid_amount,o.city,o.delivery_branch,o.ttn,o.created_at,
                                   o.telegram_id_snapshot
                            FROM orders o WHERE (%s='' OR o.order_number ILIKE %s OR o.customer_name_snapshot ILIKE %s
                              OR o.phone_snapshot ILIKE %s OR o.ttn ILIKE %s)
@@ -14234,6 +14303,37 @@ def miniapp_staff_update_order_status(order_id: int):
     except Exception:
         log.exception("Mini App order status update failed")
         return jsonify({"error": "Не вдалося змінити статус замовлення."}), 500
+
+
+@miniapp.post("/api/miniapp/staff/orders/<int:order_id>/payment")
+def miniapp_staff_confirm_order_payment(order_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "finance.payment_confirm")
+        body = request.get_json(silent=True) or {}
+        if body.get("confirmed") is not True:
+            return jsonify({"error": "Потрібне явне підтвердження отримання оплати."}), 400
+        with db_cursor() as cur:
+            cur.execute("SELECT grand_total,order_number FROM orders WHERE id=%s", (order_id,))
+            order = cur.fetchone()
+        if not order:
+            return jsonify({"error": "Замовлення не знайдено."}), 404
+        record_cod_payment(order_id, Decimal(str(order["grand_total"])), actor,
+                           "Оплату підтверджено працівником у панелі замовлень")
+        with db_cursor() as cur:
+            cur.execute("SELECT available,pending FROM loyalty_accounts WHERE customer_id=(SELECT customer_id FROM orders WHERE id=%s)",
+                        (order_id,))
+            loyalty = cur.fetchone() or {"available": Decimal("0"), "pending": Decimal("0")}
+        return jsonify({"ok": True, "order_number": order["order_number"],
+                        "bonus_available": _miniapp_json_value(loyalty["available"]),
+                        "bonus_pending": _miniapp_json_value(loyalty["pending"])})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App payment confirmation failed order_id=%s", order_id)
+        return jsonify({"error": "Не вдалося підтвердити оплату. Перевірте замовлення та повторіть."}), 500
 
 
 @miniapp.get("/api/miniapp/admin/dashboard")
@@ -14306,6 +14406,10 @@ def miniapp_owner_loyalty_adjust():
         with db_cursor() as cur:
             cur.execute("SELECT id,telegram_id,loyalty_card_number FROM customers WHERE upper(loyalty_card_number)=upper(%s) FOR UPDATE", (lookup,))
             customer = cur.fetchone()
+            if not customer and lookup.isdigit():
+                # CRM customer cards submit the internal customer ID, not Telegram ID.
+                cur.execute("SELECT id,telegram_id,loyalty_card_number FROM customers WHERE id=%s FOR UPDATE", (int(lookup),))
+                customer = cur.fetchone()
             if not customer and lookup.isdigit():
                 cur.execute("SELECT id,telegram_id,loyalty_card_number FROM customers WHERE telegram_id=%s FOR UPDATE", (int(lookup),))
                 customer = cur.fetchone()
@@ -14431,7 +14535,7 @@ def miniapp_np_cities():
     try:
         _miniapp_auth_user()
         if not CONFIG.nova_poshta_api_key:
-            return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": False,
+            return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": True,
                             "notice": "Довідник Нової пошти тимчасово недоступний. Спробуйте пізніше."}), 200
         query = (request.args.get("q") or "").strip()[:80]
         if len(query) < 2:
@@ -14447,7 +14551,7 @@ def miniapp_np_cities():
         return jsonify({"error": str(exc)}), 401
     except Exception:
         log.exception("Nova Poshta city directory failed")
-        return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": False, "notice": "Довідник тимчасово недоступний. Спробуйте пізніше."}), 200
+        return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": True, "notice": "Довідник тимчасово недоступний. Спробуйте пізніше."}), 200
 
 
 @miniapp.get("/api/miniapp/np/branches")
@@ -14455,7 +14559,7 @@ def miniapp_np_branches():
     try:
         _miniapp_auth_user()
         if not CONFIG.nova_poshta_api_key:
-            return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": False,
+            return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": True,
                             "notice": "Довідник Нової пошти тимчасово недоступний. Спробуйте пізніше."}), 200
         city_ref = (request.args.get("city_ref") or "").strip()
         if not re.fullmatch(r"[0-9a-fA-F-]{20,64}", city_ref):
@@ -14471,7 +14575,7 @@ def miniapp_np_branches():
         return jsonify({"error": str(exc)}), 401
     except Exception:
         log.exception("Nova Poshta branch directory failed")
-        return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": False, "notice": "Довідник тимчасово недоступний. Спробуйте пізніше."}), 200
+        return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": True, "notice": "Довідник тимчасово недоступний. Спробуйте пізніше."}), 200
 
 
 
@@ -14558,6 +14662,52 @@ def _np_sender_configured() -> bool:
     return all(required)
 
 
+def _np_resolve_order_destination(order: dict) -> tuple[str, str]:
+    """Resolve saved official refs or look them up from manually entered order text.
+
+    Lookup calls are read-only, so temporary network/5xx failures are safely retried
+    by the durable TTN queue. This never blocks the customer order transaction.
+    """
+    city_ref = str(order.get("np_city_ref") or "").strip()
+    warehouse_ref = str(order.get("np_warehouse_ref") or "").strip()
+    ref_pattern = r"[0-9a-fA-F-]{32,64}"
+    if re.fullmatch(ref_pattern, city_ref) and re.fullmatch(ref_pattern, warehouse_ref):
+        return city_ref, warehouse_ref
+    city_name = " ".join(str(order.get("city") or "").split())[:100]
+    branch_name = " ".join(str(order.get("delivery_branch") or "").split())[:160]
+    if not city_name or not branch_name:
+        raise NovaPoshtaAPIError("У замовленні не вказано місто та пункт доставки Нової пошти.")
+    try:
+        cities = _np_api("Address", "getCities", {"FindByString": city_name, "Limit": "30"}).get("data") or []
+        norm_city = normalize_text(city_name)
+        exact = [x for x in cities if normalize_text(x.get("Description") or "") == norm_city]
+        candidates = exact or [x for x in cities if norm_city in normalize_text(x.get("Description") or "")]
+        if not candidates:
+            raise NovaPoshtaAPIError("Місто з введеного замовлення не знайдено у довіднику Нової пошти.")
+        selected_city = candidates[0]
+        city_ref = str(selected_city.get("Ref") or "")
+        if not re.fullmatch(ref_pattern, city_ref):
+            raise NovaPoshtaAPIError("Довідник Нової пошти не повернув Ref міста.")
+        digits = re.search(r"\d+", branch_name)
+        props = {"CityRef": city_ref, "Limit": "500"}
+        if digits:
+            props["FindByString"] = digits.group(0)
+        warehouses = _np_api("Address", "getWarehouses", props).get("data") or []
+        if digits:
+            matches = [x for x in warehouses if str(x.get("Number") or "") == digits.group(0)]
+        else:
+            norm_branch = normalize_text(branch_name)
+            matches = [x for x in warehouses if norm_branch in normalize_text(x.get("Description") or "")]
+        if not matches:
+            raise NovaPoshtaAPIError("Відділення/поштомат з введеного замовлення не знайдено у довіднику Нової пошти.")
+        warehouse_ref = str(matches[0].get("Ref") or "")
+        if not re.fullmatch(ref_pattern, warehouse_ref):
+            raise NovaPoshtaAPIError("Довідник Нової пошти не повернув Ref пункту доставки.")
+        return city_ref, warehouse_ref
+    except NovaPoshtaAmbiguousResult as exc:
+        raise NovaPoshtaRetryableError("Довідник Нової пошти тимчасово недоступний; ТТН буде повторно створено автоматично.") from exc
+
+
 def _np_create_ttn_for_order(order_id: int) -> dict:
     """Create one NP waybill using the saved Cloud Hub order and sender refs."""
     if not _np_sender_configured():
@@ -14612,9 +14762,7 @@ def _np_create_ttn_for_order(order_id: int) -> dict:
     else:
         weight, length, width, height = Decimal("1.5"), 25, 25, 7
 
-    if (not re.fullmatch(r"[0-9a-fA-F-]{32,64}", str(order.get("np_city_ref") or ""))
-            or not re.fullmatch(r"[0-9a-fA-F-]{32,64}", str(order.get("np_warehouse_ref") or ""))):
-        raise NovaPoshtaAPIError("У замовленні немає вибраних зі довідника Нової пошти міста та відділення/поштомата.")
+    city_recipient_ref, warehouse_recipient_ref = _np_resolve_order_destination(order)
     # Resolve stable Nova Poshta recipient/contact refs once and reuse them on retries.
     clean_name = _clean_full_name(order["customer_name_snapshot"])
     if not clean_name:
@@ -14656,7 +14804,7 @@ def _np_create_ttn_for_order(order_id: int) -> dict:
         "Recipient": recipient_refs["recipient_ref"],
         "ContactRecipient": recipient_refs["contact_ref"],
     }
-    recipient.update({"CityRecipient": order["np_city_ref"], "RecipientAddress": order["np_warehouse_ref"]})
+    recipient.update({"CityRecipient": city_recipient_ref, "RecipientAddress": warehouse_recipient_ref})
 
     props = {
         "PayerType": CONFIG.nova_poshta_payer_type,
@@ -14763,6 +14911,69 @@ def _np_send_ttn_notifications(order_id: int, ttn: str) -> None:
                 {"text": staff_text, "buttons": [["📂 Відкрити замовлення", f"ordview:{order_id}"]]},
                 f"order:{order_id}:np_ttn_created:staff:{rid}",
             )
+
+
+def process_np_tracking_updates(limit: int = 100) -> int:
+    """Poll a bounded batch of active waybills and confirm delivered orders once."""
+    if not CONFIG.nova_poshta_api_key:
+        return 0
+    limit = max(1, min(100, int(limit)))
+    with db_cursor() as cur:
+        cur.execute("""SELECT id,order_number,ttn,phone_snapshot,telegram_id_snapshot,
+                              status,payment_status,customer_id,nova_poshta_tracking_status
+                       FROM orders
+                       WHERE delivery_type='nova_poshta' AND COALESCE(ttn,'')<>''
+                         AND status='shipped'
+                         AND (nova_poshta_updated_at IS NULL OR nova_poshta_updated_at<NOW()-INTERVAL '15 minutes')
+                       ORDER BY nova_poshta_updated_at NULLS FIRST,id LIMIT %s""", (limit,))
+        orders = list(cur.fetchall())
+    if not orders:
+        return 0
+    documents = [{"DocumentNumber": str(o["ttn"]), "Phone": normalize_phone(o.get("phone_snapshot") or "")}
+                 for o in orders]
+    try:
+        result = _np_api("TrackingDocument", "getStatusDocuments", {"Documents": documents}, timeout=20)
+    except NovaPoshtaAPIError as exc:
+        log.warning("Nova Poshta tracking poll deferred: %s", str(exc)[:500])
+        return 0
+    by_ttn = {str(row.get("Number") or row.get("DocumentNumber") or ""): row
+              for row in (result.get("data") or []) if isinstance(row, dict)}
+    updated = 0
+    for order in orders:
+        record = by_ttn.get(str(order["ttn"]))
+        status = " ".join(str((record or {}).get("Status") or "").split())[:300]
+        if not status:
+            continue
+        delivered = _np_status_is_received(status)
+        with db_cursor() as cur:
+            cur.execute("""UPDATE orders SET nova_poshta_tracking_status=%s,
+                           nova_poshta_updated_at=NOW(),updated_at=NOW() WHERE id=%s""",
+                        (status, order["id"]))
+            if delivered and order["status"] == "shipped":
+                cur.execute("UPDATE orders SET status='delivered' WHERE id=%s AND status='shipped' RETURNING id",
+                            (order["id"],))
+                if cur.fetchone():
+                    cur.execute("""INSERT INTO audit_log(action,entity_type,entity_id,before_data,after_data,reason)
+                                   VALUES('order.status_changed','order',%s,%s::jsonb,%s::jsonb,
+                                   'Статус підтверджено Новою поштою')""",
+                                (str(order["id"]), json_dumps({"status": "shipped"}),
+                                 json_dumps({"status": "delivered", "tracking_status": status})))
+                    cur.execute("""INSERT INTO delivery_events(order_id,event_type,details)
+                                   VALUES(%s,'delivered',%s::jsonb)""",
+                                (order["id"], json_dumps({"provider": "nova_poshta", "status": status})))
+                    if order.get("payment_status") == "paid" and order.get("customer_id"):
+                        _activate_pending_order_bonus_tx(cur, int(order["id"]), int(order["customer_id"]))
+                        _award_referral_rewards_tx(cur, int(order["customer_id"]), int(order["id"]))
+                    customer_tid = order.get("telegram_id_snapshot")
+                    if customer_tid:
+                        enqueue_notification(cur, int(customer_tid), "delivery", {
+                            "text": "🎉 Нова пошта підтвердила отримання посилки! Відкрийте «Замовлення», щоб оцінити покупку. Бонуси за оплачене замовлення вже доступні або очікують підтвердження оплати.",
+                            "buttons": []}, f"order:{order['id']}:delivered:customer")
+                    cur.execute("""UPDATE support_tickets SET status='closed',updated_at=NOW()
+                                   WHERE customer_telegram_id=%s AND order_id=%s AND status<>'closed'""",
+                                (customer_tid, order["id"]))
+        updated += 1
+    return updated
 
 
 def _np_schedule_safe_retry(order_id: int, error: str) -> bool:
@@ -15026,6 +15237,19 @@ def nova_poshta_ttn_worker_loop() -> None:
             _maintenance_stop.wait(10)
 
 
+def nova_poshta_tracking_worker_loop() -> None:
+    """Refresh shipment statuses every 15 minutes without blocking the bot poller."""
+    while not _maintenance_stop.is_set():
+        try:
+            count = process_np_tracking_updates(100)
+            if count:
+                log.info("Nova Poshta tracking poll updated %s orders", count)
+        except Exception:
+            log.exception("Nova Poshta tracking poll failed")
+        if _maintenance_stop.wait(900):
+            return
+
+
 
 def start_miniapp_server():
     port = int(os.getenv("PORT", "10000"))
@@ -15135,6 +15359,8 @@ def main() -> None:
         threading.Thread(target=miniapp_keepalive_loop, name="miniapp-keepalive", daemon=True).start()
     np_ttn_thread = threading.Thread(target=nova_poshta_ttn_worker_loop, name="nova-poshta-ttn-worker", daemon=True)
     np_ttn_thread.start()
+    np_tracking_thread = threading.Thread(target=nova_poshta_tracking_worker_loop, name="nova-poshta-tracking-worker", daemon=True)
+    np_tracking_thread.start()
     start_miniapp_server()
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -18718,11 +18944,11 @@ def loyalty_adjust_phone_shortcut(message):
 
 
 @bot.message_handler(commands=["loyalty_adjust"])
-def loyalty_adjust_command(message):
+def loyalty_adjust_command(message, command_text: Optional[str] = None):
     actor=require_staff(message)
     if not actor or actor.role!="owner":
         bot.reply_to(message,"⛔ Ручне коригування бонусів доступне лише власнику."); return
-    parts=(message.text or "").split(maxsplit=4)
+    parts=(command_text or message.text or "").split(maxsplit=4)
     if len(parts)!=5:
         bot.reply_to(message,"Формат: /loyalty_adjust КАРТКА_АБО_ТЕЛЕФОН earn|redeem СУМА причина"); return
     customer_lookup,operation,raw_amount,reason=parts[1],parts[2].lower(),parts[3],parts[4].strip()
