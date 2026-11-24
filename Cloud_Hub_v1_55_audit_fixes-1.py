@@ -14764,13 +14764,45 @@ def _np_create_ttn_for_order(order_id: int) -> dict:
         weight, length, width, height = Decimal("1.5"), 25, 25, 7
 
     city_recipient_ref, warehouse_recipient_ref = _np_resolve_order_destination(order)
-    # Resolve stable Nova Poshta recipient/contact refs once and reuse them on retries.
+    # Never trust a cached or first-returned contact blindly. Nova Poshta can
+    # return several contact persons for a counterparty; using data[0] can put
+    # another customer's name/phone on the waybill.
     clean_name = _clean_full_name(order["customer_name_snapshot"])
     if not clean_name:
         raise NovaPoshtaAPIError("Для ТТН потрібні коректні ім’я та прізвище одержувача.")
+
+    def contact_matches_order(contact: dict) -> bool:
+        contact_name = " ".join(str(contact.get(key) or "").strip()
+                                for key in ("FirstName", "MiddleName", "LastName")
+                                if str(contact.get(key) or "").strip())
+        contact_name = contact_name or str(contact.get("Description") or "").strip()
+        expected_name_parts = set(normalize_text(clean_name).split())
+        actual_name_parts = set(normalize_text(contact_name).split())
+        if len(expected_name_parts) < 2 or not expected_name_parts.issubset(actual_name_parts):
+            return False
+        phone_values = [contact.get(key) for key in ("Phones", "Phone", "phone") if contact.get(key)]
+        contact_phones = {
+            ("38" + digits if len(digits) == 10 and digits.startswith("0") else digits)
+            for value in phone_values
+            for digits in re.findall(r"\d{10,15}", str(value))
+        }
+        return recipient_phone in contact_phones
+
+    def matching_contact(recipient_ref: str) -> Optional[dict]:
+        if not recipient_ref:
+            return None
+        result = _np_api("Counterparty", "getCounterpartyContactPersons", {"Ref": recipient_ref})
+        matches = [row for row in (result.get("data") or [])
+                   if isinstance(row, dict) and row.get("Ref") and contact_matches_order(row)]
+        return matches[0] if len(matches) == 1 else None
+
     with db_cursor() as cur:
         cur.execute("SELECT recipient_ref,contact_ref FROM np_recipient_cache WHERE phone=%s", (recipient_phone,))
         recipient_refs = cur.fetchone()
+    if recipient_refs:
+        verified = matching_contact(str(recipient_refs.get("recipient_ref") or ""))
+        if not verified or str(verified.get("Ref") or "") != str(recipient_refs.get("contact_ref") or ""):
+            recipient_refs = None
     if not recipient_refs:
         name_parts = clean_name.split()
         if len(name_parts) < 2:
@@ -14788,11 +14820,13 @@ def _np_create_ttn_for_order(order_id: int) -> dict:
         recipient_ref = str(recipient_rows[0].get("Ref") or "") if recipient_rows else ""
         if not recipient_ref:
             raise NovaPoshtaAPIError("Нова пошта не повернула Ref одержувача.")
-        contacts_result = _np_api("Counterparty", "getCounterpartyContactPersons", {"Ref": recipient_ref})
-        contact_rows = contacts_result.get("data") or []
-        contact_ref = str(contact_rows[0].get("Ref") or "") if contact_rows else ""
+        contact = matching_contact(recipient_ref)
+        contact_ref = str((contact or {}).get("Ref") or "")
         if not contact_ref:
-            raise NovaPoshtaAPIError("Нова пошта не повернула контактну особу одержувача.")
+            raise NovaPoshtaAPIError(
+                "Нова пошта не підтвердила контакт одержувача за ім’ям і телефоном із замовлення. "
+                "ТТН не створено, замовлення збережено для перевірки працівником."
+            )
         with db_cursor() as cur:
             cur.execute("""INSERT INTO np_recipient_cache(phone,recipient_ref,contact_ref)
                            VALUES(%s,%s,%s) ON CONFLICT(phone) DO UPDATE
