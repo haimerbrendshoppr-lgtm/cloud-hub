@@ -831,6 +831,8 @@ CREATE TABLE IF NOT EXISTS customer_checkout_drafts (
 ALTER TABLE customer_checkout_drafts ADD COLUMN IF NOT EXISTS checkout_token TEXT NOT NULL DEFAULT '';
 ALTER TABLE customer_checkout_drafts ADD COLUMN IF NOT EXISTS delivery_slot_id BIGINT REFERENCES delivery_slots(id);
 ALTER TABLE customer_checkout_drafts ADD COLUMN IF NOT EXISTS bonus_amount NUMERIC(12,2) NOT NULL DEFAULT 0;
+ALTER TABLE customer_checkout_drafts ADD COLUMN IF NOT EXISTS np_city_ref TEXT;
+ALTER TABLE customer_checkout_drafts ADD COLUMN IF NOT EXISTS np_warehouse_ref TEXT;
 ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ;
 ALTER TABLE notification_outbox ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS age_verification_status TEXT NOT NULL DEFAULT 'unverified';
@@ -842,6 +844,12 @@ ALTER TABLE customers ADD COLUMN IF NOT EXISTS age_verified_at TIMESTAMPTZ;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT UNIQUE;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS np_city_ref TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS np_warehouse_ref TEXT;
+CREATE TABLE IF NOT EXISTS np_recipient_cache (
+    phone TEXT PRIMARY KEY,
+    recipient_ref TEXT NOT NULL,
+    contact_ref TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS bonus_redeemed NUMERIC(12,2) NOT NULL DEFAULT 0;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12,2) NOT NULL DEFAULT 0;
@@ -1652,6 +1660,9 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
     Courier quote must already be accepted. Nova Poshta freight is deliberately
     excluded from Cloud Hub's delivery_total in accordance with Handoff.
     """
+    phone = normalize_ua_phone(phone)
+    if not phone:
+        raise ValueError("Вкажіть коректний український номер у форматі +380XXXXXXXXX (12 цифр без +).")
     if not idempotency_key or len(idempotency_key) > 120:
         raise ValueError("Некоректний ключ оформлення.")
     if not has_current_privacy_consent(customer_telegram_id, CONFIG.privacy_consent_version):
@@ -1703,8 +1714,10 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
                                  "per_km": str(quote["tariff_per_km"]), "distance_km": str(quote["distance_km"]),
                                  "duration_minutes": str(quote["duration_minutes"]), "price": str(delivery_total)}
         elif delivery_type == "nova_poshta":
-            if not city.strip() or not delivery_branch.strip():
-                raise ValueError("Для Нової пошти вкажіть місто та відділення/поштомат.")
+            if (not city.strip() or not delivery_branch.strip()
+                    or not re.fullmatch(r"[0-9a-fA-F-]{32,64}", str(np_city_ref or ""))
+                    or not re.fullmatch(r"[0-9a-fA-F-]{32,64}", str(np_warehouse_ref or ""))):
+                raise ValueError("Оберіть місто та відділення або поштомат зі списку Нової пошти.")
         selected_slot = None
         if delivery_type.startswith("courier_"):
             if delivery_slot_id is None:
@@ -2635,6 +2648,16 @@ def normalize_text(value: Any) -> str:
 
 def normalize_phone(value: Any) -> str:
     return re.sub(r"\D", "", str(value or ""))
+
+
+def normalize_ua_phone(value: Any) -> Optional[str]:
+    """Normalize a Ukrainian mobile number and reject extra/missing digits."""
+    digits = normalize_phone(value)
+    if len(digits) == 10 and digits.startswith("0"):
+        digits = "38" + digits
+    if len(digits) != 12 or not digits.startswith("380"):
+        return None
+    return digits
 
 
 def similarity(a: str, b: str) -> float:
@@ -4503,7 +4526,7 @@ def customer_info_handler(message):
 # ---------------------------------------------------------------------------
 
 def save_checkout_draft(telegram_id: int, customer_id: int, **fields) -> None:
-    allowed = {"step", "phone", "customer_name", "delivery_type", "city", "delivery_branch", "delivery_address", "delivery_quote_id", "bonus_amount", "delivery_slot_id"}
+    allowed = {"step", "phone", "customer_name", "delivery_type", "city", "delivery_branch", "delivery_address", "delivery_quote_id", "bonus_amount", "delivery_slot_id", "np_city_ref", "np_warehouse_ref"}
     updates = {key: value for key, value in fields.items() if key in allowed}
     with db_cursor() as cur:
         cur.execute("""INSERT INTO customer_checkout_drafts(telegram_id,customer_id,checkout_token)
@@ -4567,7 +4590,8 @@ def continue_checkout_after_consent(chat_id: int, telegram_user) -> None:
         cur.execute("SELECT phone,full_name FROM customers WHERE id=%s", (customer_id,))
         row = cur.fetchone()
     saved_name = _clean_full_name(row["full_name"]) if row and row.get("full_name") else None
-    if row and row.get("phone") and saved_name:
+    saved_phone = normalize_ua_phone(row.get("phone") if row else "")
+    if row and saved_phone and saved_name:
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(types.InlineKeyboardButton("✅ Використати ці дані", callback_data="checkout:reuse:yes"),
                types.InlineKeyboardButton("✏️ Ввести інші", callback_data="checkout:reuse:no"))
@@ -4628,9 +4652,9 @@ def checkout_phone_step(message) -> None:
         _cancel_checkout_flow(message)
         return
     raw_phone = message.contact.phone_number if message.contact and message.contact.user_id == message.from_user.id else (message.text or "")
-    phone = normalize_phone(raw_phone)
-    if not 10 <= len(phone) <= 15:
-        msg = bot.send_message(message.chat.id, "Не схоже на коректний номер. Спробуйте ще раз, наприклад +380XXXXXXXXX.")
+    phone = normalize_ua_phone(raw_phone)
+    if not phone:
+        msg = bot.send_message(message.chat.id, "Номер має містити рівно 12 цифр і починатися з +380. Перевірте номер та надішліть ще раз.")
         bot.register_next_step_handler(msg, checkout_phone_step)
         return
     customer_id = upsert_customer(message.from_user)
@@ -4661,11 +4685,103 @@ def checkout_customer_name_step(message) -> None:
     bot.send_message(message.chat.id, "Дякуємо!", reply_markup=types.ReplyKeyboardRemove())
     send_delivery_choice(message.chat.id)
 
-@bot.callback_query_handler(func=lambda c: c.data in ("checkout:start", "checkout:delivery:courier", "checkout:delivery:np", "checkout:submit"))
+NP_CHECKOUT_CHOICES = {}
+
+
+def _np_checkout_city_search(message) -> None:
+    if _is_cancel_text(message):
+        _cancel_checkout_flow(message)
+        return
+    query = " ".join((message.text or "").split())[:80]
+    if len(query) < 2:
+        msg = bot.send_message(message.chat.id, "Введіть щонайменше дві літери назви міста.")
+        bot.register_next_step_handler(msg, _np_checkout_city_search)
+        return
+    try:
+        rows = (_np_api("Address", "getCities", {"FindByString": query, "Limit": "20"}).get("data") or [])
+        rows = [x for x in rows if x.get("Ref") and x.get("Description")]
+        if not rows:
+            raise ValueError("Місто не знайдено. Спробуйте іншу назву.")
+        NP_CHECKOUT_CHOICES[(message.from_user.id, "cities")] = rows[:8]
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for i, row in enumerate(rows[:8]):
+            title = " · ".join(x for x in (row.get("Description"), row.get("AreaDescription")) if x)
+            kb.add(types.InlineKeyboardButton(title[:60], callback_data=f"checkout:np:city:{i}"))
+        msg = bot.send_message(message.chat.id, "Оберіть місто з довідника Нової пошти:", reply_markup=kb)
+    except Exception as exc:
+        log.warning("Nova Poshta city lookup failed: %s", type(exc).__name__)
+        msg = bot.send_message(message.chat.id, "Не вдалося завантажити довідник Нової пошти. Спробуйте ще раз трохи пізніше; місто вручну вводити не потрібно.")
+        bot.register_next_step_handler(msg, _np_checkout_city_search)
+
+
+def _np_checkout_location_search(message) -> None:
+    if _is_cancel_text(message):
+        _cancel_checkout_flow(message)
+        return
+    query = " ".join((message.text or "").split())[:80]
+    city_ref = (get_checkout_draft(message.from_user.id) or {}).get("np_city_ref")
+    mode = NP_CHECKOUT_CHOICES.get((message.from_user.id, "mode"), "warehouse")
+    if not city_ref:
+        bot.send_message(message.chat.id, "Чернетка вибору міста застаріла. Почніть оформлення ще раз.")
+        return
+    try:
+        rows = (_np_api("Address", "getWarehouses", {"CityRef": city_ref, "FindByString": query, "Limit": "100"}).get("data") or [])
+        is_postomat = mode == "postomat"
+        rows = [x for x in rows if x.get("Ref") and x.get("Description") and
+                ("поштомат" in str(x.get("Description", "")).casefold()) == is_postomat]
+        if not rows:
+            raise ValueError("Пункти за цим запитом не знайдено.")
+        NP_CHECKOUT_CHOICES[(message.from_user.id, "locations")] = rows[:8]
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for i, row in enumerate(rows[:8]):
+            kb.add(types.InlineKeyboardButton(str(row.get("Description"))[:60], callback_data=f"checkout:np:location:{i}"))
+        bot.send_message(message.chat.id, "Оберіть пункт зі списку Нової пошти:", reply_markup=kb)
+    except Exception as exc:
+        log.warning("Nova Poshta location lookup failed: %s", type(exc).__name__)
+        msg = bot.send_message(message.chat.id, "Довідник пунктів тимчасово недоступний або нічого не знайдено. Спробуйте інший пошуковий запит.")
+        bot.register_next_step_handler(msg, _np_checkout_location_search)
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ("checkout:start", "checkout:delivery:courier", "checkout:delivery:np", "checkout:submit") or c.data.startswith("checkout:np:"))
 def customer_checkout_callback(call):
     data = call.data.split(":")
     telegram_id = call.from_user.id
     try:
+        if len(data) == 4 and data[:3] == ["checkout", "np", "city"]:
+            rows = NP_CHECKOUT_CHOICES.get((telegram_id, "cities"), [])
+            index = int(data[3])
+            if index < 0 or index >= len(rows):
+                raise ValueError("Список міст застарів. Почніть вибір ще раз.")
+            row = rows[index]
+            customer_id = upsert_customer(call.from_user)
+            save_checkout_draft(telegram_id, customer_id, city=row["Description"], np_city_ref=row["Ref"],
+                                np_warehouse_ref="", delivery_branch="", step="np_mode")
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            kb.add(types.InlineKeyboardButton("🏢 Відділення", callback_data="checkout:np:mode:warehouse"),
+                   types.InlineKeyboardButton("📮 Поштомат", callback_data="checkout:np:mode:postomat"))
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, f"Місто: {safe(row['Description'])}. Оберіть доставку:", reply_markup=kb)
+            return
+        if len(data) == 4 and data[:3] == ["checkout", "np", "mode"]:
+            if data[3] not in ("warehouse", "postomat"):
+                raise ValueError("Невідомий тип доставки.")
+            NP_CHECKOUT_CHOICES[(telegram_id, "mode")] = data[3]
+            bot.answer_callback_query(call.id)
+            msg = bot.send_message(call.message.chat.id, "Введіть номер або назву відділення/поштомата для пошуку у довіднику.")
+            bot.register_next_step_handler(msg, _np_checkout_location_search)
+            return
+        if len(data) == 4 and data[:3] == ["checkout", "np", "location"]:
+            rows = NP_CHECKOUT_CHOICES.get((telegram_id, "locations"), [])
+            index = int(data[3])
+            if index < 0 or index >= len(rows):
+                raise ValueError("Список пунктів застарів. Введіть запит ще раз.")
+            row = rows[index]
+            customer_id = upsert_customer(call.from_user)
+            save_checkout_draft(telegram_id, customer_id, delivery_type="nova_poshta",
+                                delivery_branch=row["Description"], np_warehouse_ref=row["Ref"], step="confirm")
+            bot.answer_callback_query(call.id)
+            send_checkout_confirmation(call.message.chat.id, telegram_id)
+            return
         if data[1] == "start":
             bot.answer_callback_query(call.id)
             begin_checkout(call.message.chat.id, call.from_user)
@@ -4677,8 +4793,8 @@ def customer_checkout_callback(call):
             return
         if data[1] == "delivery" and data[2] == "np":
             bot.answer_callback_query(call.id)
-            msg = bot.send_message(call.message.chat.id, "Вкажіть місто Нової пошти.")
-            bot.register_next_step_handler(msg, checkout_np_city_step)
+            msg = bot.send_message(call.message.chat.id, "Введіть назву міста Нової пошти, щоб знайти його у офіційному довіднику.")
+            bot.register_next_step_handler(msg, _np_checkout_city_search)
             return
         if data[1] == "submit":
             bot.answer_callback_query(call.id)
@@ -10757,11 +10873,12 @@ def checkout_reuse_callback(call):
                 cur.execute("SELECT phone,full_name FROM customers WHERE id=%s", (customer_id,))
                 row = cur.fetchone()
             name = _clean_full_name(row["full_name"]) if row and row.get("full_name") else None
-            if not (row and row.get("phone") and name):
+            phone = normalize_ua_phone(row.get("phone") if row else "")
+            if not (row and phone and name):
                 save_checkout_draft(uid, customer_id, step="phone")
                 ask_checkout_phone(call.message.chat.id)
                 return
-            save_checkout_draft(uid, customer_id, phone=row["phone"], customer_name=name, step="delivery")
+            save_checkout_draft(uid, customer_id, phone=phone, customer_name=name, step="delivery")
             send_delivery_choice(call.message.chat.id)
         else:
             save_checkout_draft(uid, customer_id, step="phone")
@@ -11541,11 +11658,11 @@ async function add(id){track("add_to_cart",id);if(!authenticated){let p=products
 function cartSnapshotKey(){let id=window.Telegram?.WebApp?.initDataUnsafe?.user?.id;return 'cloudhub.cart.snapshot.v1.'+(id||'web')}function readCartSnapshot(){try{let value=JSON.parse(localStorage.getItem(cartSnapshotKey())||'[]');return Array.isArray(value)?value:[]}catch(e){return []}}function saveCartSnapshot(){try{localStorage.setItem(cartSnapshotKey(),JSON.stringify(cart))}catch(e){}}async function loadCart(force=false){if(!authenticated){cart=guestCart.map(x=>({...x,line_total:Number(x.price)*Number(x.quantity)}));$('cartCount').textContent=cartCount();return true}try{let d=await api('/api/miniapp/cart',{fresh:force,timeoutMs:12000});cart=Array.isArray(d.items)?d.items:[];window.cartStale=false;window.cartLoadError=null;saveCartSnapshot();$('cartCount').textContent=cartCount();return true}catch(e){window.cartLoadError=e;cart=readCartSnapshot();window.cartStale=cart.length>0;$('cartCount').textContent=cartCount();return false}}function changeGuestQuantity(id,delta){let item=guestCart.find(x=>Number(x.variant_id)===Number(id));if(!item)return;let next=Math.min(Number(item.available)||99,item.quantity+delta);if(next<1)guestCart=guestCart.filter(x=>Number(x.variant_id)!==Number(id));else item.quantity=next;saveGuestCart();loadCart().then(showCart)}function renderCartContents(){cart=authenticated?cart:guestCart.map(x=>({...x,line_total:Number(x.price)*Number(x.quantity)}));let total=cart.reduce((sum,x)=>sum+Number(x.line_total||0),0);let note=authenticated?'':'<div class="notice">Кошик збережено в цьому браузері. Увійдіть через Telegram, щоб оформити замовлення.</div>'+telegramPrompt();let warning=window.cartStale?`<div class="notice cart-warning">Показую збережені товари й оновлюю дані з магазину.<button onclick="showCart()">Оновити кошик</button></div>`:'';let rows=cart.length?cart.map(cartRow).join('')+`<section class="cart-summary"><span>Разом</span><strong>${money(total)}</strong>${authenticated?'<button class="primary" onclick="checkoutForm()">Перейти до оформлення</button>':note}</section>`:`<div class="notice">${window.cartLoadError&&authenticated?'Кошик завантажується довше, ніж зазвичай. Спробуйте оновити його.':'Кошик порожній. Додайте товари з каталогу — вони з’являться тут.'}</div>${authenticated?'<button class="primary" onclick="showCart()">Оновити кошик</button>':''}`;$('cart').innerHTML=bannerMarkup('cart_top')+'<h2>Ваш кошик</h2>'+warning+rows;setTimeout(loadProductPhotos,0)}async function showCart(){track('cart_view');setActiveTab('cartBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('cart').classList.remove('hidden');if(!authenticated){window.cartLoadError=null;window.cartStale=false;renderCartContents();return}let snapshot=readCartSnapshot();if(snapshot.length){cart=snapshot;window.cartStale=true;window.cartLoadError=null;renderCartContents()}else{$('cart').innerHTML=bannerMarkup('cart_top')+'<h2>Ваш кошик</h2><div class="notice cart-loading" role="status">Перевіряю ваш кошик…</div>'}let pending=true;let refresh=loadCart(true).then(ok=>{pending=false;if(!$('cart').classList.contains('hidden'))renderCartContents();return ok});setTimeout(()=>{if(pending&&!$('cart').classList.contains('hidden')){if(!cart.length)window.cartLoadError=Error('Кошик ще завантажується');renderCartContents()}},5000);await refresh}async function changeCartQuantity(id,delta){if(!authenticated){changeGuestQuantity(id,delta);return}let item=cart.find(x=>Number(x.variant_id)===Number(id));if(!item)return;let next=Number(item.quantity)+delta;try{await api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:Number(id),quantity:Math.max(0,next)}),timeoutMs:9000});await showCart()}catch(e){msg(e.message)}}
 async function removeCartLine(id){if(!authenticated){guestCart=guestCart.filter(x=>Number(x.variant_id)!==Number(id));saveGuestCart();await loadCart();renderCartContents();return}try{await api('/api/miniapp/cart',{method:'DELETE',body:JSON.stringify({variant_id:Number(id)}),timeoutMs:9000});await showCart()}catch(e){msg(e.message)}}
 let cityTimer=null,branchTimer=null;
-async function suggestCities(){clearTimeout(cityTimer);cityTimer=setTimeout(async()=>{let q=$('npCity')?.value||'';if(q.trim().length<2)return;try{let d=await api('/api/miniapp/np/cities?q='+encodeURIComponent(q));$('cityChoices').innerHTML=(d.items||[]).slice(0,8).map((x,i)=>`<button type="button" onclick="chooseCity(${i})">${esc(x.name)} ${esc(x.area||'')}</button>`).join('');window._npCities=d.items||[]}catch(e){$('cityChoices').textContent='Довідник недоступний. Введіть місто вручну.'}},350)}
+async function suggestCities(){clearTimeout(cityTimer);cityTimer=setTimeout(async()=>{let q=$('npCity')?.value||'';if(q.trim().length<2)return;try{let d=await api('/api/miniapp/np/cities?q='+encodeURIComponent(q));$('cityChoices').innerHTML=(d.items||[]).slice(0,8).map((x,i)=>`<button type="button" onclick="chooseCity(${i})">${esc(x.name)} ${esc(x.area||'')}</button>`).join('');window._npCities=d.items||[]}catch(e){$('cityChoices').textContent='Довідник тимчасово недоступний. Спробуйте пізніше.'}},350)}
 async function chooseCity(i){let c=(window._npCities||[])[i];if(!c)return;$('npCity').value=c.name;npCityRef=c.ref;$('cityChoices').innerHTML='';npWarehouseRef='';$('branchChoices').innerHTML='';suggestBranches()}
-async function suggestBranches(){clearTimeout(branchTimer);branchTimer=setTimeout(async()=>{if(!npCityRef)return;try{let d=await api('/api/miniapp/np/branches?city_ref='+encodeURIComponent(npCityRef));$('branchChoices').innerHTML=(d.items||[]).slice(0,80).map((x,i)=>`<button type="button" onclick="chooseBranch(${i})">${esc(x.name)}</button>`).join('');window._npBranches=d.items||[]}catch(e){$('branchChoices').textContent='Довідник недоступний. Введіть відділення вручну.'}},200)}
+async function suggestBranches(){clearTimeout(branchTimer);branchTimer=setTimeout(async()=>{if(!npCityRef)return;try{let d=await api('/api/miniapp/np/branches?city_ref='+encodeURIComponent(npCityRef));$('branchChoices').innerHTML=(d.items||[]).slice(0,80).map((x,i)=>`<button type="button" onclick="chooseBranch(${i})">${esc(x.name)}</button>`).join('');window._npBranches=d.items||[]}catch(e){$('branchChoices').textContent='Довідник тимчасово недоступний. Спробуйте пізніше.'}},200)}
 function chooseBranch(i){let b=(window._npBranches||[])[i];if(!b)return;$('npBranch').value=b.name;npWarehouseRef=b.ref;$('branchChoices').innerHTML=''}
-async function checkoutForm(){track("checkout_start");let d=await api('/api/miniapp/profile');checkoutKey=(window.crypto?.randomUUID?crypto.randomUUID():('ch_'+Date.now()+'_'+Math.random().toString(16).slice(2)));$('cart').innerHTML=`<h2>Оформлення замовлення</h2><div class="formgrid"><input id="buyerName" placeholder="Ім’я та прізвище" value="${esc(d.full_name||'')}"><input id="buyerPhone" placeholder="Телефон +380…" value="${esc(d.phone||'')}"><div class="notice">Доступно бонусів: <b>${money(d.bonus_available||0)}</b>. Можна покрити ними до 100% вартості товарів.</div><input id="bonusAmount" type="number" min="0" step="0.01" max="${Number(d.bonus_available||0)}" value="0" placeholder="Списати бонусів"><input id="certificateCode" maxlength="40" placeholder="Сертифікат (за наявності)"><input id="npCity" placeholder="Місто Нової пошти (можна вручну)" autocomplete="off"><div id="cityChoices"></div><input id="npBranch" placeholder="Відділення або поштомат (можна вручну)" autocomplete="off"><div id="branchChoices"></div><small>Якщо номінал сертифіката більший за вартість товарів після бонусів, залишок зарахуємо на бонусний рахунок.</small><small>Можна вибрати місто й відділення з довідника Нової пошти або ввести вручну. Якщо API не працює, замовлення все одно оформлюється.</small><label class="check"><input type="checkbox" id="privacyOk"> Погоджуюся з обробкою даних, необхідних для оформлення та доставки замовлення.</label><button onclick="submitOrder()" class="primary">Підтвердити замовлення</button><button onclick="showCart()">Назад до кошика</button></div>`;$('npCity').addEventListener('input',()=>{npCityRef='';npWarehouseRef='';suggestCities()});$('npBranch').addEventListener('input',()=>{npWarehouseRef='';suggestBranches()})}
+async function checkoutForm(){track("checkout_start");let d=await api('/api/miniapp/profile');checkoutKey=(window.crypto?.randomUUID?crypto.randomUUID():('ch_'+Date.now()+'_'+Math.random().toString(16).slice(2)));$('cart').innerHTML=`<h2>Оформлення замовлення</h2><div class="formgrid"><input id="buyerName" placeholder="Ім’я та прізвище" value="${esc(d.full_name||'')}"><input id="buyerPhone" placeholder="Телефон +380…" value="${esc(d.phone||'')}"><div class="notice">Доступно бонусів: <b>${money(d.bonus_available||0)}</b>. Можна покрити ними до 100% вартості товарів.</div><input id="bonusAmount" type="number" min="0" step="0.01" max="${Number(d.bonus_available||0)}" value="0" placeholder="Списати бонусів"><input id="certificateCode" maxlength="40" placeholder="Сертифікат (за наявності)"><input id="npCity" placeholder="Місто Нової пошти — оберіть зі списку" autocomplete="off"><div id="cityChoices"></div><input id="npBranch" placeholder="Відділення або поштомат — оберіть зі списку" autocomplete="off"><div id="branchChoices"></div><small>Якщо номінал сертифіката більший за вартість товарів після бонусів, залишок зарахуємо на бонусний рахунок.</small><small>Оберіть місто й пункт доставки з офіційного довідника Нової пошти. Якщо довідник тимчасово недоступний, оформлення можна повторити трохи пізніше.</small><label class="check"><input type="checkbox" id="privacyOk"> Погоджуюся з обробкою даних, необхідних для оформлення та доставки замовлення.</label><button onclick="submitOrder()" class="primary">Підтвердити замовлення</button><button onclick="showCart()">Назад до кошика</button></div>`;$('npCity').addEventListener('input',()=>{npCityRef='';npWarehouseRef='';suggestCities()});$('npBranch').addEventListener('input',()=>{npWarehouseRef='';suggestBranches()})}
 async function submitOrder(){let body={name:$('buyerName').value,phone:$('buyerPhone').value,city:$('npCity').value,branch:$('npBranch').value,city_ref:npCityRef,warehouse_ref:npWarehouseRef,bonus_amount:$('bonusAmount').value,certificate_code:$('certificateCode').value,privacy_accepted:$('privacyOk').checked,idempotency_key:checkoutKey};try{let d=await api('/api/miniapp/checkout',{method:'POST',body:JSON.stringify(body)});$('cart').innerHTML=`<div class="success-wrap"><div class="success-mark"><svg viewBox="0 0 48 48"><path d="M10 25l9 9L38 14"/></svg></div><h2>Дякуємо за замовлення!</h2><div class="thanks">Ваше замовлення успішно оформлено</div><div class="success-order">${esc(d.order_number)}</div><div class="notice"><b>До сплати: ${money(d.grand_total)}</b><br>Нова пошта: ${esc(body.city)} / ${esc(body.branch)}${Number(d.certificate_remainder_bonus||0)>0?`<br>Залишок сертифіката зараховано бонусами: ${money(d.certificate_remainder_bonus)}`:''}<br>ТТН створюється автоматично. Якщо сервіс перевізника тимчасово недоступний, замовлення вже збережене, а ТТН буде оброблена окремо.</div><button class="primary" onclick="loadЗамовлення()">Мої замовлення</button><button onclick="renderProducts()">Повернутися до каталогу</button></div>`;playUiSound('success');document.querySelector('.success-wrap')?.classList.add('celebrate');catCelebrate();await loadCart()}catch(e){msg(e.message)}}
 
 async function loadЗамовлення(){track('orders_view');setActiveTab('ordersBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');if(!authenticated){$('orders').innerHTML='<h2>Замовлення</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small>${o.ttn?`<div class="notice">ТТН: <b>${esc(o.ttn)}</b><br>Статус Нової пошти: ${esc(o.tracking_status||'Ще не оновлювався')}<br><small>Оновлено: ${esc(o.tracking_updated_at||'—')}</small><button onclick="refreshTracking('${esc(o.order_number)}')">Оновити статус доставки</button></div>`:''}${o.status_history?.length?`<details><summary>Історія статусів</summary><ul>${o.status_history.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></details>`:''}</div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
@@ -12385,8 +12502,8 @@ def website_quick_order():
             return jsonify({"error": "Оберіть товар і підтвердьте, що вам є 18 років."}), 400
         if body.get("privacy_accepted") is not True:
             return jsonify({"error": "Для запиту потрібна згода на обробку контактних даних."}), 400
-        phone = normalize_phone(contact_raw)
-        if 10 <= len(phone) <= 15:
+        phone = normalize_ua_phone(contact_raw)
+        if phone:
             contact = phone
         else:
             telegram_name = contact_raw.lstrip("@").strip()
@@ -13139,7 +13256,7 @@ def miniapp_checkout():
     try:
         user = _miniapp_auth_user(); body = request.get_json(silent=True) or {}
         name = _clean_full_name(body.get("name"))
-        phone = normalize_phone(str(body.get("phone") or ""))
+        phone = normalize_ua_phone(str(body.get("phone") or ""))
         city = " ".join(str(body.get("city") or "").split())[:100]
         branch = " ".join(str(body.get("branch") or "").split())[:160]
         certificate_code = " ".join(str(body.get("certificate_code") or "").split()).upper()[:40]
@@ -13152,8 +13269,8 @@ def miniapp_checkout():
             return jsonify({"error": "Сума списання бонусів має бути від 0 до 100000."}), 400
         idem = str(body.get("idempotency_key") or "").strip()
         if not name: return jsonify({"error":"Вкажіть ім’я та прізвище отримувача."}),400
-        if not 10 <= len(phone) <= 15: return jsonify({"error":"Перевірте номер телефону."}),400
-        if not city or not branch: return jsonify({"error":"Вкажіть місто та відділення/поштомат. Їх можна ввести вручну."}),400
+        if not phone: return jsonify({"error":"Вкажіть український номер у форматі +380XXXXXXXXX (рівно 12 цифр без +)."}),400
+        if not city or not branch: return jsonify({"error":"Оберіть місто та відділення/поштомат у довіднику Нової пошти."}),400
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,120}", idem): return jsonify({"error":"Не вдалося підтвердити запит. Натисніть оформлення ще раз."}),400
         if not body.get("privacy_accepted") and not has_current_privacy_consent(user.id, CONFIG.privacy_consent_version):
             return jsonify({"error":"Потрібно підтвердити згоду на обробку даних."}),400
@@ -13162,7 +13279,7 @@ def miniapp_checkout():
         customer_id = upsert_customer(user)
         with db_cursor() as cur:
             cur.execute("UPDATE customers SET full_name=%s,phone=%s,updated_at=NOW() WHERE id=%s", (name, phone, customer_id))
-        # Important: do not call NP API here. Manual city/branch is accepted even if NP is down.
+        # Keep checkout independent from waybill API availability; directory refs are validated before saving.
         city_ref = str(body.get("city_ref") or "")[:80]
         warehouse_ref = str(body.get("warehouse_ref") or "")[:80]
         result = checkout_cart(user.id, customer_id, name, phone, "nova_poshta", idem,
@@ -14314,7 +14431,8 @@ def miniapp_np_cities():
     try:
         _miniapp_auth_user()
         if not CONFIG.nova_poshta_api_key:
-            return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": True}), 200
+            return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": False,
+                            "notice": "Довідник Нової пошти тимчасово недоступний. Спробуйте пізніше."}), 200
         query = (request.args.get("q") or "").strip()[:80]
         if len(query) < 2:
             return jsonify({"items": []})
@@ -14329,7 +14447,7 @@ def miniapp_np_cities():
         return jsonify({"error": str(exc)}), 401
     except Exception:
         log.exception("Nova Poshta city directory failed")
-        return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": True, "notice": "Довідник тимчасово недоступний. Введіть місто вручну."}), 200
+        return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": False, "notice": "Довідник тимчасово недоступний. Спробуйте пізніше."}), 200
 
 
 @miniapp.get("/api/miniapp/np/branches")
@@ -14337,7 +14455,8 @@ def miniapp_np_branches():
     try:
         _miniapp_auth_user()
         if not CONFIG.nova_poshta_api_key:
-            return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": True}), 200
+            return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": False,
+                            "notice": "Довідник Нової пошти тимчасово недоступний. Спробуйте пізніше."}), 200
         city_ref = (request.args.get("city_ref") or "").strip()
         if not re.fullmatch(r"[0-9a-fA-F-]{20,64}", city_ref):
             return jsonify({"error": "Оберіть місто зі списку Нової пошти."}), 400
@@ -14352,7 +14471,7 @@ def miniapp_np_branches():
         return jsonify({"error": str(exc)}), 401
     except Exception:
         log.exception("Nova Poshta branch directory failed")
-        return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": True, "notice": "Довідник тимчасово недоступний. Введіть відділення вручну."}), 200
+        return jsonify({"items": [], "directory_available": False, "manual_entry_allowed": False, "notice": "Довідник тимчасово недоступний. Спробуйте пізніше."}), 200
 
 
 
@@ -14493,22 +14612,51 @@ def _np_create_ttn_for_order(order_id: int) -> dict:
     else:
         weight, length, width, height = Decimal("1.5"), 25, 25, 7
 
-    # If the buyer used the official directory, use stable refs. For manual entry,
-    # the API's documented string-recipient mode is used instead.
+    if (not re.fullmatch(r"[0-9a-fA-F-]{32,64}", str(order.get("np_city_ref") or ""))
+            or not re.fullmatch(r"[0-9a-fA-F-]{32,64}", str(order.get("np_warehouse_ref") or ""))):
+        raise NovaPoshtaAPIError("У замовленні немає вибраних зі довідника Нової пошти міста та відділення/поштомата.")
+    # Resolve stable Nova Poshta recipient/contact refs once and reuse them on retries.
+    clean_name = _clean_full_name(order["customer_name_snapshot"])
+    if not clean_name:
+        raise NovaPoshtaAPIError("Для ТТН потрібні коректні ім’я та прізвище одержувача.")
+    with db_cursor() as cur:
+        cur.execute("SELECT recipient_ref,contact_ref FROM np_recipient_cache WHERE phone=%s", (recipient_phone,))
+        recipient_refs = cur.fetchone()
+    if not recipient_refs:
+        name_parts = clean_name.split()
+        if len(name_parts) < 2:
+            raise NovaPoshtaAPIError("Для ТТН потрібні ім’я та прізвище одержувача.")
+        recipient_result = _np_api("Counterparty", "save", {
+            "FirstName": name_parts[0],
+            "MiddleName": name_parts[1] if len(name_parts) > 2 else "",
+            "LastName": name_parts[-1],
+            "Phone": recipient_phone,
+            "Email": "",
+            "CounterpartyType": "PrivatePerson",
+            "CounterpartyProperty": "Recipient",
+        })
+        recipient_rows = recipient_result.get("data") or []
+        recipient_ref = str(recipient_rows[0].get("Ref") or "") if recipient_rows else ""
+        if not recipient_ref:
+            raise NovaPoshtaAPIError("Нова пошта не повернула Ref одержувача.")
+        contacts_result = _np_api("Counterparty", "getCounterpartyContactPersons", {"Ref": recipient_ref})
+        contact_rows = contacts_result.get("data") or []
+        contact_ref = str(contact_rows[0].get("Ref") or "") if contact_rows else ""
+        if not contact_ref:
+            raise NovaPoshtaAPIError("Нова пошта не повернула контактну особу одержувача.")
+        with db_cursor() as cur:
+            cur.execute("""INSERT INTO np_recipient_cache(phone,recipient_ref,contact_ref)
+                           VALUES(%s,%s,%s) ON CONFLICT(phone) DO UPDATE
+                           SET recipient_ref=EXCLUDED.recipient_ref,contact_ref=EXCLUDED.contact_ref,updated_at=NOW()
+                           RETURNING recipient_ref,contact_ref""", (recipient_phone, recipient_ref, contact_ref))
+            recipient_refs = cur.fetchone()
     recipient = {
         "RecipientsPhone": recipient_phone,
-        "RecipientName": str(order["customer_name_snapshot"] or "").strip()[:100],
+        "RecipientName": clean_name,
+        "Recipient": recipient_refs["recipient_ref"],
+        "ContactRecipient": recipient_refs["contact_ref"],
     }
-    if order.get("np_city_ref") and order.get("np_warehouse_ref"):
-        recipient.update({
-            "CityRecipient": order["np_city_ref"],
-            "RecipientAddress": order["np_warehouse_ref"],
-        })
-    else:
-        recipient.update({
-            "RecipientCityName": str(order["city"] or "").strip()[:100],
-            "RecipientAddressName": str(order["delivery_branch"] or "").strip()[:160],
-        })
+    recipient.update({"CityRecipient": order["np_city_ref"], "RecipientAddress": order["np_warehouse_ref"]})
 
     props = {
         "PayerType": CONFIG.nova_poshta_payer_type,
@@ -14519,14 +14667,14 @@ def _np_create_ttn_for_order(order_id: int) -> dict:
         # array whose seat keys are lowerCamelCase (weight, volumetricWidth,
         # volumetricLength, volumetricHeight). Dimensions are centimeters.
         # Do not send a derived volume: NP calculates it from the three dimensions.
-        "OptionsSeat": json.dumps([{
+        "OptionsSeat": [{
             "weight": str(weight),
             "volumetricWidth": str(width),
             "volumetricLength": str(length),
             "volumetricHeight": str(height),
-        }], ensure_ascii=False, separators=(",", ":")),
+        }],
         "ServiceType": "WarehouseWarehouse",
-        "SeatsAmount": "1",
+        "SeatsAmount": 1,
         "Description": "Ароматичні добавки",
         "Cost": str(max(1, int(declared_value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)))),
         "CitySender": CONFIG.nova_poshta_sender_city_ref,
