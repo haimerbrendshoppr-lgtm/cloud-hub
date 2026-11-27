@@ -1009,6 +1009,36 @@ pool: Optional[ConnectionPool] = None
 consent_pool: Optional[ConnectionPool] = None
 
 
+def _merge_root_category(cur, source_id: int, target_id: int) -> dict:
+    """Move one legacy root and its subtree onto the emoji-named canonical root."""
+    if int(source_id) == int(target_id):
+        return {"products": 0, "children": 0}
+    cur.execute("SELECT id,name,active FROM categories WHERE id=%s FOR UPDATE", (source_id,))
+    source = cur.fetchone()
+    cur.execute("SELECT id,name FROM categories WHERE id=%s FOR UPDATE", (target_id,))
+    target = cur.fetchone()
+    if not source or not target:
+        raise RuntimeError("Не вдалося знайти категорію для об’єднання.")
+    if not source["active"]:
+        return {"products": 0, "children": 0}
+    cur.execute("UPDATE products SET category_id=%s,updated_at=NOW() WHERE category_id=%s", (target_id, source_id))
+    moved_products = cur.rowcount
+    cur.execute("""INSERT INTO brand_categories(brand_id,category_id)
+                   SELECT brand_id,%s FROM brand_categories WHERE category_id=%s
+                   ON CONFLICT(brand_id,category_id) DO NOTHING""", (target_id, source_id))
+    cur.execute("DELETE FROM brand_categories WHERE category_id=%s", (source_id,))
+    cur.execute("UPDATE categories SET parent_id=%s WHERE parent_id=%s", (target_id, source_id))
+    moved_children = cur.rowcount
+    cur.execute("UPDATE categories SET active=FALSE WHERE id=%s", (source_id,))
+    cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,before_data,after_data)
+                   VALUES(NULL,'system','catalog.root_category_migrated','category',%s,%s::jsonb,%s::jsonb)""",
+                (str(source_id), json_dumps({"name": source["name"], "active": source["active"]}),
+                 json_dumps({"name": source["name"], "active": False, "merged_into_id": int(target_id),
+                             "merged_into_name": target["name"], "products_moved": moved_products,
+                             "children_reparented": moved_children})))
+    return {"products": moved_products, "children": moved_children}
+
+
 def init_db() -> None:
     global pool, consent_pool
     os.makedirs(os.path.join(CONFIG.data_dir, "media"), exist_ok=True)
@@ -1070,11 +1100,21 @@ def init_db() -> None:
             cur.execute("ALTER TABLE orders ALTER COLUMN payment_method SET DEFAULT 'control_payment'")
             cur.execute(
                 """INSERT INTO categories(name,parent_id,sort_order) VALUES
-                   ('Рідини',NULL,10),('Под-системи',NULL,20),
-                   ('Картриджі',NULL,30),('Інше',NULL,40)
+                   ('Рідини 🔥',NULL,10),('Под-системи 💨',NULL,20),
+                   ('Картриджі 😉',NULL,30),('Інше',NULL,40)
                    ON CONFLICT(name) DO UPDATE SET
                      parent_id=NULL,sort_order=EXCLUDED.sort_order,active=TRUE"""
             )
+            # One-time, idempotent consolidation: legacy no-emoji root IDs are
+            # preserved as archived history, while products, brands and child
+            # categories move to the public emoji-named roots.
+            for old_name, new_name in ROOT_CATEGORY_MIGRATIONS:
+                cur.execute("SELECT id FROM categories WHERE name=%s AND parent_id IS NULL", (old_name,))
+                old_root = cur.fetchone()
+                cur.execute("SELECT id FROM categories WHERE name=%s AND parent_id IS NULL", (new_name,))
+                new_root = cur.fetchone()
+                if old_root and new_root:
+                    _merge_root_category(cur, int(old_root["id"]), int(new_root["id"]))
             cur.execute(
                 """
                 INSERT INTO staff (telegram_id, display_name, role)
@@ -7410,7 +7450,8 @@ def customer_delivery_np_callback(call):
 
 CATALOG_WIZARDS: dict[int, dict[str, Any]] = {}
 CATALOG_PAGE_SIZE = 8
-ROOT_DEPARTMENT_ORDER = ("Рідини", "Под-системи", "Картриджі", "Інше")
+ROOT_CATEGORY_MIGRATIONS = (("Рідини", "Рідини 🔥"), ("Под-системи", "Под-системи 💨"), ("Картриджі", "Картриджі 😉"))
+ROOT_DEPARTMENT_ORDER = ("Рідини 🔥", "Под-системи 💨", "Картриджі 😉", "Інше")
 
 
 def catalog_actor(message_or_call, permission: str = "catalog.read") -> Optional[Staff]:
