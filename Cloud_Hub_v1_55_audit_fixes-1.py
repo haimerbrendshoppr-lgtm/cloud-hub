@@ -357,6 +357,9 @@ CREATE TABLE IF NOT EXISTS customers (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS blocked_by BIGINT;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS block_reason TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS miniapp_web_login_challenges (
     token_hash TEXT PRIMARY KEY,
@@ -1258,6 +1261,18 @@ def upsert_customer(telegram_user) -> int:
         return customer_id
 
 
+def customer_block_status(telegram_id: int) -> Optional[dict]:
+    with db_cursor() as cur:
+        cur.execute("SELECT blocked_at,block_reason FROM customers WHERE telegram_id=%s", (int(telegram_id),))
+        row = cur.fetchone()
+    return row if row and row.get("blocked_at") else None
+
+
+def ensure_customer_not_blocked(telegram_id: int) -> None:
+    if customer_block_status(telegram_id):
+        raise PermissionError("Доступ до замовлень і підтримки призупинено. Напишіть нам, щоб уточнити деталі.")
+
+
 def set_customer_phone(customer_id: int, phone: str) -> None:
     digits = normalize_phone(phone)
     if len(digits) < 10 or len(digits) > 15:
@@ -1754,6 +1769,7 @@ def post_supply_document(supply_id: int, actor: Staff) -> dict:
 
 
 def add_to_cart(customer_telegram_id: int, variant_id: int, quantity: int = 1) -> None:
+    ensure_customer_not_blocked(customer_telegram_id)
     if quantity < 1 or quantity > 99:
         raise ValueError("Кількість має бути від 1 до 99.")
     with db_cursor() as cur:
@@ -1814,6 +1830,7 @@ def checkout_cart(customer_telegram_id: int, customer_id: int, customer_name: st
     Courier quote must already be accepted. Nova Poshta freight is deliberately
     excluded from Cloud Hub's delivery_total in accordance with Handoff.
     """
+    ensure_customer_not_blocked(customer_telegram_id)
     phone = normalize_ua_phone(phone)
     if not phone:
         raise ValueError("Вкажіть коректний український номер у форматі +380XXXXXXXXX (12 цифр без +).")
@@ -2337,6 +2354,7 @@ def expire_loyalty_lots() -> Decimal:
 
 
 def create_support_ticket(customer_telegram_id: int, body: str, order_id: Optional[int] = None) -> int:
+    ensure_customer_not_blocked(customer_telegram_id)
     body = body.strip()
     if not body or len(body) > 4000:
         raise ValueError("Повідомлення має містити від 1 до 4000 символів.")
@@ -3574,7 +3592,7 @@ OWNER_SECTIONS = [
     ("🚚 Доставка", "delivery"), ("📊 Статистика", "statistics"),
     ("👥 Клієнти", "customers"), ("💰 Фінанси", "finance"),
     ("🎁 Лояльність", "loyalty"), ("📣 Розсилки", "broadcasts"),
-    ("🎫 Підтримка", "support"), ("🛡️ Безпека", "security"),
+    ("🎫 Підтримка", "support"), ("⭐ Відгуки", "reviews"), ("🛡️ Безпека", "security"),
 ]
 
 SECTION_PERMISSIONS = {
@@ -3583,7 +3601,7 @@ SECTION_PERMISSIONS = {
     "statistics": "statistics.read", "customers": "customers.read",
     "finance": "finance.read", "loyalty": "loyalty.read",
     "broadcasts": "broadcasts.read", "support": "support.read",
-    "security": "security.read",
+    "reviews": "customers.read", "security": "security.read",
 }
 
 
@@ -3596,8 +3614,8 @@ def main_menu(staff: Staff) -> types.ReplyKeyboardMarkup:
         return kb
     role_sections = {
         "courier": ["🚚 Доставка", "🛍️ Замовлення"],
-        "admin": ["🗂️ Каталог", "🛍️ Замовлення", "📦 Склад", "🚚 Доставка", "👥 Клієнти", "🎫 Підтримка"],
-        "manager": ["🛍️ Замовлення", "🚚 Доставка", "👥 Клієнти", "🎫 Підтримка"],
+        "admin": ["🗂️ Каталог", "🛍️ Замовлення", "📦 Склад", "🚚 Доставка", "👥 Клієнти", "🎫 Підтримка", "⭐ Відгуки клієнтів"],
+        "manager": ["🛍️ Замовлення", "🚚 Доставка", "👥 Клієнти", "🎫 Підтримка", "⭐ Відгуки клієнтів"],
         "packer": ["🛍️ Замовлення", "📦 Склад"],
     }
     labels = role_sections.get(staff.role, ["🛍️ Замовлення"])
@@ -4443,6 +4461,7 @@ def customer_quick_order_callback(call):
         if action == "buy" and len(parts) == 3:
             variant_id = int(parts[2])
             user = call.from_user
+            ensure_customer_not_blocked(int(user.id))
             upsert_customer(user)
             telegram_id = int(user.id)
             bot.send_chat_action(call.message.chat.id, "typing")
@@ -4626,8 +4645,62 @@ def render_customer_reviews(chat_id: int, telegram_id: int) -> None:
 
 @bot.message_handler(func=lambda m: m.text == "⭐ Відгуки")
 def customer_reviews_handler(message):
-    upsert_customer(message.from_user)
-    render_customer_reviews(message.chat.id, message.from_user.id)
+    try:
+        upsert_customer(message.from_user)
+        render_customer_reviews(message.chat.id, message.from_user.id)
+    except Exception:
+        log.exception("Customer review menu failed telegram_id=%s", message.from_user.id)
+        bot.send_message(message.chat.id, "Не вдалося завантажити відгуки. Спробуйте ще раз трохи пізніше.",
+                         reply_markup=customer_menu())
+
+
+def render_staff_reviews(chat_id: int, staff: Staff) -> None:
+    if not staff.can("customers.read"):
+        bot.send_message(chat_id, "⛔ Перегляд відгуків недоступний для вашої ролі.", reply_markup=main_menu(staff))
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute("""SELECT r.id,r.order_id,r.rating,r.comment,r.created_at,
+                                  o.order_number,c.full_name,c.username,c.phone,c.telegram_id
+                           FROM order_reviews r JOIN orders o ON o.id=r.order_id
+                           LEFT JOIN customers c ON c.telegram_id=r.customer_telegram_id
+                           ORDER BY r.created_at DESC,r.id DESC LIMIT 30""")
+            rows = list(cur.fetchall())
+        if not rows:
+            bot.send_message(chat_id, "⭐ Відгуків ще немає.", reply_markup=main_menu(staff))
+            return
+        chunks = []
+        current = "⭐ <b>Відгуки клієнтів · останні 30</b>"
+        for row in rows:
+            name = row.get("full_name") or "Клієнт"
+            username = f" · @{row['username']}" if row.get("username") else ""
+            comment = (row.get("comment") or "").strip()
+            stamp = row["created_at"].astimezone(ZoneInfo(CONFIG.timezone)).strftime("%d.%m %H:%M") if row.get("created_at") else ""
+            entry = f"\n\n<b>#{safe(row.get('order_number') or row['order_id'])} · {'⭐' * int(row['rating'])}</b> · {safe(name)}{safe(username)} · {stamp}"
+            if comment:
+                entry += f"\n{safe(comment[:500])}"
+            if len(current) + len(entry) > 3300:
+                chunks.append(current)
+                current = "⭐ <b>Відгуки клієнтів · продовження</b>" + entry
+            else:
+                current += entry
+        if current:
+            chunks.append(current)
+        for index, chunk in enumerate(chunks):
+            bot.send_message(chat_id, chunk, parse_mode="HTML",
+                             reply_markup=main_menu(staff) if index == len(chunks)-1 else None)
+    except Exception:
+        log.exception("Staff review list failed telegram_id=%s", staff.telegram_id)
+        bot.send_message(chat_id, "Не вдалося завантажити відгуки. Спробуйте ще раз.", reply_markup=main_menu(staff))
+
+
+@bot.message_handler(func=lambda m: m.text == "⭐ Відгуки клієнтів")
+def staff_reviews_handler(message):
+    staff = require_staff(message)
+    if not staff:
+        bot.reply_to(message, "⛔ Доступ заборонено.")
+        return
+    render_staff_reviews(message.chat.id, staff)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("custorder:"))
@@ -5647,6 +5720,10 @@ def cmd_start(message):
             reply_markup=main_menu(staff),
         )
         return
+    blocked = customer_block_status(message.from_user.id)
+    if blocked:
+        bot.send_message(message.chat.id, "Доступ до замовлень і підтримки призупинено. Напишіть власнику Cloud Hub, щоб уточнити деталі.")
+        return
     customer_id = upsert_customer(message.from_user)
     # Deep-link referrals are attributed once per new customer; self-referrals and
     # attempts to replace an existing inviter are ignored.
@@ -5742,6 +5819,9 @@ def owner_section_menu(message):
             broadcast_home(message.chat.id)
         else:
             bot.reply_to(message, "⛔ Розсилки доступні лише власнику.")
+        return
+    if section == "reviews":
+        render_staff_reviews(message.chat.id, staff)
         return
     render_staff_section(message.chat.id, staff, section)
 
@@ -11892,7 +11972,8 @@ def send_owner_delivery_slot_reminder():
 BONUS_ADJUST_PENDING = {}
 
 
-@bot.message_handler(func=lambda m: bool(m.text) and not m.text.lstrip().startswith("/"), content_types=["text"])
+@bot.message_handler(func=lambda m: bool(m.text) and not m.text.lstrip().startswith("/")
+                     and m.text not in {"⭐ Відгуки", "⭐ Відгуки клієнтів"}, content_types=["text"])
 def fallback(message):
     # Staff may paste a one-time access phrase anywhere in the bot chat.
     try:
@@ -12060,7 +12141,7 @@ async function optimizeProductPhoto(file){if(!file||!file.type.startsWith('image
 async function uploadStaffPhoto(btn){let c=btn.closest('[data-product]'),file=c.querySelector('[data-field=photo]').files[0];if(!file){msg('Оберіть файл фото');return}try{let optimized=await optimizeProductPhoto(file),form=new FormData();form.append('photo',optimized);let r=await fetch(`/api/miniapp/staff/catalog/${c.dataset.product}/photo`,{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:form}),d=await r.json();if(!r.ok)throw Error(d.error||'Помилка завантаження');msg(optimized!==file?`Фото оптимізовано (${Math.round(optimized.size/1024)} КБ) і завантажено`:'Фото додано до товару');await loadStaffCatalog()}catch(e){msg(e.message)}}
 async function adjustStaffStock(btn){let c=btn.closest('[data-product]');try{let d=await api(`/api/miniapp/staff/catalog/variants/${c.dataset.variant}/stock`,{method:'POST',body:JSON.stringify({delta:c.querySelector('[data-field=delta]').value,reason:c.querySelector('[data-field=stockReason]').value})});msg(`Залишок оновлено: ${d.stock_qty}`);await loadStaffCatalog()}catch(e){msg(e.message)}}
 async function searchStaffCustomers(){let q=prompt('Картка клієнта: ім’я, телефон, номер картки або Telegram ID')||'';if(q.trim().length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=d.items.map(c=>`<button class="card" onclick="openStaffКлієнт(${c.id})"><b>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</b><br><small>${esc(c.phone||'Немає телефону')} · картка ${esc(c.loyalty_card_number||'—')}</small><br><small>Бонуси ${money(c.bonus_available)} · замовлень ${c.order_count} · на суму ${money(c.lifetime_value)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
-async function openStaffКлієнт(id){try{let d=await api(`/api/miniapp/staff/customers/${id}`),c=d.customer;$('staffContent').innerHTML=`<button onclick="searchStaffCustomers()">← До пошуку</button><div class="card"><h3>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</h3><p>Телефон: ${esc(c.phone||'—')}<br>Telegram: ${esc(c.telegram_id||'—')} · @${esc(c.username||'—')}<br>Картка: ${esc(c.loyalty_card_number||'—')}<br>Доступні бонуси: ${money(c.bonus_available)} · Очікують: ${money(c.bonus_pending)}</p>${canAdjustLoyalty?`<h4>Коригування бонусів</h4><div class="formgrid"><input id="staffBonusAmount-${id}" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума бонусів"><input id="staffBonusReason-${id}" maxlength="250" placeholder="Причина — її побачить клієнт"></div><div class="toolbar"><button class="primary" onclick="adjustStaffLoyalty(${id},'earn')">Нарахувати</button><button onclick="adjustStaffLoyalty(${id},'redeem')">Списати</button></div>`:''}<h4>Замовлення</h4>${d.orders.map(o=>`<div class="notice">${esc(o.order_number)} · ${esc(o.status)} · ${money(o.grand_total)} · ${esc(o.created_at||'')}</div>`).join('')||'Немає замовлень'}<h4>Бонусний журнал</h4>${d.loyalty.map(x=>`<div class="notice">${esc(x.transaction_type)} ${money(x.amount)} · ${esc(x.state)} · ${esc(x.reason||'')}</div>`).join('')||'Операцій немає'}</div>`}catch(e){msg(e.message)}}
+async function openStaffКлієнт(id){try{let d=await api(`/api/miniapp/staff/customers/${id}`),c=d.customer;$('staffContent').innerHTML=`<button onclick="searchStaffCustomers()">← До пошуку</button><div class="card"><h3>${esc(c.full_name||[c.first_name,c.last_name].filter(Boolean).join(' ')||'Клієнт')}</h3><p>Телефон: ${esc(c.phone||'—')}<br>Telegram: ${esc(c.telegram_id||'—')} · @${esc(c.username||'—')}<br>Картка: ${esc(c.loyalty_card_number||'—')}<br>Доступні бонуси: ${money(c.bonus_available)} · Очікують: ${money(c.bonus_pending)}</p><h4>Клієнтський доступ · ${c.blocked_at?'заблокований':'активний'}</h4>${c.blocked_at&&c.block_reason?`<div class="notice">Причина: ${esc(c.block_reason)}</div>`:''}<button onclick="staffToggleCustomerBlock(${id},${Boolean(c.blocked_at)})">${c.blocked_at?'Розблокувати':'Заблокувати клієнта'}</button><h4>Особисте повідомлення в Telegram</h4><textarea id="staffCustomerMessage-${id}" maxlength="4000" placeholder="Текст повідомлення"></textarea><button class="primary" onclick="staffSendCustomerMessage(${id})">Надіслати клієнту</button>${canAdjustLoyalty?`<h4>Коригування бонусів</h4><div class="formgrid"><input id="staffBonusAmount-${id}" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума бонусів"><input id="staffBonusReason-${id}" maxlength="250" placeholder="Причина — її побачить клієнт"></div><div class="toolbar"><button class="primary" onclick="adjustStaffLoyalty(${id},'earn')">Нарахувати</button><button onclick="adjustStaffLoyalty(${id},'redeem')">Списати</button></div>`:''}<h4>Замовлення</h4>${d.orders.map(o=>`<div class="notice">${esc(o.order_number)} · ${esc(o.status)} · ${money(o.grand_total)} · ${esc(o.created_at||'')}</div>`).join('')||'Немає замовлень'}<h4>Бонусний журнал</h4>${d.loyalty.map(x=>`<div class="notice">${esc(x.transaction_type)} ${money(x.amount)} · ${esc(x.state)} · ${esc(x.reason||'')}</div>`).join('')||'Операцій немає'}</div>`}catch(e){msg(e.message)}}
 let quickOrderCityCache={},quickOrderBranchCache={};
 async function findQuickOrderCities(id){let q=$(`quick-city-${id}`)?.value?.trim()||'';if(q.length<2){msg('Введіть назву міста');return}try{let d=await api('/api/miniapp/np/cities?q='+encodeURIComponent(q));quickOrderCityCache[id]=d.items||[];let box=$(`quick-city-options-${id}`);box.innerHTML=quickOrderCityCache[id].slice(0,8).map((c,i)=>`<button type="button" onclick="chooseQuickOrderCity(${id},${i})">${esc(c.name)} ${esc(c.area||'')}</button>`).join('')||'<small>Місто не знайдено в довіднику</small>'}catch(e){msg(e.message)}}
 async function chooseQuickOrderCity(id,index){let c=quickOrderCityCache[id]?.[index];if(!c)return;$(`quick-city-${id}`).value=c.name;$(`quick-city-ref-${id}`).value=c.ref;$(`quick-city-options-${id}`).innerHTML='';$(`quick-branch-ref-${id}`).value='';$(`quick-branch-${id}`).value='';try{let d=await api('/api/miniapp/np/branches?city_ref='+encodeURIComponent(c.ref));quickOrderBranchCache[id]=d.items||[];$(`quick-branch-options-${id}`).innerHTML=quickOrderBranchCache[id].slice(0,100).map((b,i)=>`<button type="button" onclick="chooseQuickOrderBranch(${id},${i})">${esc(b.name||b.description||'Відділення')}</button>`).join('')||'<small>Відділень не знайдено</small>'}catch(e){msg(e.message)}}
@@ -12069,6 +12150,8 @@ async function convertQuickOrder(id){let card=document.querySelector(`[data-quic
 async function updateQuickOrder(id,state){if(state==='closed'&&!confirm('Скасувати запит на купівлю в один клік?'))return;try{await api(`/api/miniapp/staff/quick-orders/${id}`,{method:'PUT',body:JSON.stringify({state})});msg(state==='closed'?'Запит скасовано':'Статус оновлено');await loadStaffOrders()}catch(e){msg(e.message)}}
 async function renderQuickOrderCards(items){return (items||[]).filter(o=>!o.order_id&&o.state!=='closed'&&o.state!=='converted').map(o=>`<article class="card" data-quick-order="${Number(o.id)}"><div class="row"><b>Запит ${esc(o.request_number)}</b><span class="pill">Очікує підтвердження</span></div><p>${esc(o.product_name_snapshot)} ${esc(o.variant_name_snapshot||'')} · ${money(o.unit_price)}<br>Контакт: ${esc(o.contact||'—')} · ${esc(o.customer_name||'Ім’я не вказано')}<br>${esc(o.comment||'Без коментаря')} · ${esc(o.created_at||'')}</p><label>Ім’я отримувача<input data-q-name value="${esc(o.customer_name||'')}" maxlength="120"></label><label>Телефон<input data-q-phone value="${esc(/^\+?\d[\d ()-]{8,}$/.test(o.contact||'')?o.contact:'')}" inputmode="tel"></label><label>Місто<input data-q-city id="quick-city-${Number(o.id)}" placeholder="Львів" maxlength="120"></label><input type="hidden" data-q-city-ref id="quick-city-ref-${Number(o.id)}"><button type="button" onclick="findQuickOrderCities(${Number(o.id)})">Знайти місто</button><div id="quick-city-options-${Number(o.id)}" class="toolbar"></div><label>Відділення / поштомат<input data-q-branch id="quick-branch-${Number(o.id)}" placeholder="Оберіть у довіднику" readonly></label><input type="hidden" data-q-branch-ref id="quick-branch-ref-${Number(o.id)}"><div id="quick-branch-options-${Number(o.id)}" class="toolbar"></div><label><input type="checkbox" data-q-age> Перевірив/ла вік отримувача: 18+</label><div class="toolbar"><button class="primary" onclick="convertQuickOrder(${Number(o.id)})">Підтвердити й створити замовлення</button><button onclick="updateQuickOrder(${Number(o.id)},'closed')">Скасувати запит</button></div></article>`).join('')}
 async function adjustStaffLoyalty(id,operation){let amount=$(`staffBonusAmount-${id}`)?.value,reason=$(`staffBonusReason-${id}`)?.value;try{let d=await api('/api/miniapp/admin/loyalty-adjust',{method:'POST',body:JSON.stringify({customer_lookup:String(id),operation,amount,reason})});msg(`Бонуси оновлено: ${money(d.available)}. ${d.notification_queued?'Клієнту надіслано повідомлення.':'У клієнта немає Telegram для повідомлення.'}`);await openStaffКлієнт(id)}catch(e){msg(e.message)}}
+async function staffToggleCustomerBlock(id,blocked){let reason='';if(!blocked){reason=prompt('Причина блокування клієнта:')||'';if(reason.trim().length<3)return msg('Вкажіть причину від 3 символів.')}if(!confirm(blocked?'Розблокувати клієнта?':'Заблокувати клієнта?'))return;try{await api(`/api/miniapp/staff/customers/${id}/block`,{method:'PUT',body:JSON.stringify({blocked:!blocked,reason})});msg(blocked?'Клієнта розблоковано':'Клієнта заблоковано');await openStaffКлієнт(id)}catch(e){msg(e.message)}}
+async function staffSendCustomerMessage(id){let message=$(`staffCustomerMessage-${id}`)?.value?.trim();if(!message)return msg('Напишіть повідомлення.');if(!confirm('Надіслати повідомлення клієнту в Telegram?'))return;try{await api(`/api/miniapp/staff/customers/${id}/message`,{method:'POST',body:JSON.stringify({message})});msg('Повідомлення надіслано');await openStaffКлієнт(id)}catch(e){msg(e.message)}}
 async function loadStaffOrders(){let host=$('staffContent');host.innerHTML='<h2>Замовлення</h2><div class="notice">Завантажую…</div>';try{let q=prompt('Пошук за номером, клієнтом, телефоном або ТТН')||'';let [d,qd]=await Promise.all([api('/api/miniapp/staff/orders?q='+encodeURIComponent(q),{fresh:true,timeoutMs:15000}),api('/api/miniapp/staff/quick-orders?q='+encodeURIComponent(q),{fresh:true,timeoutMs:15000})]),items=Array.isArray(d.items)?d.items:[],quick=await renderQuickOrderCards(qd.items||[]);host.innerHTML='<h2>Замовлення</h2>'+ (items.map(o=>`<article class="card staff-order-card"><div class="row"><b>${esc(o.order_number||'Замовлення')}</b><span class="pill">${esc(o.status_label||o.status||'В обробці')}</span></div><p>${esc(o.customer_name||'Клієнт')} · ${esc(o.phone||'—')}<br>${esc(o.city||'')}, ${esc(o.delivery_branch||'')}<br>Сума: ${money(o.grand_total)} · сплачено: ${money(o.paid_amount)}<br>ТТН: ${esc(o.ttn||'—')}</p>${canUpdateOrders?`<label>Статус<select data-order-status="${Number(o.id)}"><option value="new" ${o.status==='new'?'selected':''}>Прийнято</option><option value="confirmed" ${o.status==='confirmed'?'selected':''}>Підтверджено</option><option value="packing" ${o.status==='packing'?'selected':''}>Збирається</option><option value="packed" ${o.status==='packed'?'selected':''}>Зібрано</option><option value="ready_to_ship" ${o.status==='ready_to_ship'?'selected':''}>Готове до відправлення</option><option value="shipped" ${o.status==='shipped'?'selected':''}>Відправлено</option><option value="delivered" ${o.status==='delivered'?'selected':''}>Отримано</option><option value="completed" ${o.status==='completed'?'selected':''}>Завершено</option><option value="cancelled" ${o.status==='cancelled'?'selected':''}>Скасовано</option><option value="problem" ${o.status==='problem'?'selected':''}>Потрібна перевірка</option></select></label><button class="primary" onclick="updateStaffOrder(${Number(o.id)})">Зберегти статус</button>`:''}${canConfirmPayment&&o.payment_status!=='paid'?`<button onclick="confirmStaffPayment(${Number(o.id)},${Number(o.grand_total)})">Підтвердити отримання оплати · ${money(o.grand_total)}</button>`:''}</article>`).join('')||'<div class="notice">Замовлень не знайдено.</div>')+'<section class="ops-group"><h3>Запити купити в один клік</h3>'+ (quick||'<div class="notice">Нових заявок немає.</div>')+'</section>'}catch(e){host.innerHTML='<h2>Замовлення</h2><div class="notice">Не вдалося завантажити список: '+esc(e.message)+'<br><button onclick="loadStaffOrders()">Спробувати ще</button></div>'}}
 async function updateStaffOrder(id){try{let status=document.querySelector(`[data-order-status="${id}"]`).value;await api(`/api/miniapp/staff/orders/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус замовлення оновлено');await loadStaffOrders()}catch(e){msg(e.message)}}
 async function confirmStaffPayment(id,amount){if(!confirm(`Підтверджуєте, що Cloud Hub отримав оплату ${money(amount)} за це замовлення?`))return;try{await api(`/api/miniapp/staff/orders/${id}/payment`,{method:'POST',body:JSON.stringify({confirmed:true})});msg('Оплату підтверджено. Бонуси стануть доступними після отримання посилки.');await loadStaffOrders()}catch(e){msg(e.message)}}
@@ -12181,7 +12264,12 @@ const nav=[['home','Огляд'],['orders','Замовлення'],['customers',
 function begin(k){document.querySelectorAll('[data-n]').forEach(e=>e.classList.toggle('active',e.dataset.n===k));$('#content').innerHTML=`<h1>${nav.find(x=>x[0]===k)?.[1]||k}</h1><div id="view" class="stack"></div>`;return $('#view')}async function load(k){let v=begin(k);try{if(k==='home')return home(v);if(k==='orders')return orders(v);if(k==='customers')return customers(v);if(k==='support')return support(v);if(k==='catalog')return catalog(v);if(k==='inventory')return inventory(v);if(k==='banners')return banners(v);if(k==='delivery')return delivery(v);if(k==='staff')return staff(v)}catch(e){v.innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function home(v){if(session.role==="owner"){let d=await req("/api/miniapp/admin/dashboard"),fields=[["orders_today","Замовлень сьогодні"],["order_value_today","Сума сьогодні"],["orders_month","Замовлень за місяць"],["customers","Клієнтів"],["pending_orders","Очікують"],["delivered_month","Доставлено за місяць"]];v.innerHTML=`<div class="grid">${fields.map(([k,t])=>`<article class="card"><small>${t}</small><h2>${k.includes("value")?money(d[k]):esc(d[k])}</h2></article>`).join("")}</div><div class="card">Shared catalog, orders and customer records for website and Telegram.</div>`;return}let d=await req("/api/miniapp/staff/orders"),items=d.items||[];v.innerHTML=`<div class="grid"><article class="card"><small>Найновіші замовлення</small><h2>${items.length}</h2></article><article class="card"><small>Нові / чекають</small><h2>${items.filter(x=>["new","confirmed","packing"].includes(x.status)).length}</h2></article></div><div class="stack">${items.slice(0,8).map(o=>`<article class="card">#${esc(o.order_number)} ? ${esc(o.customer_name||"")} ? ${money(o.grand_total)} ? ${esc(o.status)}</article>`).join("")}</div>`}
 async function orders(v){v.innerHTML=`<div class="toolbar"><input id="orderq" placeholder="Number, phone or customer"><button onclick="orderSearch()">Search</button></div><div id="orderrows" class="stack"></div>`;await orderSearch()}async function orderSearch(){try{let q=encodeURIComponent($('#orderq').value||''),[d,leads]=await Promise.all([req("/api/miniapp/staff/orders?q="+q),req("/api/miniapp/staff/quick-orders?q="+q)]),editable=session.role==="owner"||(session.permissions||[]).includes("orders.update");let real=(d.items||[]).map(o=>`<article class="card"><div class="row"><b>#${esc(o.order_number)} ? ${esc(o.customer_name||'')}</b><b>${money(o.grand_total)}</b></div><p>${esc(o.phone||'')} ? ${esc(o.status)} ? ${esc(o.ttn||'')}</p>${editable?`<div class="toolbar"><select id="status-${Number(o.id)}"><option value="${esc(o.status)}" selected>${esc(o.status)}</option><option value="confirmed">confirmed</option><option value="packing">packing</option><option value="packed">packed</option><option value="ready_to_ship">ready to ship</option><option value="shipped">shipped</option><option value="delivered">delivered</option><option value="cancelled">cancelled</option><option value="problem">problem</option></select><button onclick="updateOrder(${Number(o.id)})">Зберегти статус</button></div>`:''}</article>`).join('');let quick=(leads.items||[]).map(o=>`<article class="card"><div class="row"><b>One-click ${esc(o.request_number)} ? ${esc(o.product_name_snapshot)} ${esc(o.variant_name_snapshot)}</b><span>${money(o.unit_price)}</span></div><p>${esc(o.contact)} · ${esc(o.customer_name||'')} · Telegram ${esc(o.customer_telegram_id||'—')}</p><p>${esc(o.comment||'Без коментаря')} · ${esc(o.state)} · ${o.age_confirmed?'18+ підтвердив':'18+ не підтверджено'}</p>${editable?`<div class="toolbar"><select id="quick-${Number(o.id)}"><option value="${esc(o.state)}" selected>${esc(o.state)}</option><option value="contacted">contacted</option><option value="converted">converted</option><option value="closed">closed</option></select><button onclick="updateQuickOrder(${Number(o.id)})">Зберегти статус заявки</button></div>`:''}</article>`).join('');$('#orderrows').innerHTML='<h2>Заявки ?купити в 1 ?????</h2>'+(quick||'<div class="notice">Нових заявок немає.</div>')+'<h2>Замовлення</h2>'+(real||'<div class="notice">Замовлень не знайдено.</div>')}catch(e){say(e.message)}}async function updateQuickOrder(id){try{await req("/api/miniapp/staff/quick-orders/"+id,{method:"PUT",body:JSON.stringify({state:$('#quick-'+id).value})});say("Request status updated");orderSearch()}catch(e){say(e.message)}}async function updateOrder(id){try{await req("/api/miniapp/staff/orders/"+id+"/status",{method:"PUT",body:JSON.stringify({status:$('#status-'+id).value})});say("Order status updated");orderSearch()}catch(e){say(e.message)}}function filter(id,q){let s=$('#'+q).value.toLowerCase();document.querySelectorAll('#'+id+' tr').forEach(x=>x.classList.toggle('hidden',!x.dataset.q.includes(s)))}
-async function customers(v){v.innerHTML='<div class="toolbar"><input id="cq" placeholder="Ім’я, телефон, Telegram ID, бонусна карта"><button class="primary" onclick="crm()">Знайти</button></div><div id="cr" class="stack"></div>'}async function crm(){try{let d=await req('/api/miniapp/staff/customers?q='+encodeURIComponent($('#cq').value));$('#cr').innerHTML=(d.items||[]).map(c=>`<article class="card"><b>${esc(c.full_name||c.first_name||'Клієнт')}</b><p>${esc(c.phone||'')} · ${esc(c.loyalty_card_number||'')}</p><small>Замовлень ${esc(c.order_count||0)} · сума ${money(c.lifetime_value)} · бонуси ${money(c.bonus_available)}</small><button onclick="crmDetail(${Number(c.id)})">Картка клієнта</button></article>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){say(e.message)}}async function crmDetail(id){try{let d=await req('/api/miniapp/staff/customers/'+id),c=d.customer,canOwner=session.role==='owner',canAdjustLoyalty=canOwner||(session.permissions||[]).includes('loyalty.adjust');let orders=(d.orders||[]).map(o=>`<article class="card">${esc(o.order_number)} ? ${esc(o.status)} ? ${money(o.grand_total)}<br><small>${esc(o.created_at||'')} ? ${esc(o.ttn||'')}</small></article>`).join('')||'<small>Замовлень немає</small>';let ledger=(d.loyalty||[]).map(x=>`<article class="card">${esc(x.transaction_type)} ? ${money(x.amount)} ? ${esc(x.state)}<br><small>${esc(x.reason||'')} ? ${esc(x.created_at||'')}</small></article>`).join('')||'<small>Операцій із бонусами немає</small>';$('#cr').insertAdjacentHTML('afterbegin',`<article class="card"><button onclick="this.parentElement.remove()">Закрити картку</button><h2>${esc(c.full_name||c.first_name||'Клієнт')}</h2><p>${esc(c.phone||'Телефон не вказано')} ? @${esc(c.username||'')} ? Telegram ${esc(c.telegram_id||'')}</p><p>Bonus card ${esc(c.loyalty_card_number||'?')} ? available ${money(c.bonus_available)} ? pending ${money(c.bonus_pending)}</p>${canAdjustLoyalty?`<h3>Коригування бонусів</h3><div class="split"><input id="bonusValue-${id}" type="number" min="0.01" step="0.01" placeholder="Amount"><input id="bonusReason-${id}" placeholder="Required reason"></div><div class="toolbar"><button onclick="adjustКлієнтBonus(${id},'earn')">Нарахувати бонуси</button><button onclick="adjustКлієнтBonus(${id},'redeem')">Списати бонуси</button></div>`:''}<h3>Замовлення</h3><div class="stack">${orders}</div><h3>Історія бонусів</h3><div class="stack">${ledger}</div></article>`)}catch(e){say(e.message)}}async function adjustКлієнтBonus(id,operation){let value=$('#bonusValue-'+id).value,reason=$('#bonusReason-'+id).value;try{let d=await req('/api/miniapp/admin/loyalty-adjust',{method:'POST',body:JSON.stringify({customer_lookup:String(id),operation,amount:value,reason})});say('Bonus balance: '+money(d.available));crmDetail(id)}catch(e){say(e.message)}}
+async function customers(v){v.innerHTML='<div class="toolbar"><input id="cq" placeholder="Ім’я, телефон, Telegram ID, бонусна карта"><button class="primary" onclick="crm()">Знайти</button></div><div id="cr" class="stack"></div>'}
+async function crm(){try{let d=await req('/api/miniapp/staff/customers?q='+encodeURIComponent($('#cq').value));$('#cr').innerHTML=(d.items||[]).map(c=>`<article class="card"><b>${esc(c.full_name||c.first_name||'Клієнт')}</b> ${c.blocked_at?'<span class="notice">ЗАБЛОКОВАНИЙ</span>':''}<p>${esc(c.phone||'')} · ${esc(c.loyalty_card_number||'')}</p><small>Замовлень ${esc(c.order_count||0)} · сума ${money(c.lifetime_value)} · бонуси ${money(c.bonus_available)}</small><button onclick="crmDetail(${Number(c.id)})">Картка клієнта</button></article>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){say(e.message)}}
+async function crmDetail(id){try{let d=await req('/api/miniapp/staff/customers/'+id),c=d.customer,canOwner=session.role==='owner',canAdjustLoyalty=canOwner||(session.permissions||[]).includes('loyalty.adjust');let orders=(d.orders||[]).map(o=>`<article class="card">${esc(o.order_number)} · ${esc(o.status)} · ${money(o.grand_total)}<br><small>${esc(o.created_at||'')} · ${esc(o.ttn||'')}</small></article>`).join('')||'<small>Замовлень немає</small>';let ledger=(d.loyalty||[]).map(x=>`<article class="card">${esc(x.transaction_type)} · ${money(x.amount)} · ${esc(x.state)}<br><small>${esc(x.reason||'')} · ${esc(x.created_at||'')}</small></article>`).join('')||'<small>Операцій із бонусами немає</small>';$('#cr').insertAdjacentHTML('afterbegin',`<article class="card"><button onclick="this.parentElement.remove()">Закрити картку</button><h2>${esc(c.full_name||c.first_name||'Клієнт')}</h2><p>${esc(c.phone||'Телефон не вказано')} · @${esc(c.username||'—')} · Telegram ${esc(c.telegram_id||'—')}</p><p>Бонусна картка ${esc(c.loyalty_card_number||'—')} · доступно ${money(c.bonus_available)} · очікують ${money(c.bonus_pending)}</p><section class="ops-group"><h3>Зв’язок і доступ</h3><div class="notice">${c.blocked_at?'Заблокований':'Активний'}${c.blocked_at&&c.block_reason?' · причина: '+esc(c.block_reason):''}</div><button onclick="crmToggleBlock(${id},${Boolean(c.blocked_at)})">${c.blocked_at?'Розблокувати клієнта':'Заблокувати клієнта'}</button><textarea id="clientMessage-${id}" maxlength="4000" placeholder="Особисте повідомлення клієнту в Telegram"></textarea><button class="primary" onclick="crmMessage(${id})">Надіслати повідомлення</button></section>${canAdjustLoyalty?`<h3>Коригування бонусів</h3><div class="split"><input id="bonusValue-${id}" type="number" min="0.01" step="0.01" placeholder="Сума"><input id="bonusReason-${id}" placeholder="Причина"></div><div class="toolbar"><button onclick="adjustКлієнтBonus(${id},'earn')">Нарахувати бонуси</button><button onclick="adjustКлієнтBonus(${id},'redeem')">Списати бонуси</button></div>`:''}<h3>Замовлення</h3><div class="stack">${orders}</div><h3>Історія бонусів</h3><div class="stack">${ledger}</div></article>`)}catch(e){say(e.message)}}
+async function crmToggleBlock(id,blocked){let reason='';if(!blocked){reason=prompt('Вкажіть причину блокування клієнта (побачить команда):')||'';if(reason.trim().length<3)return say('Потрібна причина від 3 символів.')}if(!confirm(blocked?'Розблокувати клієнта?':'Заблокувати клієнта?'))return;try{await req('/api/miniapp/staff/customers/'+id+'/block',{method:'PUT',body:JSON.stringify({blocked:!blocked,reason})});say(blocked?'Клієнта розблоковано':'Клієнта заблоковано');crmDetail(id)}catch(e){say(e.message)}}
+async function crmMessage(id){let message=$('#clientMessage-'+id).value.trim();if(!message)return say('Напишіть повідомлення');if(!confirm('Надіслати це повідомлення клієнту в Telegram?'))return;try{await req('/api/miniapp/staff/customers/'+id+'/message',{method:'POST',body:JSON.stringify({message})});say('Повідомлення надіслано клієнту');$('#clientMessage-'+id).value=''}catch(e){say(e.message)}}
+async function adjustКлієнтBonus(id,operation){let value=$('#bonusValue-'+id).value,reason=$('#bonusReason-'+id).value;try{let d=await req('/api/miniapp/admin/loyalty-adjust',{method:'POST',body:JSON.stringify({customer_lookup:String(id),operation,amount:value,reason})});say('Bonus balance: '+money(d.available));crmDetail(id)}catch(e){say(e.message)}}
 async function support(v){let d=await req('/api/miniapp/staff/support?status=active');v.innerHTML=`<div class="toolbar"><button onclick="supportList('active')">Активні (${Math.min(5,(d.counts||{}).active||0)})</button><button onclick="supportList('archive')">Архів</button><button onclick="supportList('all')">Усі</button><input id="tq" placeholder="Пошук у повідомленнях"><button onclick="supportSearch()">Шукати</button></div><div id="tickets" class="stack">${ticketCards(d.items||[])}</div>`}function ticketCards(a){return a.map(t=>`<button class="card wide" style="text-align:left" onclick="ticket(${Number(t.id)})">#${Number(t.id)} · ${esc(t.subject||'Звернення')} · ${esc(t.status)}<p>${esc(t.latest_message||'')}</p></button>`).join('')||'<div class="notice">Тікетів немає.</div>'}async function supportList(s){try{let d=await req('/api/miniapp/staff/support?status='+s);$('#tickets').innerHTML=ticketCards(d.items||[])}catch(e){say(e.message)}}async function supportSearch(){try{let d=await req('/api/miniapp/staff/support?status=all&q='+encodeURIComponent($('#tq').value));$('#tickets').innerHTML=ticketCards(d.items||[])}catch(e){say(e.message)}}async function ticket(id){try{let d=await req('/api/miniapp/staff/support/'+id),t=d.ticket,canReply=session.role==='owner'||(session.permissions||[]).includes('support.reply');$('#content').innerHTML=`<button onclick="load('support')">← До черги</button><h1>Тікет #${id}</h1><div class="stack">${(t.messages||[]).map(m=>`<article class="ticket ${m.sender_type==='staff'?'staff':'customer'}">${esc(m.sender_type)} · ${esc(m.created_at||'')}<p>${esc(m.body)}</p></article>`).join('')}</div>${t.status==='closed'?'<div class="notice">Тікет закрито.</div>':'<textarea id="reply" placeholder="Відповідь клієнту"></textarea><button class="primary" onclick="reply(${id})">Надіслати</button><button onclick="closeTicket('+id+')">Закрити тікет</button>'}`}catch(e){say(e.message)}}async function reply(id){try{await req('/api/miniapp/staff/support/'+id+'/reply',{method:'POST',body:JSON.stringify({message:$('#reply').value})});ticket(id)}catch(e){say(e.message)}}async function closeTicket(id){try{await req('/api/miniapp/staff/support/'+id+'/status',{method:'PUT',body:JSON.stringify({status:'closed'})});load('support')}catch(e){say(e.message)}}
 async function optimizeSitePhoto(file){if(!file||!file.type.startsWith('image/'))return file;try{let bitmap=await createImageBitmap(file),scale=Math.min(1,1440/bitmap.width,1440/bitmap.height),canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));canvas.getContext('2d',{alpha:true}).drawImage(bitmap,0,0,canvas.width,canvas.height);bitmap.close?.();let blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/webp',.86));if(!blob||blob.size>=file.size)return file;return new File([blob],(file.name.replace(/\.[^.]+$/,'')||'product')+'.webp',{type:'image/webp',lastModified:Date.now()})}catch(e){return file}}async function catalog(v){let d=await req('/api/miniapp/staff/catalog');v.innerHTML=`<input id="pq" placeholder="Назва або SKU" oninput="products()"><div id="prod" class="stack">${prodCards(d)}</div>`}function prodCards(d){return(d.items||[]).map(p=>`<article class="card" data-p="${p.product_id}" data-v="${p.variant_id}">${p.media_id?`<img class="photo" src="/api/miniapp/products/${p.media_id}/photo">`:''}<div class="row"><b>${esc(p.name)} ${esc(p.variant_name||'')}</b>${money(p.price)}</div><small>SKU ${esc(p.sku||'')} · склад ${Number(p.stock_qty)}</small><div class="split"><input data-f="name" value="${esc(p.name)}" placeholder="Назва"><input data-f="sku" value="${esc(p.sku||'')}" placeholder="SKU"><input data-f="price" type="number" min="0" step=".01" value="${Number(p.price)}" placeholder="Акційна / поточна ціна"><input data-f="compare" type="number" min="0" step=".01" value="${p.compare_at_price?Number(p.compare_at_price):''}" placeholder="Ціна до акції"></div><textarea data-f="description" placeholder="Опис">${esc(p.description||'')}</textarea><select data-f="category"><option value="">Без категорії</option>${(d.categories||[]).map(c=>`<option value="${c.id}" ${Number(c.id)===Number(p.category_id)?'selected':''}>${esc(c.name)}</option>`).join('')}</select><select data-f="badge">${['','Bestseller','MEGA SALE','Акція'].map(x=>`<option value="${x}" ${p.storefront_badge===x?'selected':''}>${x||'Без плашки'}</option>`).join('')}</select><label>Фото <input data-f="photo" type="file" accept="image/jpeg,image/png,image/webp"></label><label><input data-f="active" type="checkbox" ${p.active?'checked':''}> Активний</label><label><input data-f="hidden" type="checkbox" ${p.manually_hidden?'checked':''}> Прихований</label><div class="toolbar"><button class="primary" onclick="saveProduct(this)">Зберегти</button><button onclick="photoProduct(this)">Замінити фото</button></div></article>`).join('')||'<div class="notice">Немає товарів.</div>'}function lockCatalogControls(){if(session.role==='owner'||(session.permissions||[]).includes('catalog.update'))return;document.querySelectorAll('#prod [data-f]').forEach(x=>x.disabled=true);document.querySelectorAll('#prod .toolbar').forEach(x=>x.classList.add('hidden'))}async function products(){try{let d=await req('/api/miniapp/staff/catalog?q='+encodeURIComponent($('#pq').value));$('#prod').innerHTML=prodCards(d);lockCatalogControls()}catch(e){say(e.message)}}async function saveProduct(b){let c=b.closest('[data-p]'),g=n=>c.querySelector(`[data-f=${n}]`);try{await req('/api/miniapp/staff/catalog/'+c.dataset.p,{method:'PUT',body:JSON.stringify({variant_id:c.dataset.v,name:g('name').value,sku:g('sku').value,price:g('price').value,compare_at_price:g('compare').value,description:g('description').value,category_id:g('category').value||null,storefront_badge:g('badge').value,active:g('active').checked,manually_hidden:g('hidden').checked,reason:'website admin'})});say('Збережено')}catch(e){say(e.message)}}async function photoProduct(b){let c=b.closest('[data-p]'),f=c.querySelector('[data-f=photo]').files[0];if(!f)return say('Оберіть фото');try{let optimized=await optimizeSitePhoto(f),fd=new FormData();fd.append('photo',optimized);await req('/api/miniapp/staff/catalog/'+c.dataset.p+'/photo',{method:'POST',body:fd});say(optimized!==f?`Фото оптимізовано (${Math.round(optimized.size/1024)} КБ) і збережено`:'Фото збережено');products()}catch(e){say(e.message)}}
 async function inventory(v){let d=await req('/api/miniapp/staff/inventory?archived=0');v.innerHTML=`<button class="primary" onclick="startInventory()">Почати інвентаризацію</button><button onclick="inventoryArchive()">Архів</button><div class="stack">${(d.items||[]).map(x=>`<article class="card">Інвентаризація #${esc(x.id)} · ${esc(x.status)} <button onclick="openInventory(${Number(x.id)})">Відкрити</button></article>`).join('')||'<div class="notice">Активних немає.</div>'}</div>`}async function inventoryArchive(){try{let d=await req('/api/miniapp/staff/inventory?archived=1');$('#content').innerHTML='<h1>Архів інвентаризацій</h1><button onclick="load(\'inventory\')">Назад</button>'+((d.items||[]).map(x=>`<article class="card">#${esc(x.id)} · ${esc(x.status)} · ${esc(x.created_at||'')}</article>`).join('')||'<div class="notice">Архів порожній.</div>')}catch(e){say(e.message)}}async function startInventory(){try{let d=await req("/api/miniapp/staff/inventory",{method:"POST",body:"{}"});openInventory(d.count_id)}catch(e){say(e.message)}}async function openInventory(id){try{let d=await req("/api/miniapp/staff/inventory/"+id);$('#content').innerHTML=`<h1>Inventory #${Number(id)} ? ${esc(d.status)}</h1><div class="stack">${(d.items||[]).map(i=>`<article class="card">${i.photo_id?`<img class="photo" src="/api/miniapp/products/${Number(i.photo_id)}/photo">`:''}<b>${esc(i.name)} ? ${esc(i.sku||'')}</b><p>System ${Number(i.system_qty_snapshot)} ? counted ${i.actual_qty===null?'?':Number(i.actual_qty)} ? shortage ${Number(i.shortage_qty||0)}</p><div class="toolbar"><button onclick="setCount(${Number(id)},${Number(i.variant_id)},${Math.max(0,Number(i.actual_qty||0)-1)})">?</button><b>${i.actual_qty===null?'?':Number(i.actual_qty)}</b><button onclick="setCount(${Number(id)},${Number(i.variant_id)},${Number(i.actual_qty||0)+1})">+</button></div></article>`).join('')}</div>${d.status==='counting'&&['owner','admin'].includes(session.role)?`<button class="primary" onclick="confirmInventory(${Number(id)})">Підтвердити інвентаризацію і оновити залишки</button>`:''}`}catch(e){say(e.message)}}async function confirmInventory(id){if(!confirm("Confirm these counts and apply stock differences? A PDF report will be sent to the owner."))return;try{let d=await req(`/api/miniapp/staff/inventory/${id}/confirm`,{method:"POST",body:JSON.stringify({reason:"Confirmed from website admin"})});say(`Reconciled. Shortages: ${d.shortage_units} units across ${d.shortage_skus} products.`);load("inventory")}catch(e){say(e.message)}}async function setCount(id,variant_id,actual_qty){try{await req(`/api/miniapp/staff/inventory/${id}/item`,{method:"PUT",body:JSON.stringify({variant_id,actual_qty})});openInventory(id)}catch(e){say(e.message)}}async function inventoryArchive(){try{let d=await req("/api/miniapp/staff/inventory?archived=1");$('#content').innerHTML=`<h1>Архів інвентаризацій</h1><button onclick="load('inventory')">Back</button>${(d.items||[]).map(x=>`<article class="card">#${esc(x.id)} ? ${esc(x.status)} ? ${esc(x.created_at||'')}</article>`).join('')||'<div class="notice">Архів порожній.</div>'}`}catch(e){say(e.message)}}async function banners(v){let d=await req('/api/miniapp/admin/banners');v.innerHTML=`<p class="muted">Акції та банери для сайту й магазину.</p><div id="bs" class="stack">${(d.banners||[]).map(bannerRow).join('')}</div><button onclick="addBanner()">Додати банер</button><button class="primary" onclick="saveBanners()">Зберегти</button>`}function bannerRow(b={}){return `<article class="card" data-b><input data-k="title" placeholder="Заголовок" value="${esc(b.title||'')}"><select data-k="placement"><option value="website_top" ${b.placement==='website_top'?'selected':''}>Верх сайту</option><option value="website_bottom" ${b.placement==='website_bottom'?'selected':''}>Низ сайту</option><option value="home_top" ${!b.placement||b.placement==='home_top'?'selected':''}>Головна</option></select><textarea data-k="body" placeholder="Текст">${esc(b.body||'')}</textarea><input data-k="image_url" placeholder="URL зображення" value="${esc(b.image_url||'')}"><input data-k="link_url" placeholder="Посилання" value="${esc(b.link_url||'')}"><label><input data-k="active" type="checkbox" ${b.active?'checked':''}> Активний</label><button onclick="this.closest('[data-b]').remove()">Видалити</button></article>`}function addBanner(){$('#bs').insertAdjacentHTML('beforeend',bannerRow({active:true}))}async function saveBanners(){let banners=[...document.querySelectorAll('[data-b]')].map(e=>{let x={};e.querySelectorAll('[data-k]').forEach(i=>x[i.dataset.k]=i.type==='checkbox'?i.checked:i.value);return x});try{await req('/api/miniapp/admin/banners',{method:'PUT',body:JSON.stringify({banners})});say('Банери збережено')}catch(e){say(e.message)}}
@@ -12694,6 +12782,8 @@ def _miniapp_auth_user():
                                WHERE s.token_hash=%s AND s.expires_at>NOW()""", (token_hash,))
                 session_user = cur.fetchone()
             if session_user:
+                if not get_staff(int(session_user["telegram_id"])):
+                    ensure_customer_not_blocked(int(session_user["telegram_id"]))
                 return _NS(id=int(session_user["telegram_id"]), username=session_user.get("username"),
                            first_name=session_user.get("first_name") or "", last_name=session_user.get("last_name") or "")
         admin_staff = _site_admin_staff()
@@ -12722,6 +12812,8 @@ def _miniapp_auth_user():
         raise PermissionError("Не вдалося прочитати профіль Telegram.")
     if uid <= 0:
         raise PermissionError("Некоректний профіль Telegram.")
+    if not get_staff(uid):
+        ensure_customer_not_blocked(uid)
     return _NS(id=uid, username=user.get("username"), first_name=user.get("first_name", ""), last_name=user.get("last_name", ""))
 
 
@@ -12901,11 +12993,21 @@ def website_quick_order():
         phone = normalize_ua_phone(contact_raw)
         if phone:
             contact = phone
+            with db_cursor() as cur:
+                cur.execute("SELECT 1 FROM customers WHERE phone=%s AND blocked_at IS NOT NULL LIMIT 1",
+                            (normalize_phone(phone),))
+                if cur.fetchone():
+                    return jsonify({"error": "Не вдалося оформити запит. Зверніться до Cloud Hub для уточнення."}), 403
         else:
             telegram_name = contact_raw.lstrip("@").strip()
             if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", telegram_name):
                 return jsonify({"error": "Вкажіть номер телефону або Telegram @username."}), 400
             contact = "@" + telegram_name
+            with db_cursor() as cur:
+                cur.execute("SELECT 1 FROM customers WHERE lower(username)=lower(%s) AND blocked_at IS NOT NULL LIMIT 1",
+                            (telegram_name,))
+                if cur.fetchone():
+                    return jsonify({"error": "Не вдалося оформити запит. Зверніться до Cloud Hub для уточнення."}), 403
         request_number = "WH-" + datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6].upper()
         with db_cursor() as cur:
             cur.execute("""SELECT v.id,v.sku,v.variant_name,v.price,v.stock_qty,v.reserved_qty,v.active variant_active,
@@ -14706,7 +14808,7 @@ def miniapp_staff_customers():
         pattern = f"%{query}%"
         with db_cursor() as cur:
             cur.execute("""SELECT c.id,c.telegram_id,c.username,c.first_name,c.last_name,c.full_name,c.phone,
-                                  c.loyalty_card_number,c.created_at,COALESCE(la.available,0) bonus_available,
+                                  c.loyalty_card_number,c.created_at,c.blocked_at,c.block_reason,COALESCE(la.available,0) bonus_available,
                                   COALESCE(la.pending,0) bonus_pending,COUNT(o.id) order_count,
                                   COALESCE(SUM(o.grand_total) FILTER(WHERE o.status<>'cancelled'),0) lifetime_value
                            FROM customers c LEFT JOIN loyalty_accounts la ON la.customer_id=c.id
@@ -14752,7 +14854,7 @@ def miniapp_staff_customer_card(customer_id: int):
         _miniapp_require_staff(user, "customers.read")
         with db_cursor() as cur:
             cur.execute("""SELECT c.id,c.telegram_id,c.username,c.first_name,c.last_name,c.full_name,c.phone,
-                                  c.loyalty_card_number,c.created_at,c.updated_at,
+                                  c.loyalty_card_number,c.created_at,c.updated_at,c.blocked_at,c.block_reason,
                                   COALESCE(la.available,0) bonus_available,COALESCE(la.pending,0) bonus_pending
                            FROM customers c LEFT JOIN loyalty_accounts la ON la.customer_id=c.id WHERE c.id=%s""", (customer_id,))
             customer = cur.fetchone()
@@ -14772,6 +14874,71 @@ def miniapp_staff_customer_card(customer_id: int):
     except Exception:
         log.exception("Mini App customer card failed")
         return jsonify({"error": "Не вдалося завантажити картку клієнта."}), 500
+
+
+@miniapp.put("/api/miniapp/staff/customers/<int:customer_id>/block")
+def miniapp_staff_customer_block(customer_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "customers.read")
+        body = request.get_json(silent=True) or {}
+        blocked = body.get("blocked") is True
+        reason = " ".join(str(body.get("reason") or "").split())[:250]
+        if blocked and len(reason) < 3:
+            return jsonify({"error": "Вкажіть причину блокування (від 3 символів)."}), 400
+        with db_cursor() as cur:
+            cur.execute("SELECT id,telegram_id,blocked_at,block_reason FROM customers WHERE id=%s FOR UPDATE", (customer_id,))
+            customer = cur.fetchone()
+            if not customer:
+                return jsonify({"error": "Клієнта не знайдено."}), 404
+            if customer.get("telegram_id"):
+                cur.execute("SELECT 1 FROM staff WHERE telegram_id=%s AND active=TRUE", (int(customer["telegram_id"]),))
+                if cur.fetchone():
+                    return jsonify({"error": "Обліковий запис працівника не можна блокувати як клієнта."}), 409
+            before = {"blocked": bool(customer.get("blocked_at")), "reason": customer.get("block_reason") or ""}
+            if blocked:
+                cur.execute("UPDATE customers SET blocked_at=NOW(),blocked_by=%s,block_reason=%s,updated_at=NOW() WHERE id=%s",
+                            (actor.telegram_id, reason, customer_id))
+            else:
+                cur.execute("UPDATE customers SET blocked_at=NULL,blocked_by=NULL,block_reason='',updated_at=NOW() WHERE id=%s",
+                            (customer_id,))
+            audit(actor, "customer.blocked" if blocked else "customer.unblocked", "customer", str(customer_id),
+                  before=before, after={"blocked": blocked, "reason": reason if blocked else ""}, reason=reason if blocked else None)
+        return jsonify({"ok": True, "blocked": blocked})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App customer block update failed id=%s", customer_id)
+        return jsonify({"error": "Не вдалося змінити доступ клієнта."}), 500
+
+
+@miniapp.post("/api/miniapp/staff/customers/<int:customer_id>/message")
+def miniapp_staff_customer_message(customer_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff(user, "customers.read")
+        body = request.get_json(silent=True) or {}
+        text = str(body.get("message") or "").strip()
+        if not text or len(text) > 4000:
+            return jsonify({"error": "Напишіть повідомлення до 4000 символів."}), 400
+        with db_cursor() as cur:
+            cur.execute("SELECT id,telegram_id,full_name,username FROM customers WHERE id=%s", (customer_id,))
+            customer = cur.fetchone()
+        if not customer:
+            return jsonify({"error": "Клієнта не знайдено."}), 404
+        if not customer.get("telegram_id"):
+            return jsonify({"error": "У клієнта ще немає прив’язаного Telegram-акаунта."}), 409
+        if not get_staff(int(customer["telegram_id"])) and customer_block_status(int(customer["telegram_id"])):
+            return jsonify({"error": "Клієнт заблокований. Спершу розблокуйте його."}), 409
+        bot.send_message(int(customer["telegram_id"]), f"💬 Повідомлення від Cloud Hub:\n\n{text}")
+        audit(actor, "customer.message_sent", "customer", str(customer_id),
+              after={"telegram_id": int(customer["telegram_id"]), "length": len(text)})
+        return jsonify({"ok": True})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception as exc:
+        log.exception("Mini App customer message failed id=%s", customer_id)
+        return jsonify({"error": "Не вдалося надіслати повідомлення. Перевірте, чи клієнт відкривав бота."}), 502
 
 
 @miniapp.get("/api/miniapp/staff/orders")
