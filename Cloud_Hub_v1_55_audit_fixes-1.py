@@ -1039,6 +1039,24 @@ def _merge_root_category(cur, source_id: int, target_id: int) -> dict:
     return {"products": moved_products, "children": moved_children}
 
 
+def _archive_accidental_cherry_juice_category(cur) -> bool:
+    """Hide the accidentally created customer-facing Cherry juice root category."""
+    cur.execute("""SELECT id,name,active FROM categories
+                   WHERE lower(btrim(name))='cherry juice' AND parent_id IS NULL AND active=TRUE
+                   FOR UPDATE""")
+    category = cur.fetchone()
+    if not category:
+        return False
+    cur.execute("UPDATE categories SET active=FALSE WHERE id=%s AND active=TRUE RETURNING id", (category["id"],))
+    if not cur.fetchone():
+        return False
+    cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,before_data,after_data)
+                   VALUES(NULL,'system','catalog.accidental_category_archived','category',%s,%s::jsonb,%s::jsonb)""",
+                (str(category["id"]), json_dumps({"name": category["name"], "active": True}),
+                 json_dumps({"name": category["name"], "active": False, "reason": "accidental customer-facing category"})))
+    return True
+
+
 def init_db() -> None:
     global pool, consent_pool
     os.makedirs(os.path.join(CONFIG.data_dir, "media"), exist_ok=True)
@@ -1115,6 +1133,9 @@ def init_db() -> None:
                 new_root = cur.fetchone()
                 if old_root and new_root:
                     _merge_root_category(cur, int(old_root["id"]), int(new_root["id"]))
+            # This exact accidental root should not be exposed to customers. Its
+            # product/category references are retained; only the category is archived.
+            _archive_accidental_cherry_juice_category(cur)
             cur.execute(
                 """
                 INSERT INTO staff (telegram_id, display_name, role)
