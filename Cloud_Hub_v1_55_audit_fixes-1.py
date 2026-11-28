@@ -4876,7 +4876,12 @@ def customer_loyalty_handler(message):
 
 @bot.message_handler(func=lambda m: m.text == "🎫 Підтримка")
 def customer_support_handler(message):
-    upsert_customer(message.from_user)
+    try:
+        ensure_customer_not_blocked(message.from_user.id)
+        upsert_customer(message.from_user)
+    except PermissionError as exc:
+        bot.send_message(message.chat.id, str(exc), reply_markup=customer_menu())
+        return
     msg = bot.send_message(message.chat.id, "Напишіть одним повідомленням, чим ми можемо допомогти.")
     bot.register_next_step_handler(msg, customer_support_message)
 
@@ -4884,6 +4889,9 @@ def customer_support_handler(message):
 def customer_support_message(message):
     try:
         ticket_id = create_support_ticket(message.from_user.id, message.text or "")
+    except PermissionError as exc:
+        bot.reply_to(message, str(exc), reply_markup=customer_menu())
+        return
     except ValueError as exc:
         bot.reply_to(message, safe(str(exc)))
         return
@@ -11321,6 +11329,7 @@ def checkout_reuse_callback(call):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("cs:reply:"))
 def customer_ticket_reply_callback(call):
     try:
+        ensure_customer_not_blocked(call.from_user.id)
         ticket_id = int(call.data.split(":")[2])
         with db_cursor() as cur:
             cur.execute("SELECT status FROM support_tickets WHERE id=%s AND customer_telegram_id=%s", (ticket_id, call.from_user.id))
@@ -11334,6 +11343,8 @@ def customer_ticket_reply_callback(call):
         bot.answer_callback_query(call.id)
         msg = bot.send_message(call.message.chat.id, f"Напишіть вашу відповідь до звернення #{ticket_id}:")
         bot.register_next_step_handler(msg, customer_ticket_reply_step, ticket_id)
+    except PermissionError as exc:
+        bot.answer_callback_query(call.id, str(exc), show_alert=True)
     except Exception:
         log.exception("Клієнт ticket reply callback failed")
         bot.answer_callback_query(call.id, "Не вдалося відкрити звернення.", show_alert=True)
@@ -11346,6 +11357,7 @@ def customer_ticket_reply_step(message, ticket_id: int) -> None:
         bot.register_next_step_handler(msg, customer_ticket_reply_step, ticket_id)
         return
     try:
+        ensure_customer_not_blocked(message.from_user.id)
         upsert_customer(message.from_user)
         with db_cursor() as cur:
             cur.execute("SELECT assigned_to FROM support_tickets WHERE id=%s AND customer_telegram_id=%s", (ticket_id, message.from_user.id))
@@ -11369,6 +11381,8 @@ def customer_ticket_reply_step(message, ticket_id: int) -> None:
         bot.reply_to(message, "✅ Відповідь надіслано. Ми відповімо тут у чаті.", reply_markup=customer_menu())
     except ValueError as exc:
         bot.reply_to(message, safe(str(exc)))
+    except PermissionError as exc:
+        bot.reply_to(message, str(exc), reply_markup=customer_menu())
     except Exception:
         log.exception("Клієнт ticket reply failed")
         bot.reply_to(message, "⚠️ Не вдалося надіслати відповідь. Спробуйте ще раз.")
