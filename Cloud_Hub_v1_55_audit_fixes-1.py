@@ -81,6 +81,7 @@ Do not commit secrets. Do not point this bot at the legacy CRM database.
 from __future__ import annotations
 
 import difflib
+import base64
 import html
 import inspect
 import logging
@@ -107,6 +108,11 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable, Optional
 from types import SimpleNamespace as _NS
 from zoneinfo import ZoneInfo
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:
+    AESGCM = None
 
 try:
     from flask import Flask, jsonify, request, Response, send_file
@@ -297,6 +303,31 @@ CREATE TABLE IF NOT EXISTS staff (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Staff messenger content and media are encrypted with AES-256-GCM before
+-- entering PostgreSQL. The encryption key is supplied by Render at runtime.
+CREATE TABLE IF NOT EXISTS staff_chat_profiles (
+    telegram_id BIGINT PRIMARY KEY REFERENCES staff(telegram_id) ON DELETE CASCADE,
+    avatar_ciphertext BYTEA,
+    avatar_mime TEXT,
+    background_ciphertext BYTEA,
+    background_mime TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS staff_chat_messages (
+    id BIGSERIAL PRIMARY KEY,
+    conversation_key TEXT NOT NULL,
+    sender_telegram_id BIGINT NOT NULL,
+    sender_name TEXT NOT NULL,
+    sender_role TEXT NOT NULL,
+    body_ciphertext BYTEA NOT NULL,
+    attachment_ciphertext BYTEA,
+    attachment_mime TEXT,
+    attachment_name TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_staff_chat_messages_conversation
+    ON staff_chat_messages(conversation_key, id DESC);
 
 CREATE TABLE IF NOT EXISTS staff_access_codes (
     id BIGSERIAL PRIMARY KEY,
@@ -3644,10 +3675,16 @@ SECTION_PERMISSIONS = {
 
 def main_menu(staff: Staff) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    messenger_button = types.KeyboardButton(
+        "💬 Месенджер команди",
+        web_app=types.WebAppInfo(url=CONFIG.mini_app_url.rstrip("/") + "/miniapp?staffchat=1"),
+    ) if CONFIG.mini_app_url else None
     if staff.role == "owner":
         labels = [label for label, _ in OWNER_SECTIONS]
         for i in range(0, len(labels), 2):
             kb.row(*labels[i:i + 2])
+        if messenger_button:
+            kb.row(messenger_button)
         return kb
     role_sections = {
         "courier": ["🚚 Доставка", "🛍️ Замовлення"],
@@ -3658,6 +3695,8 @@ def main_menu(staff: Staff) -> types.ReplyKeyboardMarkup:
     labels = role_sections.get(staff.role, ["🛍️ Замовлення"])
     for i in range(0, len(labels), 2):
         kb.row(*labels[i:i + 2])
+    if messenger_button:
+        kb.row(messenger_button)
     kb.row("🏠 Головне меню")
     return kb
 
@@ -12113,6 +12152,7 @@ main{max-width:880px;padding:14px 16px 28px}.search{height:48px;margin:2px 0 8px
 @media(min-width:600px){.grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.card.product-card{padding:12px}.product-card h3{font-size:15px}}
 @media(max-width:380px){main{padding-left:11px;padding-right:11px}.grid{gap:8px}.card.product-card{padding:8px;border-radius:15px}.product-actions{gap:5px}.product-actions button{padding:7px 6px;font-size:11px}.bottom{gap:1px;padding-left:5px;padding-right:5px}.bottom button{font-size:9px}}
 @media(prefers-reduced-motion:reduce){.card.product-card{animation:none!important}.product-photo img{transition:none!important}}
+.staff-messenger{display:grid;grid-template-columns:minmax(160px,230px) minmax(0,1fr);gap:12px;min-height:65vh}.staff-chat-list,.staff-chat-window{min-width:0;border:1px solid #49395d;border-radius:18px;background:#171121;overflow:hidden}.staff-chat-list{padding:10px;max-height:72vh;overflow-y:auto}.staff-chat-contact{display:flex;align-items:center;gap:10px;width:100%;margin:4px 0;text-align:left;border-radius:14px;background:#211a2b}.staff-chat-contact.active{background:#6840a8;border-color:#b48cff}.staff-chat-avatar{flex:0 0 38px;width:38px;height:38px;border-radius:50%;object-fit:cover;display:grid;place-items:center;background:#6840a8;color:white;font-weight:700}.staff-chat-avatar img{width:100%;height:100%;border-radius:50%;object-fit:cover}.staff-chat-window{display:flex;flex-direction:column;min-height:62vh;background-size:cover;background-position:center}.staff-chat-head{display:flex;align-items:center;gap:10px;padding:12px;background:#211a2bdf;border-bottom:1px solid #49395d}.staff-chat-head button{margin-left:auto}.staff-chat-messages{flex:1;min-height:300px;max-height:55vh;overflow:auto;padding:12px;background:#120d1dcc}.staff-chat-message{display:flex;align-items:flex-end;gap:7px;margin:9px 0}.staff-chat-message.mine{justify-content:flex-end}.staff-chat-bubble{max-width:min(78%,560px);padding:9px 12px;border:1px solid #4c3a63;border-radius:15px 15px 15px 4px;background:#251d32;color:#fff;overflow-wrap:anywhere}.staff-chat-message.mine .staff-chat-bubble{border-radius:15px 15px 4px 15px;background:#57358b}.staff-chat-meta{display:flex;gap:8px;opacity:.72;font-size:11px}.staff-chat-bubble img,.staff-chat-bubble video{display:block;max-width:100%;max-height:340px;margin-top:6px;border-radius:10px}.staff-chat-compose{display:grid;grid-template-columns:1fr auto;gap:8px;padding:10px;background:#211a2b}.staff-chat-compose textarea{min-height:46px;max-height:120px}.staff-chat-tools{display:flex;gap:6px;flex-wrap:wrap;padding:8px;background:#211a2b}.staff-chat-tools input[type=file]{display:none}.staff-chat-empty{padding:18px;text-align:center;opacity:.75}.staff-chat-fab{position:fixed;right:18px;bottom:20px;z-index:20;width:auto;min-width:148px;min-height:52px;padding:0 18px;border:1px solid #d1b3ff;border-radius:999px;background:linear-gradient(120deg,#8754e8,#a56aff);box-shadow:0 8px 28px #8d59ff70;color:#fff;font-weight:800}.staff-chat-fab[hidden]{display:none!important}@media(max-width:700px){.staff-messenger{grid-template-columns:1fr;min-height:0}.staff-chat-list{max-height:170px}.staff-chat-window{min-height:55vh}.staff-chat-messages{min-height:220px;max-height:42vh}.staff-chat-fab{right:14px;bottom:14px;min-width:0;padding:0 15px}}
 </style></head><body>
 <header><div class="brand-row"><button id="cloudLogo" class="cloud-logo" aria-label="Cloud Hub" onclick="startSnowfall()"><svg viewBox="0 0 64 44" aria-hidden="true"><path d="M17 37h32a11 11 0 0 0 1-22A18 18 0 0 0 16 19a9 9 0 0 0 1 18Z"/></svg></button><div><h1>Cloud Hub</h1><small>Магазин · каталог · замовлення</small></div><div id="catWidget" class="cat-widget"><button id="catCompanion" class="cat-companion" type="button" aria-label="Погладити котика" title="Натисни — котик нявкне"><svg class="cat-svg" viewBox="0 0 52 52" aria-hidden="true"><path class="cat-tail" d="M10 38C3 36 4 27 9 25"/><path class="cat-head" d="M9 23 8 9l13 8a19 19 0 0 1 10 0l13-8-1 15a17 17 0 0 1-34-1Z"/><path class="cat-muzzle" d="M18 31q8 8 16 0"/><ellipse class="cat-eye" cx="19" cy="26" rx="3" ry="4"/><ellipse class="cat-eye" cx="33" cy="26" rx="3" ry="4"/><circle class="cat-pupil" cx="20" cy="27" r="1.4"/><circle class="cat-pupil" cx="34" cy="27" r="1.4"/><path class="cat-nose" d="m24 32 2 2 2-2"/></svg></button><span id="catSpeech" class="cat-speech hidden" role="status"></span></div><button id="soundToggle" class="sound-toggle" type="button" aria-label="Увімкнути звук" aria-pressed="false" onclick="toggleSound()">🔇</button></div><button id="webLogout" class="hidden" onclick="webLogout()">Log out</button><div id="snowfallFx"></div></header><main>
 <div id="banners"></div><input id="search" class="search" placeholder="Пошук товарів…"><div id="categories" class="chips"></div><div id="products" class="grid"></div><div id="catalogBanners"></div>
@@ -12126,7 +12166,7 @@ function paintSoundToggle(){let b=document.getElementById('soundToggle');if(!b)r
 function toggleSound(){uiSoundEnabled=!uiSoundEnabled;localStorage.setItem(UI_SOUND_KEY,uiSoundEnabled?'1':'0');if(uiSoundEnabled)playUiSound('success');paintSoundToggle()}
 function playUiSound(kind='tap'){if(!uiSoundEnabled)return;try{let AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;uiSoundContext=uiSoundContext||new AC();if(uiSoundContext.state==='suspended')uiSoundContext.resume();let notes=kind==='success'?[523.25,659.25,783.99]:kind==='favorite'?[659.25,880]:kind==='remove'?[440,349.23]:kind==='add'?[587.33,783.99]:[523.25],start=uiSoundContext.currentTime;notes.forEach((hz,i)=>{let osc=uiSoundContext.createOscillator(),gain=uiSoundContext.createGain(),at=start+i*.075;osc.type='sine';osc.frequency.setValueAtTime(hz,at);gain.gain.setValueAtTime(.0001,at);gain.gain.exponentialRampToValueAtTime(.035,at+.012);gain.gain.exponentialRampToValueAtTime(.0001,at+.13);osc.connect(gain);gain.connect(uiSoundContext.destination);osc.start(at);osc.stop(at+.14)})}catch(e){}}
 paintSoundToggle();
-const headers={'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''};const inTelegram=Boolean(tg?.initData);let authenticated=inTelegram,webSession=false;const GUEST_CART_KEY='cloudhub.guest-cart.v1';let guestCart=[];try{guestCart=JSON.parse(localStorage.getItem(GUEST_CART_KEY)||'[]');if(!Array.isArray(guestCart))guestCart=[]}catch(e){guestCart=[]}let category=null,productPage=1,productPageSize=20,selectedBrandId='',products=[],popularProductIds=new Set(),cart=[],favorites=new Set(),canManageBanners=false,canManageOwner=false,canManageCatalog=false,canEditCatalog=false,canViewCustomers=false,canAdjustLoyalty=false,canViewOrders=false,canUpdateOrders=false,canConfirmPayment=false,canViewSupport=false,canReplySupport=false,canManageInventory=false,canConfirmInventory=false,banners=[],npCityRef="",npWarehouseRef="",checkoutKey="",photoObserver=null;const photoUrls=new Map(),photoRequests=new Map();
+const headers={'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''};const inTelegram=Boolean(tg?.initData);let authenticated=inTelegram,webSession=false;const GUEST_CART_KEY='cloudhub.guest-cart.v1';let guestCart=[];try{guestCart=JSON.parse(localStorage.getItem(GUEST_CART_KEY)||'[]');if(!Array.isArray(guestCart))guestCart=[]}catch(e){guestCart=[]}let category=null,productPage=1,productPageSize=20,selectedBrandId='',products=[],popularProductIds=new Set(),cart=[],favorites=new Set(),canManageBanners=false,canManageOwner=false,canManageCatalog=false,canEditCatalog=false,canViewCustomers=false,canAdjustLoyalty=false,canViewOrders=false,canUpdateOrders=false,canConfirmPayment=false,canViewSupport=false,canReplySupport=false,canManageInventory=false,canConfirmInventory=false,canUseStaffChat=false,banners=[],npCityRef="",npWarehouseRef="",checkoutKey="",photoObserver=null;const photoUrls=new Map(),photoRequests=new Map();
 const $=id=>document.getElementById(id);function money(v){return new Intl.NumberFormat('uk-UA',{maximumFractionDigits:2}).format(Number(v||0))+' грн'}
 let toastTimer;function msg(t){let el=$('status');el.textContent=t;el.classList.remove('hidden');el.setAttribute('role','status');el.style.cssText='position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:1000;width:max-content;max-width:calc(100vw - 32px);padding:13px 18px;border:1px solid #a879ff;border-radius:18px;background:rgba(39,25,65,.97);box-shadow:0 8px 28px #0008;color:#fff;text-align:center;font-weight:700;animation:toastIn .22s ease-out';clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.add('hidden'),2400)}
 const apiReadCache=new Map(),apiReadОчікують=new Map();
@@ -12154,7 +12194,7 @@ function loadProductPhotos(){if(photoObserver)photoObserver.disconnect();const i
 function editDistance(a,b){if(Math.abs(a.length-b.length)>2)return 99;let prev=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){let curr=[i],rowMin=i;for(let j=1;j<=b.length;j++){let v=Math.min(curr[j-1]+1,prev[j]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));curr[j]=v;rowMin=Math.min(rowMin,v)}if(rowMin>2)return 99;prev=curr}return prev[b.length]}
 function productMatches(p,q){if(!q)return true;let fields=`${p.name} ${p.brand||''} ${p.sku||''} ${p.variant_name||''}`.toLowerCase();if(fields.includes(q))return true;let needles=q.split(/\s+/).filter(Boolean),words=fields.split(/[^\p{L}\p{N}]+/u).filter(Boolean);return needles.every(n=>{if(words.some(w=>w.includes(n)))return true;if(n.length<4)return false;let max=n.length>=8?2:1;return words.some(w=>Math.abs(w.length-n.length)<=max&&editDistance(n,w)<=max)})}
 function renderProducts(){setActiveTab('shopBtn');hideSections();let q=$('search').value.toLowerCase().trim();let arr=products.filter(p=>(!category||(category===0?popularProductIds.has(Number(p.product_id)):(p.storefront_category_id??p.category_id)===category))&&(!selectedBrandId||Number(p.brand_id)===Number(selectedBrandId))&&productMatches(p,q));let productIds=[...new Set(arr.map(p=>Number(p.product_id)))],empty=q?'Нічого не знайдено. Перевірте написання або пошукайте коротше.':category===0?'Популярне з’явиться після перших покупок.':category?'У цій категорії зараз немає товарів у наявності.':'Каталог наразі порожній.';let brands=[...new Map(products.filter(p=>p.brand_id&&p.brand).map(p=>[Number(p.brand_id),String(p.brand)])).entries()].sort((a,b)=>a[1].localeCompare(b[1],'uk'));let filter=`<div class="catalog-controls"><select id="brandFilter" aria-label="Фільтр за виробником" onchange="setBrandFilter(this.value)"><option value="">Усі виробники</option>${brands.map(([id,name])=>`<option value="${id}" ${String(id)===String(selectedBrandId)?'selected':''}>${esc(name)}</option>`).join('')}</select><span>Показано ${Math.min(productPage*productPageSize,productIds.length)} із ${productIds.length}</span></div>`;let pageIds=new Set(productIds.slice(0,productPage*productPageSize)),shown=arr.filter(p=>pageIds.has(Number(p.product_id)));let more=pageIds.size<productIds.length?`<div class="load-more-wrap"><button class="primary" onclick="showMoreProducts()">Показати ще ${Math.min(productPageSize,productIds.length-pageIds.size)} товарів</button></div>`:'';$('products').innerHTML=filter+(productCards(shown)||`<div class="notice">${empty}</div>`)+more;loadProductPhotos()}function showMoreProducts(){productPage++;renderProducts()}function setBrandFilter(id){selectedBrandId=id;productPage=1;track('brand_filter',id||'all');renderProducts()}
-async function load(){try{let d=await api('/api/miniapp/bootstrap');track('visit',visitSource());authenticated=Boolean(d.authenticated||inTelegram);webSession=Boolean(d.web_session);$("webLogout").classList.toggle("hidden",!webSession);products=d.products;popularProductIds=new Set((d.popular_product_ids||[]).map(Number));favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canAdjustLoyalty=Boolean(d.can_adjust_loyalty);canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;canConfirmPayment=Boolean(d.can_confirm_payment);canViewSupport=d.can_view_support;canReplySupport=d.can_reply_support;canManageInventory=Boolean(d.can_manage_inventory);canConfirmInventory=Boolean(d.can_confirm_inventory);let staffMode=canManageOwner||canManageCatalog||canEditCatalog||canViewCustomers||canViewOrders||canViewSupport||canManageInventory||canConfirmInventory||canManageBanners;document.body.classList.toggle('staff-mode',staffMode);banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі товари</button>'+(popularProductIds.size?'<button class="chip" onclick="setCat(0,this)">Популярне</button>':'')+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();let directVariant=new URLSearchParams(location.search).get('variant');if(!directVariant){let startParam=tg?.initDataUnsafe?.start_param||'';let match=startParam.match(/^(?:product|variant)_(\d+)$/);if(match)directVariant=match[1]}if(directVariant&&products.some(p=>Number(p.variant_id)===Number(directVariant)))openProduct(Number(directVariant));if((webSession||inTelegram)&&guestCart.length){try{await Promise.all(guestCart.map(line=>api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:line.variant_id,quantity:line.quantity})})));guestCart=[];localStorage.removeItem(GUEST_CART_KEY)}catch(e){msg('Guest cart sync failed; it remains saved here.')}}loadCart();if(new URLSearchParams(location.search).get('support')==='1')openSupport();if(canManageBanners)renderBannerAdmin();if(canManageOwner){renderOwnerEntry();renderAnalyticsEntry()}if(staffMode){renderStaffEntry();loadStaffTools()}if(canManageInventory)renderInventoryEntry()}catch(e){$('products').innerHTML='<div class="notice">Магазин тимчасово не відповідає. Кошик і ваші дані залишаються збереженими.<br><button class="primary" onclick="load()">Спробувати ще</button></div>';$('products').classList.remove('hidden');msg(e.message)}}
+async function load(){try{let d=await api('/api/miniapp/bootstrap');track('visit',visitSource());authenticated=Boolean(d.authenticated||inTelegram);webSession=Boolean(d.web_session);$("webLogout").classList.toggle("hidden",!webSession);products=d.products;popularProductIds=new Set((d.popular_product_ids||[]).map(Number));favorites=new Set((d.favorite_product_ids||[]).map(Number));canManageBanners=d.can_manage_banners;canManageOwner=d.can_manage_owner;canManageCatalog=d.can_manage_catalog;canEditCatalog=d.can_edit_catalog;canViewCustomers=d.can_view_customers;canAdjustLoyalty=Boolean(d.can_adjust_loyalty);canViewOrders=d.can_view_orders;canUpdateOrders=d.can_update_orders;canConfirmPayment=Boolean(d.can_confirm_payment);canViewSupport=d.can_view_support;canReplySupport=d.can_reply_support;canManageInventory=Boolean(d.can_manage_inventory);canConfirmInventory=Boolean(d.can_confirm_inventory);canUseStaffChat=Boolean(d.can_use_staff_chat);let staffMode=canManageOwner||canManageCatalog||canEditCatalog||canViewCustomers||canViewOrders||canViewSupport||canManageInventory||canConfirmInventory||canManageBanners||canUseStaffChat;document.body.classList.toggle('staff-mode',staffMode);banners=d.banners||[];renderBanners();$('categories').innerHTML='<button class="chip active" onclick="setCat(null,this)">Усі товари</button>'+(popularProductIds.size?'<button class="chip" onclick="setCat(0,this)">Популярне</button>':'')+d.categories.map(c=>`<button class="chip" onclick="setCat(${c.id},this)">${esc(c.name)}</button>`).join('');renderProducts();let directVariant=new URLSearchParams(location.search).get('variant');if(!directVariant){let startParam=tg?.initDataUnsafe?.start_param||'';let match=startParam.match(/^(?:product|variant)_(\d+)$/);if(match)directVariant=match[1]}if(directVariant&&products.some(p=>Number(p.variant_id)===Number(directVariant)))openProduct(Number(directVariant));if((webSession||inTelegram)&&guestCart.length){try{await Promise.all(guestCart.map(line=>api('/api/miniapp/cart',{method:'PUT',body:JSON.stringify({variant_id:line.variant_id,quantity:line.quantity})})));guestCart=[];localStorage.removeItem(GUEST_CART_KEY)}catch(e){msg('Guest cart sync failed; it remains saved here.')}}loadCart();if(new URLSearchParams(location.search).get('support')==='1')openSupport();if(canManageBanners)renderBannerAdmin();if(canManageOwner){renderOwnerEntry();renderAnalyticsEntry()}if(staffMode){renderStaffEntry();loadStaffTools()}if(canUseStaffChat&&new URLSearchParams(location.search).get('staffchat')==='1')openStaffMessenger();if(canManageInventory)renderInventoryEntry()}catch(e){$('products').innerHTML='<div class="notice">Магазин тимчасово не відповідає. Кошик і ваші дані залишаються збереженими.<br><button class="primary" onclick="load()">Спробувати ще</button></div>';$('products').classList.remove('hidden');msg(e.message)}}
 async function toggleFavorite(productId){if(!authenticated){msg('Щоб зберегти обране, увійдіть через Telegram.');return}try{let add=!favorites.has(Number(productId));let d=await api('/api/miniapp/favorites',{method:'POST',body:JSON.stringify({product_id:productId,active:add})});favorites=new Set((d.product_ids||[]).map(Number));playUiSound(add?'favorite':'remove');msg(add?'Додано в обране ♥':'Прибрано з обраного');if(!$('favorites').classList.contains('hidden'))await loadFavorites();else renderProducts()}catch(e){msg(e.message)}}
 async function loadFavorites(){track('favorites_view');setActiveTab('favoritesBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('favorites').classList.remove('hidden');if(!authenticated){$('favorites').innerHTML='<h2>Обране</h2>'+telegramPrompt();return}try{if(!favorites.size){$('favorites').innerHTML='<h2>Обране</h2><div class="notice">В обраному поки немає товарів</div>';return}let items=products.filter(p=>favorites.has(Number(p.product_id)));$('favorites').innerHTML='<h2>Обране</h2>'+ (items.length?productCards(items):'<div class="notice">В обраному поки немає доступних товарів</div>')}catch(e){$('favorites').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function loadLoyalty(){track('loyalty_view');setActiveTab('loyaltyBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('loyaltyPanel').classList.remove('hidden');if(!authenticated){$('loyaltyPanel').innerHTML='<h2>Бонуси</h2>'+telegramPrompt();return}$('loyaltyPanel').innerHTML='<h2>Бонусна карта</h2><div class="notice" role="status">Завантажую бонусний рахунок…</div>';try{let d=await api('/api/miniapp/profile',{timeoutMs:10000});let share=d.referral_link?`<a class="banner" href="https://t.me/share/url?url=${encodeURIComponent(d.referral_link)}&text=${encodeURIComponent('Приєднуйся до Cloud Hub за моїм посиланням')}" target="_blank" rel="noopener"><div><b>Запросити друга</b><p>Після першого отриманого замовлення ви обоє отримаєте по 50 бонусів. Код: ${esc(d.referral_code)}</p></div></a>`:`<div class="notice">Код запрошення: ${esc(d.referral_code||'')}. Якщо посилання ще не готове, поділіться кодом із другом.</div>`;$('loyaltyPanel').innerHTML=`<h2>Бонусна карта</h2><div class="grid"><div class="card"><small>Доступно</small><h3>${money(d.bonus_available||0)}</h3></div><div class="card"><small>Нарахуємо після отримання</small><h3>${money(d.bonus_pending||0)}</h3></div></div><div class="notice">Картка: <b>${esc(d.loyalty_card_number||'—')}</b><br>1 бонус = 1 грн. Бонусами можна оплатити до 100% вартості товарів.</div>${share}<section class="referral-summary"><h3>Твої запрошення</h3><div class="grid"><article class="card referral-metric"><small>Запросив друзів</small><h3>${Number(d.referrals?.referred||0)}</h3></article><article class="card referral-metric"><small>Отримали замовлення</small><h3>${Number(d.referrals?.converted||0)}</h3></article><article class="card referral-metric"><small>Чекають на перше замовлення</small><h3>${Number(d.referrals?.pending||0)}</h3></article><article class="card referral-metric"><small>Нараховано за рефералів</small><h3>${money(d.referrals?.bonus_earned||0)}</h3></article></div><p class="muted">По 50 бонусів вам і другу нараховуємо після отримання першого замовлення.</p></section><button onclick="loadOwnerDashboard()" ${canManageOwner?'':'class="hidden"'}>Панель власника</button>`}catch(e){$('loyaltyPanel').innerHTML=`<h2>Бонусна карта</h2><div class="notice">${esc(e.message)}<br><button class="primary" onclick="loadLoyalty()">Завантажити ще раз</button></div>`}}
@@ -12282,6 +12322,22 @@ function renderAnalyticsEntry(){if(!document.getElementById('analyticsBtn')){let
 async function loadReplenishment(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">Рахую продажі та запас…</div>';try{let d=await api('/api/miniapp/admin/replenishment');$('ownerPanel').innerHTML=`<h2>Рекомендації закупівлі</h2><div class="notice">Попит рахується за останні 7 днів. Цільовий запас покриває 5 днів доставки, ще 5 днів до наступного циклу закупівлі та 2 дні резерву. Списання не враховуються.</div><button id="restockPdfNow" class="primary" onclick="generateRestockPdf()">📄 Сформувати PDF закупівлі зараз</button>${d.items.length?`<div class="grid">${d.items.map(x=>`<article class="card"><h3>${esc(x.product_name)}</h3><small>SKU: ${esc(x.sku)}</small><p>Продано: ${x.sold_units} за 7 днів · у наявності: ${x.available_qty}</p><p>Середнє: ${x.daily_velocity}/день</p><div class="price">Замовити: ${x.suggested_order_qty}</div></article>`).join('')}</div>`:'<div class="notice">За поточним запасом і продажами термінової закупівлі не потрібно.</div>'}`}catch(e){$('ownerPanel').innerHTML='<h2>Рекомендації закупівлі</h2><div class="notice">'+esc(e.message)+'</div>'}}
 async function generateRestockPdf(){if(!confirm('Сформувати позаплановий PDF рекомендацій і надіслати власнику, адміну та менеджеру? Щотижневий звіт залишиться без змін.'))return;let button=$('restockPdfNow');if(button){button.disabled=true;button.textContent='Формую PDF…'}try{let d=await api('/api/miniapp/admin/replenishment/pdf',{method:'POST',body:'{}'});msg(`PDF закупівель сформовано й поставлено в чергу для ${d.queued} працівників. Позицій до замовлення: ${d.item_count}.`)}catch(e){msg(e.message)}finally{if(button){button.disabled=false;button.textContent='📄 Сформувати PDF закупівлі зараз'}}}
 async function loadOwnerAnalytics(period='day'){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Аналітика магазину</h2><div class="notice">Завантажую показники…</div>';try{let d=await api('/api/miniapp/admin/analytics?period='+encodeURIComponent(period));let daily=d.daily||[],maxVisitors=Math.max(1,...daily.map(x=>Number(x.visitors)||0)),maxOrders=Math.max(1,...daily.map(x=>Number(x.buyers)||0));let chart=daily.length?`<section class="card"><h3>Відвідування й покупки по часу</h3><div class="bar-chart">${daily.map(x=>`<div class="bar-chart-column" title="${esc(x.label)}: ${Number(x.visitors)||0} відвідувачів, ${Number(x.buyers)||0} замовлень"><div class="bar-pair"><i style="height:${Math.max(4,Math.round((Number(x.visitors)||0)/maxVisitors*112))}px"></i><b style="height:${Math.max(3,Math.round((Number(x.buyers)||0)/maxOrders*112))}px"></b></div><small>${esc(x.label)}</small></div>`).join('')}</div><small class="chart-legend"><i></i> відвідувачі <b></b> оформлені замовлення</small></section>`:'<div class="notice">За цей період ще немає подій для графіка.</div>';let funnel=[['Зайшли',Number(d.visitors)||0],['Відкрили товар',Number(d.product_viewers)||0],['Додали в кошик',Number(d.adders)||0],['Відкрили кошик',Number(d.cart_visitors)||0],['Почали оформлення',Number(d.checkouts)||0],['Надіслали замовлення',Number(d.buyers)||0]],maxF=Math.max(1,...funnel.map(x=>x[1]));let loss=funnel.slice(1).map((x,i)=>({from:funnel[i][0],to:x[0],n:Math.max(0,funnel[i][1]-x[1]),pct:funnel[i][1]?Math.round(Math.max(0,funnel[i][1]-x[1])/funnel[i][1]*100):0})).sort((a,b)=>b.pct-a.pct)[0];let advice=!d.visitors?'Трафіку не було: перевірте рекламу, посилання та запуск бота.':loss?.pct>=50?`Найбільший відтік: «${loss.from} → ${loss.to}» (${loss.pct}%). Перевірте цей крок у магазині.`:'Воронка проходить рівномірно. Порівняйте джерела трафіку й замовлення.';let sources=(d.traffic_sources||[]).map(x=>`<div class="row notice analytics-source"><span>${esc(x.source)}</span><b>${Number(x.visitors)||0} людей · ${Number(x.visits)||0} входів</b></div>`).join('')||'<div class="notice">Джерела з’являться після переходів з мітками кампаній.</div>';let brand=String(period);$('ownerPanel').innerHTML=`<h2>Аналітика · ${({day:'сьогодні',week:'7 днів',month:'30 днів',year:'12 місяців'})[brand]}</h2><label for="analyticsPeriod">Період</label><select id="analyticsPeriod" onchange="loadOwnerAnalytics(this.value)"><option value="day" ${period==='day'?'selected':''}>Сьогодні</option><option value="week" ${period==='week'?'selected':''}>7 днів</option><option value="month" ${period==='month'?'selected':''}>30 днів</option><option value="year" ${period==='year'?'selected':''}>12 місяців</option></select><div class="grid analytics-grid"><div class="card"><small>Відвідувачі</small><h3>${Number(d.visitors)||0}</h3></div><div class="card"><small>Запуски бота</small><h3>${Number(d.bot_starts)||0}</h3></div><div class="card"><small>Переглянули товар</small><h3>${Number(d.product_viewers)||0}</h3></div><div class="card"><small>Додали в кошик</small><h3>${Number(d.adders)||0} · ${Number(d.add_clicks)||0} натискань</h3></div><div class="card"><small>Оформлення розпочато</small><h3>${Number(d.checkouts)||0}</h3></div><div class="card"><small>Замовлення надіслано</small><h3>${Number(d.buyers)||0}</h3></div></div>${chart}<section class="ops-group"><h3>Де зупиняються</h3>${funnel.map((x,i)=>`<div class="funnel-step"><div class="row"><span>${x[0]}</span><b>${x[1]}</b></div><div class="funnel-track"><i style="width:${Math.max(x[1]?4:0,Math.round(x[1]/maxF*100))}%"></i></div></div>`).join('')}<div class="notice">${esc(advice)}</div></section><section class="ops-group"><h3>Джерела переходів</h3>${sources}<h3>Реферали</h3><div class="grid analytics-grid"><div class="card">Запрошено: <b>${Number(d.referrals?.referred)||0}</b></div><div class="card">Зробили перше замовлення: <b>${Number(d.referrals?.converted)||0}</b></div><div class="card">Очікують: <b>${Number(d.referrals?.pending)||0}</b></div><div class="card">Сума замовлень: <b>${money(d.referrals?.referral_revenue||0)}</b></div></div><h3>Найкращі запрошувачі</h3>${(d.top_referrers||[]).map(x=>`<div class="notice analytics-source">${esc(x.referrer)} · код ${esc(x.code)} · ${x.converted}/${x.referred} · ${money(x.revenue)}</div>`).join('')||'<div class="notice">Даних поки немає.</div>'}</section><small>Відвідування анонімні; рекламу порівнюйте за мітками кампаній. Події сайту й Mini App рахуються разом.</small>`}catch(e){$('ownerPanel').innerHTML='<h2>Аналітика</h2><div class="notice">'+esc(e.message)+'<br><button onclick="loadOwnerAnalytics()">Спробувати ще</button></div>'}}
+const loadStaffToolsBeforeMessenger=loadStaffTools;
+loadStaffTools=function(){loadStaffToolsBeforeMessenger();if(!canUseStaffChat||document.getElementById('staffMessengerEntry'))return;let section=document.createElement('section');section.id='staffMessengerEntry';section.className='ops-group';section.innerHTML='<h3>Внутрішній зв’язок</h3><button class="primary" onclick="openStaffMessenger()">💬 Відкрити месенджер команди</button>';document.getElementById('staffContent')?.before(section)};
+let staffMessenger=null;const staffChatAvatarUrls=new Map(),staffChatAttachmentUrls=new Map();
+async function staffChatBinary(path){let r=await fetch(path,{headers:{'X-Telegram-Init-Data':tg?.initData||''},credentials:'same-origin',cache:'no-store'});if(!r.ok){let d=await r.json().catch(()=>({}));throw Error(d.error||'Не вдалося завантажити вкладення')}return r.blob()}
+async function staffChatAvatarUrl(id){id=Number(id);if(staffChatAvatarUrls.has(id))return staffChatAvatarUrls.get(id);try{let b=await staffChatBinary(`/api/miniapp/staff/messenger/profile/${id}/avatar`),u=URL.createObjectURL(b);staffChatAvatarUrls.set(id,u);return u}catch(e){return null}}
+async function openStaffMessenger(){if(!canUseStaffChat){msg('Месенджер доступний лише працівникам.');return}if(staffMessenger?.poll)clearInterval(staffMessenger.poll);hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('banners').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>💬 Месенджер команди</h2><div class="notice">Відкриваю захищені чати…</div>';try{let d=await api('/api/miniapp/staff/messenger/bootstrap',{fresh:true});staffMessenger={me:Number(d.me),myName:d.my_name,staff:d.staff||[],current:'group',poll:null,before:null,hasMore:false};let coworkers=staffMessenger.staff.filter(x=>Number(x.telegram_id)!==staffMessenger.me);$('staffPanel').innerHTML=`<div class="row"><h2>💬 Месенджер команди</h2><button onclick="loadStaffTools()">← Робоча панель</button></div><div class="staff-messenger"><aside id="staffChatList" class="staff-chat-list"></aside><section class="staff-chat-window" id="staffChatWindow"><div class="staff-chat-head"><div id="staffChatPeerAvatar" class="staff-chat-avatar">☁</div><div><b id="staffChatTitle">Командна група</b><br><small>Лише активні працівники Cloud Hub</small></div><button onclick="document.getElementById('staffAvatarInput').click()" title="Змінити фото профілю">Фото профілю</button></div><div id="staffChatMessages" class="staff-chat-messages"><div class="staff-chat-empty">Оберіть чат</div></div><div class="staff-chat-tools"><input id="staffAvatarInput" type="file" accept="image/jpeg,image/png,image/webp" onchange="saveStaffChatImage('avatar',this)"><input id="staffBackgroundInput" type="file" accept="image/jpeg,image/png,image/webp" onchange="saveStaffChatImage('background',this)"><button onclick="document.getElementById('staffBackgroundInput').click()">🖼 Фон чату</button><button onclick="loadStaffChatMessages(true)">↻ Оновити</button></div><div class="staff-chat-compose"><textarea id="staffChatText" maxlength="4000" placeholder="Повідомлення команді…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendStaffChatMessage()}"></textarea><button id="staffChatAttach" onclick="document.getElementById('staffChatFile').click()">📎 Фото / відео</button><input id="staffChatFile" type="file" accept="image/jpeg,image/png,image/webp,video/mp4,video/webm,video/quicktime" onchange="staffChatFilePicked(this)"><button id="staffChatSend" class="primary" onclick="sendStaffChatMessage()">Надіслати</button></div><small id="staffChatFileLabel" class="muted"></small></section></div>`;let list=$('staffChatList');list.innerHTML=`<button class="staff-chat-contact active" data-conversation="group" onclick="selectStaffChat('group','Командна група','')"><span class="staff-chat-avatar">☁</span><span><b>Командна група</b><br><small>Загальний чат працівників</small></span></button><h3>Особисті повідомлення</h3>${coworkers.map(s=>`<button class="staff-chat-contact" data-conversation="dm:${Number(s.telegram_id)}" onclick="selectStaffChat('dm:${Number(s.telegram_id)}','${esc(s.display_name)}','${esc(s.role)}')"><span class="staff-chat-avatar" id="staffChatContactAvatar-${Number(s.telegram_id)}">${esc((s.display_name||'?').trim().slice(0,1).toUpperCase())}</span><span><b>${esc(s.display_name)}</b><br><small>${esc(s.role)}</small></span></button>`).join('')}`;selectStaffChat('group','Командна група','');if(d.profile?.has_background)loadStaffChatBackground()}catch(e){$('staffPanel').innerHTML='<h2>Месенджер команди</h2><div class="notice">'+esc(e.message)+'</div>'}}
+async function selectStaffChat(conversation,title,role){if(!staffMessenger)return;if(staffMessenger.poll)clearInterval(staffMessenger.poll);staffMessenger.current=conversation;staffMessenger.before=null;staffMessenger.hasMore=false;$('staffChatTitle').textContent=title;$('staffChatMessages').innerHTML='<div class="staff-chat-empty">Завантажую повідомлення…</div>';document.querySelectorAll('.staff-chat-contact').forEach(x=>x.classList.toggle('active',x.dataset.conversation===conversation));let target=conversation.startsWith('dm:')?Number(conversation.split(':')[1]):0;$('staffChatPeerAvatar').textContent=target?title.trim().slice(0,1).toUpperCase():'☁';if(target){let avatar=await staffChatAvatarUrl(target);if(avatar)$('staffChatPeerAvatar').innerHTML=`<img src="${avatar}" alt="">`}await loadStaffChatMessages(true);staffMessenger.poll=setInterval(()=>{if(staffMessenger&&staffMessenger.current===conversation)loadStaffChatMessages(false)},5000)}
+async function loadStaffChatMessages(reset=false,older=false){if(!staffMessenger)return;let host=$('staffChatMessages');if(!host)return;try{let q=new URLSearchParams({conversation:staffMessenger.current});if(older&&staffMessenger.before)q.set('before',staffMessenger.before);let d=await api('/api/miniapp/staff/messenger/messages?'+q.toString(),{fresh:true,timeoutMs:25000});if(reset||older){staffMessenger.hasMore=Boolean(d.has_more);staffMessenger.before=d.next_before;}if(reset)host.innerHTML=d.has_more?'<button class="staff-chat-older" onclick="loadOlderStaffChat()">Завантажити старіші</button>':'';let items=d.items||[];if(reset&&!items.length)host.innerHTML='<div class="staff-chat-empty">Поки повідомлень немає. Напишіть команді першим 👋</div>';for(let m of items){if(host.querySelector('[data-message-id=+m.id+]'))continue;let avatar=m.sender_id===staffMessenger.me?null:await staffChatAvatarUrl(m.sender_id),mine=Number(m.sender_id)===staffMessenger.me,stamp=new Date(m.created_at).toLocaleString('uk-UA',{hour:'2-digit',minute:'2-digit',day:'2-digit',month:'2-digit'}),attachment=m.has_attachment?`<button class="staff-chat-attachment" data-message="${Number(m.id)}" onclick="openStaffChatAttachment(${Number(m.id)},this)">${m.attachment_mime?.startsWith('video/')?'▶ Відкрити відео':'🖼 Відкрити фото'} · ${esc(m.attachment_name||'вкладення')}</button>`:'';let html=`<article class="staff-chat-message ${mine?'mine':''}" data-message-id="${Number(m.id)}">${!mine?`<span class="staff-chat-avatar">${avatar?`<img src="${avatar}" alt="">`:esc((m.sender_name||'?').trim().slice(0,1).toUpperCase())}</span>`:''}<div class="staff-chat-bubble">${!mine?`<div class="staff-chat-meta"><b>${esc(m.sender_name)}</b><span>${esc(m.sender_role)}</span></div>`:''}${m.body?`<div>${esc(m.body).replace(/\n/g,'<br>')}</div>`:''}${attachment}<div class="staff-chat-meta"><span>${esc(stamp)}</span></div></div></article>`;host.insertAdjacentHTML('beforeend',html)}if(reset||items.length)host.scrollTop=host.scrollHeight}catch(e){if(reset)host.innerHTML='<div class="staff-chat-empty">'+esc(e.message)+'<br><button onclick="loadStaffChatMessages(true)">Спробувати ще</button></div>'}}
+async function loadOlderStaffChat(){if(!staffMessenger?.hasMore)return;let host=$('staffChatMessages'),oldHeight=host.scrollHeight,oldTop=host.scrollTop;await loadStaffChatMessages(false,true);host.scrollTop=host.scrollHeight-oldHeight+oldTop}
+async function sendStaffChatMessage(){if(!staffMessenger)return;let text=$('staffChatText')?.value.trim()||'',file=$('staffChatFile')?.files?.[0],attachment=null;if(!text&&!file){msg('Напишіть повідомлення або прикріпіть фото чи відео.');return}if(file){if(file.size>6*1024*1024){msg('Файл завеликий. Максимум 6 МБ.');return}attachment=await new Promise((resolve,reject)=>{let reader=new FileReader();reader.onload=()=>resolve({name:file.name,mime:file.type,data:String(reader.result)});reader.onerror=()=>reject(Error('Не вдалося прочитати файл'));reader.readAsDataURL(file)})}let btn=$('staffChatSend');btn.disabled=true;try{await api('/api/miniapp/staff/messenger/messages',{method:'POST',body:JSON.stringify({conversation:staffMessenger.current,text,attachment})});$('staffChatText').value='';$('staffChatFile').value='';$('staffChatFileLabel').textContent='';await loadStaffChatMessages(true)}catch(e){msg(e.message)}finally{btn.disabled=false}}
+function staffChatFilePicked(input){let f=input.files?.[0];$('staffChatFileLabel').textContent=f?`Додано: ${f.name} · ${(f.size/1024/1024).toFixed(1)} МБ`:''}
+async function openStaffChatAttachment(id,button){if(staffChatAttachmentUrls.has(Number(id))){let url=staffChatAttachmentUrls.get(Number(id));insertStaffChatMedia(button,url,button.dataset.mime||'');return}button.disabled=true;try{let blob=await staffChatBinary(`/api/miniapp/staff/messenger/messages/${Number(id)}/attachment`),url=URL.createObjectURL(blob);staffChatAttachmentUrls.set(Number(id),url);button.dataset.mime=blob.type;insertStaffChatMedia(button,url,blob.type)}catch(e){msg(e.message);button.disabled=false}}
+function insertStaffChatMedia(button,url,mime){let node;if(mime.startsWith('video/')){node=document.createElement('video');node.controls=true;node.playsInline=true;node.src=url}else{node=document.createElement('img');node.src=url;node.alt='Фото з робочого чату'}button.replaceWith(node)}
+async function saveStaffChatImage(kind,input){let file=input.files?.[0];if(!file)return;let max=kind==='avatar'?512*1024:2*1024*1024;if(file.size>max){msg(`Файл завеликий. Максимум ${kind==='avatar'?'0.5':'2'} МБ.`);input.value='';return}try{let data=await new Promise((resolve,reject)=>{let r=new FileReader();r.onload=()=>resolve(String(r.result));r.onerror=()=>reject(Error('Не вдалося прочитати фото'));r.readAsDataURL(file)});await api('/api/miniapp/staff/messenger/profile',{method:'POST',body:JSON.stringify({kind,name:file.name,mime:file.type,data})});staffChatAvatarUrls.delete(staffMessenger.me);msg(kind==='avatar'?'Фото профілю оновлено':'Фон чату оновлено');if(kind==='background')loadStaffChatBackground();else selectStaffChat(staffMessenger.current,$('staffChatTitle').textContent,'');}catch(e){msg(e.message)}finally{input.value=''}}
+async function loadStaffChatBackground(){try{let b=await staffChatBinary(`/api/miniapp/staff/messenger/profile/${staffMessenger.me}/background`),u=URL.createObjectURL(b);$('staffChatWindow').style.backgroundImage=`linear-gradient(#120d1d99,#120d1d99),url("${u}")`}catch(e){}}
+
 async function loadStaffCatalog(query=null){try{let q=query===null?(prompt('Пошук за назвою або SKU')||''):query;window.staffCatalogQuery=q;let d=await api('/api/miniapp/staff/catalog?q='+encodeURIComponent(q),{fresh:true}),seen=new Set(),items=Array.isArray(d.items)?d.items:[],cards=items.map(p=>{let first=!seen.has(Number(p.product_id));seen.add(Number(p.product_id));let categoryLabel=(d.categories||[]).find(c=>Number(c.id)===Number(p.category_id));return `<article class="card" data-product="${Number(p.product_id)}" data-variant="${Number(p.variant_id)}"><div class="row"><b>${esc(p.name)} ${esc(p.variant_name||'')}</b><b>${money(p.price)}</b></div>${p.media_id?`<img class="admin-product-photo" loading="lazy" src="/api/miniapp/products/${Number(p.media_id)}/photo" alt="${esc(p.name)}">`:''}<input data-field="name" value="${esc(p.name)}" placeholder="Назва товару"><textarea data-field="description" placeholder="Опис">${esc(p.description||'')}</textarea><input data-field="sku" value="${esc(p.sku)}" placeholder="SKU"><input data-field="price" type="number" min="0" step="0.01" value="${Number(p.price)}" placeholder="Ціна"><select data-field="category"><option value="">Без категорії</option>${(d.categories||[]).map(c=>`<option value="${Number(c.id)}" ${Number(p.category_id)===Number(c.id)?'selected':''}>${c.parent_id?'↳ ':''}${esc(c.name)}</option>`).join('')}</select><select data-field="badge"><option value="" ${!p.storefront_badge?'selected':''}>Без плашки</option><option value="Bestseller" ${p.storefront_badge==='Bestseller'?'selected':''}>Bestseller</option><option value="MEGA SALE" ${p.storefront_badge==='MEGA SALE'?'selected':''}>MEGA SALE</option><option value="Акція" ${p.storefront_badge==='Акція'?'selected':''}>Акція</option></select><div class="notice">Категорія: ${esc(categoryLabel?.name||'Без категорії')} · залишок: ${Number(p.stock_qty)} · зарезервовано: ${Number(p.reserved_qty)}</div>${canEditCatalog?`<label class="check"><input data-field="active" type="checkbox" ${p.active?'checked':''}> Активний у каталозі</label><label class="check"><input data-field="hidden" type="checkbox" ${p.manually_hidden?'checked':''}> Приховати</label><input data-field="reason" placeholder="Причина зміни"><button class="primary" onclick="saveStaffProduct(this)">Зберегти товар</button><label>Нове фото <input data-field="photo" type="file" accept="image/png,image/jpeg,image/webp"></label><button onclick="uploadStaffPhoto(this)">Замінити фото</button><div class="formgrid"><input data-field="delta" type="number" step="1" placeholder="Зміна залишку (+/−)"><input data-field="stockReason" placeholder="Причина коригування"><button onclick="adjustStaffStock(this)">Змінити залишок</button></div>${first?`<details class="variant-editor"><summary>Додати інший об’єм / варіант</summary><div class="formgrid"><select data-new-variant="name"><option value="10 мл">10 мл</option><option value="15 мл">15 мл</option><option value="30 мл">30 мл</option><option value="1 шт.">1 шт.</option><option value="">Інший розмір…</option></select><input data-new-variant="custom-name" placeholder="Свій об’єм або розмір"><input data-new-variant="sku" placeholder="Унікальний SKU"><input data-new-variant="price" type="number" min="0" step="0.01" placeholder="Ціна, грн"><input data-new-variant="stock" type="number" min="0" step="1" value="0" placeholder="Початковий залишок"></div><button onclick="addStaffVariant(${Number(p.product_id)},this)">Додати варіант до цього товару</button></details>`:''}`:''}</article>`}).join('');let createPanel=canEditCatalog?`<section class="ops-group"><div class="row"><h3>Додати товар</h3><button type="button" onclick="loadStaffCategories()">Керування категоріями</button></div><input id="newProductName" placeholder="Назва товару"><select id="newProductCategory"><option value="">Оберіть категорію</option>${(d.categories||[]).map(c=>`<option value="${Number(c.id)}">${c.parent_id?'↳ ':''}${esc(c.name)}</option>`).join('')}</select><textarea id="newProductDescription" placeholder="Опис товару"></textarea><h4>Перший варіант товару</h4><div class="formgrid"><input id="newProductVariantName" placeholder="Об’єм / розмір: 10 мл, 15 мл, 30 мл, 1 шт…"><input id="newProductSku" placeholder="Унікальний SKU"><input id="newProductPrice" type="number" min="0" step="0.01" placeholder="Ціна, грн"><input id="newProductStock" type="number" min="0" step="1" value="0" placeholder="Залишок"></div><button class="primary" onclick="createStaffProduct()">Створити товар</button></section>`:'';$('staffContent').innerHTML=createPanel+`<div class="row"><h3>Товари та варіанти</h3><button onclick="loadStaffCatalog('')">Оновити список</button></div>`+(cards||'<div class="notice">Товари не знайдені.</div>')}catch(e){$('staffContent').innerHTML='<div class="notice">Не вдалося завантажити товари: '+esc(e.message)+'<br><button onclick="loadStaffCatalog(\'\')">Спробувати ще</button></div>'}}
 async function addStaffVariant(productId,button){let box=button.closest('details'),name=(box?.querySelector('[data-new-variant=name]')?.value||box?.querySelector('[data-new-variant=custom-name]')?.value||'').trim(),sku=box?.querySelector('[data-new-variant=sku]')?.value.trim(),price=box?.querySelector('[data-new-variant=price]')?.value,stock=box?.querySelector('[data-new-variant=stock]')?.value;try{await api(`/api/miniapp/staff/catalog/${Number(productId)}/variants`,{method:'POST',body:JSON.stringify({variant_name:name,sku,price,stock})});msg(`Варіант ${name} додано до товару`);await loadStaffCatalog(window.staffCatalogQuery||'')}catch(e){msg(e.message)}}
 async function loadStaffCategories(){let host=$('staffContent');host.innerHTML='<h2>Категорії</h2><div class="notice">Завантажую список…</div>';try{let d=await api('/api/miniapp/staff/catalog?q=',{fresh:true}),cats=Array.isArray(d.category_admin)?d.category_admin:(Array.isArray(d.categories)?d.categories:[]),activeCats=cats.filter(c=>c.active),roots=activeCats.filter(c=>!c.parent_id);host.innerHTML=`<section class="ops-group"><h3>Створити нову категорію або підкатегорію</h3><div class="notice">Щоб змінити назву наявної категорії, редагуйте її в списку нижче. Не створюйте її повторно — так з’являться дві окремі категорії.</div><input id="newCategoryName" maxlength="80" placeholder="Нова назва, наприклад XROS або Рідини"><select id="newCategoryParent"><option value="">Нова основна категорія</option>${roots.map(c=>`<option value="${Number(c.id)}">Нова підкатегорія в «${esc(c.name)}»</option>`).join('')}</select><button class="primary" onclick="createStaffCategory()">Створити нову категорію</button></section>${canManageOwner?'<section class="ops-group"><h3>Прибрати старі дублікати</h3><p class="muted">В архів підуть лише порожні категорії без емодзі, якщо є активна категорія з емодзі та такою самою назвою поруч. Товари, основні категорії й записи історії не чіпаємо.</p><button onclick="archiveEmojiDuplicateCategories()">Прибрати дублікати без емодзі</button></section>':''}<h3>Категорії та товари в них</h3><div class="support-ticket-list">${cats.map(c=>`<article class="card"><div class="row"><small>${c.parent_id?'Підкатегорія':'Основна категорія'} · ${c.active?'Активна':'В архіві'}</small><small>Товарів: ${Number(c.product_count||0)}</small></div><div class="formgrid"><input data-category-name="${Number(c.id)}" maxlength="80" value="${esc(c.name)}" ${c.active?'':'disabled'}><button onclick="saveStaffCategory(${Number(c.id)},this)" ${c.active?'':'disabled'}>Зберегти назву</button></div>${canManageOwner&&c.parent_id?`<button class="${c.active?'':'primary'}" onclick="setStaffCategoryStatus(${Number(c.id)},${c.active?'false':'true'})">${c.active?'Архівувати порожню категорію':'Відновити категорію'}</button>`:''}</article>`).join('')||'<div class="notice">Категорій поки немає.</div>'}</div><button onclick="loadStaffCatalog(window.staffCatalogQuery||'')">← До товарів</button>`}catch(e){host.innerHTML='<div class="notice">Не вдалося завантажити категорії: '+esc(e.message)+'<br><button onclick="loadStaffCategories()">Спробувати ще</button></div>'}}
@@ -12290,12 +12346,14 @@ async function saveStaffCategory(id,button){let name=button.closest('.card')?.qu
 async function setStaffCategoryStatus(id,active){let verb=active?'відновити':'архівувати';if(!confirm(`Точно ${verb} цю категорію? Архівна категорія приховується з магазину, її запис зберігається.`))return;try{await api(`/api/miniapp/staff/catalog/categories/${Number(id)}/status`,{method:'POST',body:JSON.stringify({active})});msg(active?'Категорію відновлено':'Порожню категорію переміщено в архів');await loadStaffCategories()}catch(e){msg(e.message)}}
 async function archiveEmojiDuplicateCategories(){if(!confirm('Заархівувати всі порожні дублікати без емодзі, для яких знайдеться активна однойменна категорія з емодзі? Товари та основні системні категорії не зміняться.'))return;try{let d=await api('/api/miniapp/staff/catalog/categories/archive-emoji-duplicates',{method:'POST',body:JSON.stringify({})});let names=(d.archived||[]).map(x=>x.name).join(', ');msg(d.count?`В архів переміщено ${d.count}: ${names}`:'Порожніх дублікатів без емодзі не знайшов');await loadStaffCategories()}catch(e){msg(e.message)}}
 async function saveStaffProduct(btn){let c=btn.closest('[data-product]');try{await api(`/api/miniapp/staff/catalog/${c.dataset.product}`,{method:'PUT',body:JSON.stringify({variant_id:c.dataset.variant,name:c.querySelector('[data-field=name]').value,description:c.querySelector('[data-field=description]').value,sku:c.querySelector('[data-field=sku]').value,price:c.querySelector('[data-field=price]').value,category_id:c.querySelector('[data-field=category]').value||null,storefront_badge:c.querySelector('[data-field=badge]').value,active:c.querySelector('[data-field=active]').checked,manually_hidden:c.querySelector('[data-field=hidden]').checked,reason:c.querySelector('[data-field=reason]').value})});msg('Товар збережено');await loadStaffCatalog()}catch(e){msg(e.message)}}
-function renderStaffEntry(){if(document.getElementById('staffToolsBtn'))return;let btn=document.createElement('button');btn.id='staffToolsBtn';btn.textContent='Робоча панель';btn.onclick=loadStaffTools;$('banners').after(btn)}
+function renderStaffEntry(){if(!document.getElementById('staffToolsBtn')){let btn=document.createElement('button');btn.id='staffToolsBtn';btn.textContent='Робоча панель';btn.onclick=loadStaffTools;$('banners').after(btn)}if(canUseStaffChat&&!document.getElementById('staffMessengerFab')){let chatBtn=document.createElement('button');chatBtn.id='staffMessengerFab';chatBtn.className='staff-chat-fab';chatBtn.type='button';chatBtn.textContent='💬 Команда';chatBtn.setAttribute('aria-label','Відкрити робочий месенджер');chatBtn.onclick=openStaffMessenger;document.body.append(chatBtn)}}
 async function searchStaffCustomers(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>CRM · пошук клієнтів</h2><input id="crmQuery" placeholder="Ім’я, телефон, картка, Telegram ID" onkeydown="if(event.key===\'Enter\')runCrmSearch()"><button class="primary" onclick="runCrmSearch()">Знайти</button><div id="staffContent"></div>';}
 async function runCrmSearch(){let q=$('crmQuery').value.trim();if(q.length<2){msg('Введіть щонайменше 2 символи');return}try{let d=await api('/api/miniapp/staff/customers?q='+encodeURIComponent(q));$('staffContent').innerHTML=(d.items||[]).map(c=>`<button class="card crm-result" onclick="openStaffКлієнт(${c.id})"><b>${esc(c.full_name||c.first_name||'Клієнт')}</b><br><small>${esc(c.phone||'Телефон не вказано')} · ${esc(c.loyalty_card_number||'Без картки')}</small><br><small>Замовлень: ${c.order_count} · Сума: ${money(c.lifetime_value)} · Бонуси: ${money(c.bonus_available)}</small></button>`).join('')||'<div class="notice">Клієнтів не знайдено.</div>'}catch(e){msg(e.message)}}
 async function loadInventory(archived=false){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML='<h2>Інвентаризації</h2><div id="inventoryActions"></div><div class="support-tabs"><button class="'+(!archived?'primary':'')+'" onclick="loadInventory(false)">Останні 2</button><button class="'+(archived?'primary':'')+'" onclick="loadInventory(true)">Архів інвентаризацій</button></div><div class="notice">'+(archived?'Старі перерахунки':'Дві найсвіжіші перерахунки')+'</div><div id="inventoryHistory">Завантажую...</div>';try{let d=await api('/api/miniapp/staff/inventory'+(archived?'?archived=1':''));$('inventoryActions').innerHTML=!archived&&d.can_start?'<button class="primary" onclick="startInventory()">Почати інвентаризацію</button>':'';$('inventoryHistory').innerHTML=(d.items||[]).map(x=>`<button class="card" onclick="renderInventoryCount(${Number(x.id)})"><b>#${Number(x.id)} ? ${x.status==='confirmed'?'Завершена':x.status==='counting'?'У процесі':esc(x.status)}</b><br><small>${esc(x.created_at)} ? Пораховано ${Number(x.counted_count)}/${Number(x.sku_count)}</small></button>`).join('')||'<div class="notice">'+(archived?'Архів порожній.':'Інвентаризацій ще немає.')+'</div>'}catch(e){$('inventoryHistory').textContent=e.message}}
 async function startInventory(){try{let d=await api('/api/miniapp/staff/inventory',{method:'POST',body:'{}'});await renderInventoryCount(d.count_id)}catch(e){msg(e.message)}}
 function loadStaffTools(){hideSections();$('banners').classList.add('hidden');$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('staffPanel').classList.remove('hidden');$('staffPanel').innerHTML=`<h2>Робоча панель</h2><section class="ops-group"><h3>Клієнти / замовлення</h3><div class="formgrid">${canViewCustomers?'<button onclick="searchStaffCustomers()">Пошук CRM</button>':''}${canViewOrders?'<button class="primary" onclick="loadStaffOrders(\'all\',\'\')">🧾 Центр замовлень · заявки та ТТН</button>':''}</div></section><section class="ops-group"><h3>Товари / склад</h3><div class="formgrid">${canManageCatalog?'<button onclick="loadStaffCatalog()">Редагувати товари</button>':''}${canEditCatalog?'<button onclick="loadStaffCategories()">Категорії товарів</button>':''}${canManageInventory?'<button onclick="loadInventory()">Інвентаризації</button>':''}</div></section>${canManageOwner?'<section class="ops-group"><h3>Власник / звіти / керування</h3><div class="formgrid"><button onclick="loadOwnerAnalytics(this.dataset.period)" data-period="day">Аналітика джерел / воронки / рефералів</button><button onclick="loadReplenishment()">Закупівлі</button><button onclick="loadOwnerDashboard()">Панель власника</button><button class="primary" onclick="openBonusGiftPanel()">🎁 Розсилка бонусів і сертифікатів</button><button onclick="renderBannerAdmin()">Банери</button></div></section>':''}<section class="ops-group"><h3>Підтримка</h3><div class="formgrid">${canViewSupport?'<button onclick="loadStaffSupport()">Чат підтримки</button>':''}</div></section><div id="staffContent"></div>`}
+const loadStaffToolsFinalBeforeMessenger=loadStaffTools;loadStaffTools=function(){loadStaffToolsFinalBeforeMessenger();let fab=document.getElementById('staffMessengerFab');if(fab)fab.hidden=false;if(!canUseStaffChat||document.getElementById('staffMessengerEntry'))return;let section=document.createElement('section');section.id='staffMessengerEntry';section.className='ops-group';section.innerHTML='<h3>Внутрішній зв’язок</h3><button class="primary" onclick="openStaffMessenger()">💬 Відкрити месенджер команди</button>';document.getElementById('staffContent')?.before(section)};
+const openStaffMessengerBeforeVisibility=openStaffMessenger;openStaffMessenger=async function(){let fab=document.getElementById('staffMessengerFab');if(fab)fab.hidden=true;await openStaffMessengerBeforeVisibility();if(fab&&!document.getElementById('staffChatMessages'))fab.hidden=false};
 async function loadКлієнтSupport(archived=false){let panel=$('supportPanel');panel.innerHTML=`<h2>Чат підтримки</h2><div class="formgrid"><button onclick="loadКлієнтSupport(false)">Активні</button><button onclick="loadКлієнтSupport(true)">Архів</button></div><div class="notice">Тут лише ваші звернення до підтримки — товари й історія замовлень окремо.</div>`;try{let d=await api('/api/miniapp/support?archived='+(archived?'1':'0'));panel.innerHTML+=((d.items||[]).map(t=>`<article class="card"><b>Звернення #${t.id}</b> · ${esc(t.status)}${(t.messages||[]).map(m=>`<div class="notice"><small>${m.sender_type==='staff'?'Підтримка':'Ви'} · ${esc(m.created_at||'')}</small><br>${esc(m.body)}</div>`).join('')}${!archived&&t.status!=='closed'?`<textarea id="reply-${t.id}" maxlength="4000" placeholder="Напишіть відповідь"></textarea><button onclick="sendSupportMessage(${t.id})">Надіслати</button>`:''}</article>`).join('')||`<div class="notice">${archived?'Архів порожній':'Активних звернень немає'}</div>`)+(archived?'':'<div class="card"><h3>Нове звернення</h3><textarea id="newSupportMessage" maxlength="4000" placeholder="Опишіть, чим допомогти"></textarea><button class="primary" onclick="sendSupportMessage(0)">Надіслати підтримці</button></div>')}catch(e){panel.innerHTML+='<div class="notice">'+esc(e.message)+'</div>'}}
 let arcadeSession=null,arcadeRun=null,arcadeRaf=0,arcadeОчікуютьFinish=null;
 async function openArcade(){const o=$('gameOverlay');o.classList.add('open');o.setAttribute('aria-hidden','false');document.body.style.overflow='hidden';$('gameResult').classList.remove('hidden');$('gameResult').style.display='grid';$('gameTitle').textContent='Хмаролов';$('gameMessage').textContent='Лови світлі хмаринки пальцем або мишкою. Червоні іскри забирають життя. Очки та рекорд — лише для розваги, без обміну на гроші чи товари.';$('gameStart').disabled=true;$('gameProfile').textContent='Завантажую твій рахунок…';try{const d=await api('/api/miniapp/arcade/status');$('gameProfile').textContent=`Твій рахунок: ${d.total_score} очок · Спроб до ліміту: ${d.losses_left}/3 за 24 год.`;if(!d.losses_left){$('gameMessage').textContent=`Спроби на сьогодні закінчилися. Нові з’являться після ${new Date(d.reset_at).toLocaleTimeString('uk-UA',{hour:'2-digit',minute:'2-digit'})}. Рахунок збережено.`;$('gameStart').textContent='Спроби закінчилися';$('gameStart').disabled=true}else{$('gameStart').textContent='Почати гру';$('gameStart').disabled=false}}catch(e){$('gameProfile').textContent=e.message;$('gameMessage').textContent='Щоб рахунок і ліміт спроб зберігались, відкрий Cloud Hub у Telegram та запусти гру ще раз.';$('gameStart').textContent='Потрібен вхід через Telegram';$('gameStart').disabled=true}}
@@ -13528,6 +13586,281 @@ def miniapp_owner_analytics():
         return jsonify({"error":"Не вдалося завантажити аналітику."}),500
 
 
+def _staff_chat_crypto():
+    if AESGCM is None:
+        raise RuntimeError("staff chat cryptography dependency is unavailable")
+    raw = os.getenv("STAFF_CHAT_ENCRYPTION_KEY", "").strip()
+    if not raw:
+        raise RuntimeError("staff chat encryption key is not configured")
+    try:
+        key = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+    except Exception as exc:
+        raise RuntimeError("staff chat encryption key is invalid") from exc
+    if len(key) != 32:
+        raise RuntimeError("staff chat encryption key must decode to 32 bytes")
+    return AESGCM(key)
+
+
+def _staff_chat_encrypt(crypto, value: bytes, aad: str) -> bytes:
+    nonce = os.urandom(12)
+    return nonce + crypto.encrypt(nonce, value, aad.encode("utf-8"))
+
+
+def _staff_chat_decrypt(crypto, value: bytes, aad: str) -> bytes:
+    raw = bytes(value or b"")
+    if len(raw) < 29:
+        raise ValueError("Encrypted staff chat data is truncated")
+    return crypto.decrypt(raw[:12], raw[12:], aad.encode("utf-8"))
+
+
+def _miniapp_require_staff_chat(user):
+    """Restrict internal messaging to active staff, including courier and packer roles."""
+    if not request.headers.get("X-Telegram-Init-Data", "").strip():
+        web_staff = _site_admin_staff()
+        if not web_staff or int(web_staff.telegram_id) != int(user.id):
+            raise PermissionError("Увійдіть у Cloud Hub через Telegram-бота як працівник.")
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            _site_admin_require_csrf()
+    staff = get_staff(user.id)
+    if not staff or not staff.active:
+        raise PermissionError("Месенджер доступний лише активним працівникам Cloud Hub.")
+    with db_cursor() as cur:
+        cur.execute("SELECT state FROM staff_security_state WHERE telegram_id=%s", (user.id,))
+        state = cur.fetchone()
+    if state and state.get("state") != "active":
+        raise PermissionError("Доступ працівника тимчасово призупинений.")
+    return staff
+
+
+def _staff_chat_conversation_key(user_id: int, conversation: str) -> str:
+    if conversation == "group":
+        return "group:staff"
+    match = re.fullmatch(r"dm:(\d{1,20})", conversation)
+    if not match:
+        raise ValueError("Оберіть груповий чат або працівника зі списку.")
+    recipient_id = int(match.group(1))
+    if recipient_id == int(user_id):
+        raise ValueError("Оберіть іншого працівника для особистого чату.")
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM staff WHERE telegram_id=%s AND active=TRUE", (recipient_id,))
+        if not cur.fetchone():
+            raise ValueError("Цей працівник уже не має активного доступу.")
+    left, right = sorted((int(user_id), recipient_id))
+    return f"dm:{left}:{right}"
+
+
+def _staff_chat_require_conversation_member(user_id: int, conversation_key: str) -> None:
+    if conversation_key == "group:staff":
+        return
+    match = re.fullmatch(r"dm:(\d+):(\d+)", conversation_key)
+    if not match or int(user_id) not in {int(match.group(1)), int(match.group(2))}:
+        raise PermissionError("Це особисте листування недоступне вашому акаунту.")
+
+
+def _staff_chat_decode_attachment(payload: dict, max_bytes: int) -> tuple[bytes, str, str]:
+    item = payload.get("attachment")
+    if not isinstance(item, dict):
+        raise ValueError("Файл має бути фото або відео.")
+    mime = str(item.get("mime") or "").split(";", 1)[0].strip().lower()
+    if mime not in {"image/jpeg", "image/png", "image/webp", "video/mp4", "video/webm", "video/quicktime"}:
+        raise ValueError("Дозволені фото JPG, PNG, WebP та відео MP4, WebM, MOV.")
+    encoded = str(item.get("data") or "")
+    if "," in encoded and encoded.startswith("data:"):
+        encoded = encoded.split(",", 1)[1]
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("Не вдалося прочитати вибраний файл.") from exc
+    if not content or len(content) > max_bytes:
+        raise ValueError(f"Файл завеликий. Максимум {max_bytes // (1024 * 1024)} МБ.")
+    name = os.path.basename(str(item.get("name") or "вкладення").replace("\\", "/"))[:120]
+    return content, mime, name or "вкладення"
+
+
+@miniapp.route("/api/miniapp/staff/messenger/bootstrap", methods=["GET"])
+def miniapp_staff_messenger_bootstrap():
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff_chat(user)
+        with db_cursor() as cur:
+            cur.execute("""SELECT s.telegram_id,s.display_name,s.role,
+                                  EXISTS(SELECT 1 FROM staff_chat_profiles p WHERE p.telegram_id=s.telegram_id AND p.avatar_ciphertext IS NOT NULL) AS has_avatar
+                           FROM staff s WHERE s.active=TRUE ORDER BY s.display_name,s.telegram_id""")
+            staff_rows = list(cur.fetchall())
+            cur.execute("SELECT avatar_ciphertext IS NOT NULL AS has_avatar,background_ciphertext IS NOT NULL AS has_background FROM staff_chat_profiles WHERE telegram_id=%s", (actor.telegram_id,))
+            profile = cur.fetchone() or {"has_avatar": False, "has_background": False}
+        return jsonify({"me": actor.telegram_id, "my_name": actor.display_name, "my_role": actor.role,
+                        "profile": profile, "staff": [{k: _miniapp_json_value(v) for k, v in row.items()} for row in staff_rows]})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Staff messenger bootstrap failed")
+        return jsonify({"error": "Не вдалося відкрити месенджер команди."}), 500
+
+
+@miniapp.route("/api/miniapp/staff/messenger/messages", methods=["GET", "POST"])
+def miniapp_staff_messenger_messages():
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff_chat(user)
+        body = request.get_json(silent=True) or {}
+        conversation = str(request.args.get("conversation") if request.method == "GET" else body.get("conversation") or "group")
+        conversation_key = _staff_chat_conversation_key(int(actor.telegram_id), conversation)
+        _staff_chat_require_conversation_member(int(actor.telegram_id), conversation_key)
+        crypto = _staff_chat_crypto()
+        if request.method == "GET":
+            try:
+                before_id = max(0, int(request.args.get("before") or 0))
+            except (TypeError, ValueError):
+                before_id = 0
+            with db_cursor() as cur:
+                cur.execute("""SELECT id,sender_telegram_id,sender_name,sender_role,body_ciphertext,
+                                      attachment_ciphertext IS NOT NULL AS has_attachment,
+                                      attachment_mime,attachment_name,created_at
+                               FROM staff_chat_messages
+                               WHERE conversation_key=%s AND (%s=0 OR id<%s)
+                               ORDER BY id DESC LIMIT 40""", (conversation_key, before_id, before_id))
+                rows = list(cur.fetchall())
+            items = []
+            for row in reversed(rows):
+                aad = f"staffchat:{conversation_key}:{int(row['sender_telegram_id'])}"
+                item = {"id": int(row["id"]), "sender_id": int(row["sender_telegram_id"]),
+                        "sender_name": row["sender_name"], "sender_role": row["sender_role"],
+                        "body": _staff_chat_decrypt(crypto, row["body_ciphertext"], aad + ":body").decode("utf-8"),
+                        "created_at": _miniapp_json_value(row["created_at"]),
+                        "has_attachment": bool(row["has_attachment"]),
+                        "attachment_mime": row["attachment_mime"], "attachment_name": row["attachment_name"]}
+                items.append(item)
+            return jsonify({"conversation": conversation_key, "items": items,
+                            "has_more": bool(rows and len(rows) == 40), "next_before": int(rows[-1]["id"]) if rows else None})
+
+        text = str(body.get("text") or "").strip()
+        if len(text) > 4000:
+            return jsonify({"error": "Повідомлення не може бути довшим за 4000 символів."}), 400
+        attachment = None
+        mime = file_name = None
+        if body.get("attachment"):
+            attachment, mime, file_name = _staff_chat_decode_attachment(body, 6 * 1024 * 1024)
+        if not text and not attachment:
+            return jsonify({"error": "Напишіть повідомлення або прикріпіть фото чи відео."}), 400
+        aad = f"staffchat:{conversation_key}:{int(actor.telegram_id)}"
+        body_cipher = _staff_chat_encrypt(crypto, text.encode("utf-8"), aad + ":body")
+        attachment_cipher = _staff_chat_encrypt(crypto, attachment, aad + ":attachment") if attachment else None
+        with db_cursor() as cur:
+            cur.execute("""INSERT INTO staff_chat_messages
+                           (conversation_key,sender_telegram_id,sender_name,sender_role,body_ciphertext,
+                            attachment_ciphertext,attachment_mime,attachment_name)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id,created_at""",
+                        (conversation_key, actor.telegram_id, actor.display_name, actor.role,
+                         body_cipher, attachment_cipher, mime, file_name))
+            created = cur.fetchone()
+        return jsonify({"ok": True, "id": int(created["id"]), "created_at": _miniapp_json_value(created["created_at"])})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        log.error("Staff messenger unavailable: %s", str(exc))
+        return jsonify({"error": "Захищений чат ще не налаштовано. Повідомте власника."}), 503
+    except Exception:
+        log.exception("Staff messenger message request failed")
+        return jsonify({"error": "Не вдалося завантажити або надіслати повідомлення."}), 500
+
+
+@miniapp.get("/api/miniapp/staff/messenger/messages/<int:message_id>/attachment")
+def miniapp_staff_messenger_attachment(message_id: int):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff_chat(user)
+        crypto = _staff_chat_crypto()
+        with db_cursor() as cur:
+            cur.execute("""SELECT conversation_key,sender_telegram_id,attachment_ciphertext,
+                                  attachment_mime,attachment_name
+                           FROM staff_chat_messages WHERE id=%s AND attachment_ciphertext IS NOT NULL""", (message_id,))
+            row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "Вкладення не знайдено."}), 404
+        _staff_chat_require_conversation_member(int(actor.telegram_id), str(row["conversation_key"]))
+        aad = f"staffchat:{row['conversation_key']}:{int(row['sender_telegram_id'])}:attachment"
+        content = _staff_chat_decrypt(crypto, row["attachment_ciphertext"], aad)
+        return Response(content, mimetype=row["attachment_mime"], headers={
+            "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline; filename*=UTF-8''" + urllib.parse.quote(str(row["attachment_name"] or "file")),
+        })
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except RuntimeError:
+        return jsonify({"error": "Захищений чат ще не налаштовано."}), 503
+    except Exception:
+        log.exception("Staff messenger attachment read failed")
+        return jsonify({"error": "Не вдалося відкрити вкладення."}), 500
+
+
+@miniapp.route("/api/miniapp/staff/messenger/profile", methods=["POST"])
+def miniapp_staff_messenger_profile_save():
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff_chat(user)
+        body = request.get_json(silent=True) or {}
+        kind = str(body.get("kind") or "")
+        if kind not in {"avatar", "background"}:
+            return jsonify({"error": "Оберіть фото профілю або фон чату."}), 400
+        max_bytes = 512 * 1024 if kind == "avatar" else 2 * 1024 * 1024
+        content, mime, _ = _staff_chat_decode_attachment({"attachment": body}, max_bytes)
+        if not mime.startswith("image/"):
+            return jsonify({"error": "Для аватарки й фону можна вибрати лише фото."}), 400
+        crypto = _staff_chat_crypto()
+        encrypted = _staff_chat_encrypt(crypto, content, f"staffchat:profile:{int(actor.telegram_id)}:{kind}")
+        if kind == "avatar":
+            sql = """INSERT INTO staff_chat_profiles(telegram_id,avatar_ciphertext,avatar_mime,updated_at)
+                     VALUES(%s,%s,%s,NOW()) ON CONFLICT(telegram_id) DO UPDATE SET
+                     avatar_ciphertext=EXCLUDED.avatar_ciphertext,avatar_mime=EXCLUDED.avatar_mime,updated_at=NOW()"""
+        else:
+            sql = """INSERT INTO staff_chat_profiles(telegram_id,background_ciphertext,background_mime,updated_at)
+                     VALUES(%s,%s,%s,NOW()) ON CONFLICT(telegram_id) DO UPDATE SET
+                     background_ciphertext=EXCLUDED.background_ciphertext,background_mime=EXCLUDED.background_mime,updated_at=NOW()"""
+        with db_cursor() as cur:
+            cur.execute(sql, (actor.telegram_id, encrypted, mime))
+        return jsonify({"ok": True, "kind": kind})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError:
+        return jsonify({"error": "Захищений чат ще не налаштовано."}), 503
+    except Exception:
+        log.exception("Staff messenger profile image save failed")
+        return jsonify({"error": "Не вдалося зберегти фото профілю або фон."}), 500
+
+
+@miniapp.get("/api/miniapp/staff/messenger/profile/<int:telegram_id>/<kind>")
+def miniapp_staff_messenger_profile_media(telegram_id: int, kind: str):
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_staff_chat(user)
+        if kind not in {"avatar", "background"} or (kind == "background" and int(actor.telegram_id) != telegram_id):
+            return jsonify({"error": "Фото профілю або фон недоступні."}), 403
+        crypto = _staff_chat_crypto()
+        column = "avatar_ciphertext" if kind == "avatar" else "background_ciphertext"
+        mime_column = "avatar_mime" if kind == "avatar" else "background_mime"
+        with db_cursor() as cur:
+            cur.execute(f"""SELECT p.{column} AS ciphertext,p.{mime_column} AS mime
+                            FROM staff_chat_profiles p JOIN staff s USING(telegram_id)
+                            WHERE p.telegram_id=%s AND s.active=TRUE""", (telegram_id,))
+            row = cur.fetchone()
+        if not row or not row["ciphertext"]:
+            return jsonify({"error": "Фото ще не додано."}), 404
+        content = _staff_chat_decrypt(crypto, row["ciphertext"], f"staffchat:profile:{telegram_id}:{kind}")
+        return Response(content, mimetype=row["mime"], headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except RuntimeError:
+        return jsonify({"error": "Захищений чат ще не налаштовано."}), 503
+    except Exception:
+        log.exception("Staff messenger profile image read failed")
+        return jsonify({"error": "Не вдалося відкрити фото профілю або фон."}), 500
+
+
 @miniapp.get("/api/miniapp/admin/replenishment")
 def miniapp_owner_replenishment():
     try:
@@ -13617,7 +13950,8 @@ def miniapp_bootstrap():
             if not security_active:
                 staff = None
         banners = _miniapp_get_banners(active_only=True)
-        return jsonify({"categories": categories, "products": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in products], "popular_product_ids":list_popular_product_ids(), "favorite_product_ids": favorite_product_ids, "banners": banners, "authenticated":True, "web_session":bool(has_web_session and not raw_init_data), "can_manage_banners": can_manage, "can_manage_owner": can_manage_owner, "can_manage_catalog": bool(staff and staff.active and staff.can("catalog.read")), "can_edit_catalog": bool(staff and staff.active and staff.can("catalog.update")), "can_view_customers": bool(staff and staff.active and staff.can("customers.read")), "can_adjust_loyalty": bool(staff and staff.active and staff.can("loyalty.adjust")), "can_view_orders": bool(staff and staff.active and staff.can("orders.read")), "can_update_orders": bool(staff and staff.active and staff.can("orders.update")), "can_confirm_payment": bool(staff and staff.active and staff.can("finance.payment_confirm")), "can_view_support": bool(staff and staff.active and staff.can("support.read")), "can_reply_support": bool(staff and staff.active and staff.can("support.reply")), "can_manage_inventory":bool(staff and staff.active and staff.can("inventory.read")), "can_confirm_inventory":bool(staff and staff.active and staff.role in {"owner","admin"})})
+        can_use_staff_chat = bool(staff and staff.active)
+        return jsonify({"categories": categories, "products": [{k: _miniapp_json_value(v) for k,v in row.items()} for row in products], "popular_product_ids":list_popular_product_ids(), "favorite_product_ids": favorite_product_ids, "banners": banners, "authenticated":True, "web_session":bool(has_web_session and not raw_init_data), "can_manage_banners": can_manage, "can_manage_owner": can_manage_owner, "can_manage_catalog": bool(staff and staff.active and staff.can("catalog.read")), "can_edit_catalog": bool(staff and staff.active and staff.can("catalog.update")), "can_view_customers": bool(staff and staff.active and staff.can("customers.read")), "can_adjust_loyalty": bool(staff and staff.active and staff.can("loyalty.adjust")), "can_view_orders": bool(staff and staff.active and staff.can("orders.read")), "can_update_orders": bool(staff and staff.active and staff.can("orders.update")), "can_confirm_payment": bool(staff and staff.active and staff.can("finance.payment_confirm")), "can_view_support": bool(staff and staff.active and staff.can("support.read")), "can_reply_support": bool(staff and staff.active and staff.can("support.reply")), "can_manage_inventory":bool(staff and staff.active and staff.can("inventory.read")), "can_confirm_inventory":bool(staff and staff.active and staff.role in {"owner","admin"}), "can_use_staff_chat": can_use_staff_chat})
     except PermissionError as exc:
         return jsonify({"error": str(exc)}), 401
     except Exception:
