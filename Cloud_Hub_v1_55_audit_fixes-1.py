@@ -47,7 +47,7 @@ Cloud Hub Handoff v1.9 is complete. Implemented here:
 - v1.46: customer product photo cards, variant selection, cart item removal, wholesale requests/history, roulette, shipping labels
 
 This is a single-file application. It is designed to be extended in place; do not
-split it into a multi-file project for the owner. Some advanced handoff modules still require implementation and live-provider testing before launch. This repaired build fixes known broken navigation paths; it is not a substitute for live checkout, Telegram, database, and provider acceptance tests. Nova Poshta directory lookup is optional assistance only: checkout never depends on its availability. Клієнт city/branch can be entered manually. Automatic TTN creation is queued after order commit. It requires the business API key and sender Ref values in Render environment variables; live provider acceptance tests are still required. Tracking status polling is not yet implemented.
+split it into a multi-file project for the owner. Some advanced handoff modules still require implementation and live-provider testing before launch. This repaired build fixes known broken navigation paths; it is not a substitute for live checkout, Telegram, database, and provider acceptance tests. Nova Poshta directory lookup is optional assistance only: checkout never depends on its availability. Клієнт city/branch can be entered manually. Automatic TTN creation is queued after order commit. It requires the business API key and sender Ref values in Render environment variables; live provider acceptance tests are still required. Nova Poshta tracking is polled in a bounded background batch; customer notices are queued once on arrival and receipt.
 
 Render environment variables:
   BOT_TOKEN                 required
@@ -2439,7 +2439,9 @@ def dispatch_notification_batch(batch_size: int = 25) -> int:
         try:
             payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
             markup = None
-            if isinstance(payload, dict) and payload.get("buttons"):
+            if isinstance(payload, dict) and payload.get("customer_menu"):
+                markup = customer_menu()
+            elif isinstance(payload, dict) and payload.get("buttons"):
                 markup = types.InlineKeyboardMarkup(row_width=1)
                 for label, data in payload["buttons"]:
                     markup.add(types.InlineKeyboardButton(label, callback_data=data))
@@ -3034,6 +3036,125 @@ def _np_status_is_received(status: str) -> bool:
     return any(term in text for term in (
         "отримано", "вручено", "доставлено одержувачу", "доставлено адресату", "доставлено клієнту"
     ))
+
+
+def _np_status_is_arrived(status: str, status_code: Any = None) -> bool:
+    code = str(status_code or "").strip()
+    if code in {"7", "8"}:  # Branch / parcel locker ready for pickup.
+        return True
+    text = normalize_text(status)
+    return any(term in text for term in (
+        "прибуло у відділення", "прибув у відділення", "прибула у відділення",
+        "на відділенні отримувача", "прибуло у поштомат", "прибула у поштомат",
+        "готове до видачі", "готова до видачі", "чекає на отримувача",
+    ))
+
+
+def _save_order_review(order_id: int, customer_telegram_id: int,
+                       rating: int, comment: str = "") -> bool:
+    if rating not in range(1, 6):
+        raise ValueError("Оцініть покупку від 1 до 5 зірок.")
+    with db_cursor() as cur:
+        cur.execute("""SELECT id,nova_poshta_tracking_status FROM orders
+                       WHERE id=%s AND telegram_id_snapshot=%s""",
+                    (order_id, customer_telegram_id))
+        order = cur.fetchone()
+        if not order or not _np_status_is_received(str(order.get("nova_poshta_tracking_status") or "")):
+            raise ValueError("Відгук можна залишити після отримання посилки.")
+        cur.execute("""INSERT INTO order_reviews(order_id,customer_telegram_id,rating,comment)
+                       VALUES(%s,%s,%s,%s) ON CONFLICT(order_id) DO NOTHING RETURNING id""",
+                    (order_id, customer_telegram_id, rating, comment[:1000]))
+        return bool(cur.fetchone())
+
+
+def _order_review_rating_keyboard(order_id: int) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=5)
+    keyboard.add(*[types.InlineKeyboardButton(
+        f"{rating} ⭐", callback_data=f"orderreview:rate:{order_id}:{rating}")
+        for rating in range(1, 6)])
+    return keyboard
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith("orderreview:start:"))
+def order_review_start_callback(call):
+    try:
+        order_id = int(call.data.rsplit(":", 1)[1])
+        with db_cursor() as cur:
+            cur.execute("""SELECT o.id,o.nova_poshta_tracking_status,r.id AS review_id
+                           FROM orders o LEFT JOIN order_reviews r ON r.order_id=o.id
+                           WHERE o.id=%s AND o.telegram_id_snapshot=%s""",
+                        (order_id, call.from_user.id))
+            row = cur.fetchone()
+        if not row or not _np_status_is_received(str(row.get("nova_poshta_tracking_status") or "")):
+            bot.answer_callback_query(call.id, "Відгук стане доступний після отримання посилки.", show_alert=True)
+            return
+        if row.get("review_id"):
+            bot.answer_callback_query(call.id, "Дякуємо, відгук уже отримали ❤️", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id,
+                         f"Як вам замовлення #{order_id}? Оберіть оцінку:",
+                         reply_markup=_order_review_rating_keyboard(order_id))
+    except Exception:
+        log.exception("Order review start callback failed")
+        bot.answer_callback_query(call.id, "Не вдалося відкрити форму відгуку.", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith("orderreview:rate:"))
+def order_review_rate_callback(call):
+    try:
+        parts = call.data.split(":")
+        if len(parts) != 4:
+            raise ValueError("Некоректна оцінка.")
+        order_id, rating = int(parts[2]), int(parts[3])
+        if rating not in range(1, 6):
+            raise ValueError("Оцініть покупку від 1 до 5 зірок.")
+        bot.answer_callback_query(call.id)
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(types.InlineKeyboardButton(
+            "Пропустити коментар", callback_data=f"orderreview:skip:{order_id}:{rating}"))
+        prompt = bot.send_message(call.message.chat.id,
+            f"Оцінка {rating}/5 ⭐. Напишіть короткий коментар або натисніть «Пропустити коментар».",
+            reply_markup=keyboard)
+        bot.register_next_step_handler(prompt, order_review_comment_step, order_id, rating)
+    except Exception:
+        log.exception("Order review rating callback failed")
+        bot.answer_callback_query(call.id, "Не вдалося записати оцінку.", show_alert=True)
+
+
+def order_review_comment_step(message, order_id: int, rating: int) -> None:
+    if not message.from_user or int(message.from_user.id) <= 0:
+        return
+    comment = (message.text or "").strip()
+    if len(comment) > 1000:
+        prompt = bot.reply_to(message, "Коментар має бути до 1000 символів. Спробуйте ще раз або пропустіть його кнопкою.")
+        bot.register_next_step_handler(prompt, order_review_comment_step, order_id, rating)
+        return
+    try:
+        saved = _save_order_review(order_id, int(message.from_user.id), rating, comment)
+        bot.send_message(message.chat.id, "Дякуємо за відгук ❤️" if saved else "Дякуємо, відгук уже отримали ❤️")
+    except ValueError as exc:
+        bot.reply_to(message, str(exc))
+    except Exception:
+        log.exception("Order review comment save failed")
+        bot.reply_to(message, "Не вдалося зберегти відгук. Спробуйте ще раз трохи пізніше.")
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data) and call.data.startswith("orderreview:skip:"))
+def order_review_skip_callback(call):
+    try:
+        parts = call.data.split(":")
+        if len(parts) != 4:
+            raise ValueError("Некоректна дія.")
+        bot.clear_step_handler_by_chat_id(call.message.chat.id)
+        saved = _save_order_review(int(parts[2]), int(call.from_user.id), int(parts[3]), "")
+        bot.answer_callback_query(call.id, "Відгук збережено" if saved else "Відгук уже отримали")
+        bot.send_message(call.message.chat.id, "Дякуємо за відгук ❤️" if saved else "Дякуємо, відгук уже отримали ❤️")
+    except ValueError as exc:
+        bot.answer_callback_query(call.id, str(exc), show_alert=True)
+    except Exception:
+        log.exception("Order review skip callback failed")
+        bot.answer_callback_query(call.id, "Не вдалося зберегти відгук.", show_alert=True)
 
 
 def _award_referral_rewards_tx(cur, referred_customer_id: int, order_id: int, actor: Optional[Staff] = None) -> None:
@@ -3874,7 +3995,8 @@ def customer_menu() -> types.ReplyKeyboardMarkup:
     kb.row("🛍️ Відкрити каталог", "🧺 Мій кошик")
     kb.row("📦 Мої замовлення", "🎁 Бонусна карта")
     kb.row("⭐ Обране", "🎲 Рулетка")
-    kb.row("👤 Мій профіль", "🎫 Підтримка")
+    kb.row("⭐ Відгуки", "👤 Мій профіль")
+    kb.row("🎫 Підтримка")
     kb.row("💼 Хочу роботу", "📦 Оптове замовлення")
     kb.row("ℹ️ Про Cloud Hub")
     return kb
@@ -4469,6 +4591,43 @@ def render_customer_orders(chat_id: int, telegram_id: int) -> None:
 def customer_orders_handler(message):
     upsert_customer(message.from_user)
     render_customer_orders(message.chat.id, message.from_user.id)
+
+
+def render_customer_reviews(chat_id: int, telegram_id: int) -> None:
+    with db_cursor() as cur:
+        cur.execute("""SELECT o.id,o.order_number,o.grand_total,o.status,
+                              o.nova_poshta_tracking_status,o.created_at,r.rating,r.comment
+                       FROM orders o LEFT JOIN order_reviews r ON r.order_id=o.id
+                       WHERE o.telegram_id_snapshot=%s
+                         AND (o.status IN ('delivered','completed')
+                              OR o.nova_poshta_tracking_status ILIKE '%отримано%'
+                              OR o.nova_poshta_tracking_status ILIKE '%вручено%'
+                              OR o.nova_poshta_tracking_status ILIKE '%доставлено%')
+                       ORDER BY o.created_at DESC,o.id DESC LIMIT 30""", (telegram_id,))
+        rows = list(cur.fetchall())
+    if not rows:
+        bot.send_message(chat_id,
+            "⭐ <b>Відгуки</b>\nТут з’явиться оцінка, щойно Нова пошта підтвердить отримання вашого замовлення.",
+            reply_markup=customer_menu())
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for row in rows:
+        label = f"✅ № {row['order_number']} · {row['rating']}/5" if row.get("rating") else f"⭐ Оцінити № {row['order_number']}"
+        kb.add(types.InlineKeyboardButton(label[:60], callback_data=f"orderreview:start:{int(row['id'])}")) if not row.get("rating") else None
+    reviewed = sum(bool(row.get("rating")) for row in rows)
+    pending = sum(not bool(row.get("rating")) for row in rows)
+    text = f"⭐ <b>Відгуки</b>\nОтриманих замовлень: {len(rows)} · оцінено: {reviewed} · очікують оцінки: {pending}."
+    if pending:
+        text += "\nОберіть замовлення, щоб поставити оцінку; коментар можна пропустити."
+    else:
+        text += "\nДякуємо, ви вже оцінили всі отримані замовлення 💜"
+    bot.send_message(chat_id, text, reply_markup=kb if pending else customer_menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "⭐ Відгуки")
+def customer_reviews_handler(message):
+    upsert_customer(message.from_user)
+    render_customer_reviews(message.chat.id, message.from_user.id)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("custorder:"))
@@ -11888,7 +12047,7 @@ function chooseBranch(i){let b=(window._npBranches||[])[i];if(!b)return;$('npBra
 async function checkoutForm(){track("checkout_start");let d=await api('/api/miniapp/profile');checkoutKey=(window.crypto?.randomUUID?crypto.randomUUID():('ch_'+Date.now()+'_'+Math.random().toString(16).slice(2)));$('cart').innerHTML=`<h2>Оформлення замовлення</h2><div class="formgrid"><input id="buyerName" placeholder="Ім’я та прізвище" value="${esc(d.full_name||'')}"><input id="buyerPhone" placeholder="Телефон +380…" value="${esc(d.phone||'')}"><div class="notice">Доступно бонусів: <b>${money(d.bonus_available||0)}</b>. Можна покрити ними до 100% вартості товарів.</div><input id="bonusAmount" type="number" min="0" step="0.01" max="${Number(d.bonus_available||0)}" value="0" placeholder="Списати бонусів"><input id="certificateCode" maxlength="40" placeholder="Сертифікат (за наявності)"><input id="npCity" placeholder="Місто Нової пошти (оберіть зі списку або введіть вручну)" autocomplete="off"><div id="cityChoices"></div><input id="npBranch" placeholder="Відділення або поштомат (зі списку або вручну)" autocomplete="off"><div id="branchChoices"></div><small>Якщо номінал сертифіката більший за вартість товарів після бонусів, залишок зарахуємо на бонусний рахунок.</small><small>Оберіть місто й пункт з довідника або введіть вручну. Замовлення збережеться, навіть якщо довідник чи ТТН API тимчасово недоступні.</small><label class="check"><input type="checkbox" id="privacyOk"> Погоджуюся з обробкою даних, необхідних для оформлення та доставки замовлення.</label><button onclick="submitOrder()" class="primary">Підтвердити замовлення</button><button onclick="showCart()">Назад до кошика</button></div>`;$('npCity').addEventListener('input',()=>{npCityRef='';npWarehouseRef='';suggestCities()});$('npBranch').addEventListener('input',()=>{npWarehouseRef='';suggestBranches()})}
 async function submitOrder(){let body={name:$('buyerName').value,phone:$('buyerPhone').value,city:$('npCity').value,branch:$('npBranch').value,city_ref:npCityRef,warehouse_ref:npWarehouseRef,bonus_amount:$('bonusAmount').value,certificate_code:$('certificateCode').value,privacy_accepted:$('privacyOk').checked,idempotency_key:checkoutKey};try{let d=await api('/api/miniapp/checkout',{method:'POST',body:JSON.stringify(body)});$('cart').innerHTML=`<div class="success-wrap"><div class="success-mark"><svg viewBox="0 0 48 48"><path d="M10 25l9 9L38 14"/></svg></div><h2>Дякуємо за замовлення!</h2><div class="thanks">Ваше замовлення успішно оформлено</div><div class="success-order">${esc(d.order_number)}</div><div class="notice"><b>До сплати: ${money(d.grand_total)}</b><br>Нова пошта: ${esc(body.city)} / ${esc(body.branch)}${Number(d.certificate_remainder_bonus||0)>0?`<br>Залишок сертифіката зараховано бонусами: ${money(d.certificate_remainder_bonus)}`:''}<br>ТТН створюється автоматично. Якщо сервіс перевізника тимчасово недоступний, замовлення вже збережене, а ТТН буде оброблена окремо.</div><button class="primary" onclick="loadЗамовлення()">Мої замовлення</button><button onclick="renderProducts()">Повернутися до каталогу</button></div>`;playUiSound('success');document.querySelector('.success-wrap')?.classList.add('celebrate');catCelebrate();await loadCart()}catch(e){msg(e.message)}}
 
-async function loadЗамовлення(){track('orders_view');setActiveTab('ordersBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');if(!authenticated){$('orders').innerHTML='<h2>Замовлення</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small>${o.ttn?`<div class="notice">ТТН: <b>${esc(o.ttn)}</b><br>Статус Нової пошти: ${esc(o.tracking_status||'Ще не оновлювався')}<br><small>Оновлено: ${esc(o.tracking_updated_at||'—')}</small><button onclick="refreshTracking('${esc(o.order_number)}')">Оновити статус доставки</button></div>`:''}${o.tracking_status&&/отримано|вручено|доставлено/i.test(o.tracking_status)?`<details><summary>Залишити відгук про отримане замовлення</summary><label>Оцінка<select id="review-rating-${esc(o.order_number)}"><option value=5>5 — чудово</option><option value=4>4 — добре</option><option value=3>3 — нормально</option><option value=2>2 — є зауваження</option><option value=1>1 — погано</option></select></label><textarea id="review-comment-${esc(o.order_number)}" placeholder="Коментар (необов’язково)"></textarea><button class="primary" onclick="sendOrderReview('${esc(o.order_number)}')">Надіслати відгук</button></details>`:''}${o.status_history?.length?`<details><summary>Історія статусів</summary><ul>${o.status_history.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></details>`:''}</div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function loadЗамовлення(){track('orders_view');setActiveTab('ordersBtn');hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('orders').classList.remove('hidden');if(!authenticated){$('orders').innerHTML='<h2>Замовлення</h2>'+telegramPrompt();return}try{let d=await api('/api/miniapp/orders');$('orders').innerHTML='<h2>Мої замовлення</h2>'+(d.items.length?d.items.map(o=>`<div class="card"><b>${esc(o.order_number)}</b><p>${esc(o.status_label)} · ${money(o.grand_total)}</p><small>${esc(o.delivery_summary)} · ${esc(o.created_at||'')}</small>${o.ttn?`<div class="notice">ТТН: <b>${esc(o.ttn)}</b><br>Статус Нової пошти: ${esc(o.tracking_status||'Ще не оновлювався')}<br><small>Оновлено: ${esc(o.tracking_updated_at||'—')}</small><button onclick="refreshTracking('${esc(o.order_number)}')">Оновити статус доставки</button></div>`:''}${o.review_submitted?'<div class="notice">✅ Відгук отримано. Дякуємо!</div>':o.tracking_status&&/отримано|вручено|доставлено/i.test(o.tracking_status)?`<details><summary>⭐ Залишити відгук про отримане замовлення</summary><label>Оцінка<select id="review-rating-${esc(o.order_number)}"><option value=5>5 — чудово</option><option value=4>4 — добре</option><option value=3>3 — нормально</option><option value=2>2 — є зауваження</option><option value=1>1 — погано</option></select></label><textarea id="review-comment-${esc(o.order_number)}" placeholder="Коментар (необов’язково)"></textarea><button class="primary" onclick="sendOrderReview('${esc(o.order_number)}')">Надіслати відгук</button></details>`:''}${o.status_history?.length?`<details><summary>Історія статусів</summary><ul>${o.status_history.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></details>`:''}</div>`).join(''):'<div class="notice">Замовлень поки немає</div>')}catch(e){$('orders').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function refreshTracking(orderNumber){try{let d=await api('/api/miniapp/orders/refresh-tracking',{method:'POST',body:JSON.stringify({order_number:orderNumber})});msg(d.tracking_status||'Статус доставки оновлено');loadЗамовлення()}catch(e){msg(e.message)}}
 async function sendOrderReview(orderNumber){try{let rating=Number($('review-rating-'+orderNumber).value),comment=$('review-comment-'+orderNumber).value||'';await api('/api/miniapp/orders/review',{method:'POST',body:JSON.stringify({order_number:orderNumber,rating,comment})});msg('Дякуємо за відгук ❤️');loadЗамовлення()}catch(e){msg(e.message)}}
 function renderBannerAdmin(){ $('adminBanners').innerHTML=`<h3>Керування банерами</h3><p class="muted">Банери відображаються компактно: на головній, у каталозі або в кошику.</p><div id="bannerRows">${banners.map((b,i)=>bannerRow(b,i)).join('')}</div><button onclick="addBannerRow()">Додати банер</button><button class="primary" onclick="saveBanners()">Зберегти банери</button>`;let btn=document.createElement('button');btn.textContent='Банери (адмін)';btn.onclick=()=>{hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('adminBanners').classList.remove('hidden')};$('banners').after(btn)}
@@ -13668,9 +13827,10 @@ def miniapp_orders():
         user = _miniapp_auth_user()
         labels = {"new":"Прийнято", "confirmed":"Підтверджено", "packing":"Збирається", "packed":"Зібрано", "ready_to_ship":"Готове до відправлення", "shipped":"Відправлено", "delivered":"Отримано", "completed":"Завершено", "cancelled":"Скасовано", "returned":"Повернення", "problem":"Уточнюємо деталі замовлення"}
         with db_cursor() as cur:
-            cur.execute("""SELECT id,order_number,status,grand_total,city,delivery_branch,created_at,ttn,
-                                  nova_poshta_tracking_status,nova_poshta_updated_at
-                           FROM orders WHERE telegram_id_snapshot=%s ORDER BY created_at DESC,id DESC LIMIT 50""", (user.id,))
+            cur.execute("""SELECT o.id,o.order_number,o.status,o.grand_total,o.city,o.delivery_branch,o.created_at,o.ttn,
+                                  o.nova_poshta_tracking_status,o.nova_poshta_updated_at,
+                                  EXISTS(SELECT 1 FROM order_reviews r WHERE r.order_id=o.id) AS review_submitted
+                           FROM orders o WHERE o.telegram_id_snapshot=%s ORDER BY created_at DESC,id DESC LIMIT 50""", (user.id,))
             rows = list(cur.fetchall())
             order_ids = [int(r["id"]) for r in rows]
             history_by_order = {}
@@ -13683,7 +13843,7 @@ def miniapp_orders():
                     after = event.get("after_data") or {}
                     label = f"{labels.get(before.get('status'), before.get('status',''))} → {labels.get(after.get('status'), after.get('status',''))} · {event['created_at'].astimezone(ZoneInfo(CONFIG.timezone)).strftime('%d.%m.%Y %H:%M')}"
                     history_by_order.setdefault(str(event["entity_id"]), []).append(label)
-        return jsonify({"items":[{"order_number":r["order_number"],"status_label":labels.get(r["status"],"В обробці"),"grand_total":_miniapp_json_value(r["grand_total"]),"delivery_summary":("Нова пошта: "+str(r["city"])+", "+str(r["delivery_branch"])),"created_at":_miniapp_json_value(r["created_at"]),"ttn":r.get("ttn") or "","tracking_status":r.get("nova_poshta_tracking_status") or "","tracking_updated_at":_miniapp_json_value(r.get("nova_poshta_updated_at")),"status_history":history_by_order.get(str(r["id"]),[])} for r in rows]})
+        return jsonify({"items":[{"order_number":r["order_number"],"status_label":labels.get(r["status"],"В обробці"),"grand_total":_miniapp_json_value(r["grand_total"]),"delivery_summary":("Нова пошта: "+str(r["city"])+", "+str(r["delivery_branch"])),"created_at":_miniapp_json_value(r["created_at"]),"ttn":r.get("ttn") or "","tracking_status":r.get("nova_poshta_tracking_status") or "","tracking_updated_at":_miniapp_json_value(r.get("nova_poshta_updated_at")),"review_submitted":bool(r.get("review_submitted")),"status_history":history_by_order.get(str(r["id"]),[])} for r in rows]})
     except PermissionError as exc: return jsonify({"error":str(exc)}),401
     except Exception:
         log.exception("Mini App order history failed"); return jsonify({"error":"Не вдалося завантажити замовлення."}),500
@@ -13698,7 +13858,7 @@ def miniapp_refresh_tracking():
         if not order_number:
             return jsonify({"error": "Не вказано номер замовлення."}), 400
         with db_cursor() as cur:
-            cur.execute("SELECT id,ttn,phone_snapshot,status,payment_status,customer_id FROM orders WHERE order_number=%s AND telegram_id_snapshot=%s", (order_number, user.id))
+            cur.execute("SELECT id,ttn,phone_snapshot,status,payment_status,customer_id,nova_poshta_tracking_status FROM orders WHERE order_number=%s AND telegram_id_snapshot=%s", (order_number, user.id))
             order = cur.fetchone()
         if not order:
             return jsonify({"error": "Замовлення не знайдено."}), 404
@@ -13715,6 +13875,13 @@ def miniapp_refresh_tracking():
             cur.execute("""UPDATE orders SET nova_poshta_tracking_status=%s,nova_poshta_updated_at=NOW(),updated_at=NOW()
                            WHERE id=%s AND telegram_id_snapshot=%s""", (status, order["id"], user.id))
             delivered = _np_status_is_received(status)
+            arrived = _np_status_is_arrived(status, records[0].get("StatusCode"))
+            previously_arrived = _np_status_is_arrived(str(order.get("nova_poshta_tracking_status") or ""))
+            if arrived and not delivered and not previously_arrived:
+                enqueue_notification(cur, user.id, "delivery", {
+                    "text": f"📦 Ваша посилка Cloud Hub прибула у відділення Нової пошти.\nТТН: <code>{html.escape(ttn)}</code>\nКоли заберете — бот повідомить і запропонує оцінити замовлення.",
+                    "customer_menu": True},
+                    f"order:{order['id']}:arrived:customer")
             if delivered and order["status"] == "shipped":
                 cur.execute("""UPDATE orders SET status='delivered',updated_at=NOW()
                                WHERE id=%s AND status='shipped' RETURNING id""", (order["id"],))
@@ -13728,8 +13895,9 @@ def miniapp_refresh_tracking():
                         _activate_pending_order_bonus_tx(cur, int(order["id"]), int(order["customer_id"]))
                         _award_referral_rewards_tx(cur, int(order["customer_id"]), int(order["id"]))
                     enqueue_notification(cur, user.id, "delivery", {
-                        "text": "🎉 Нова пошта підтвердила отримання посилки! Будь ласка, залиште короткий відгук у розділі «Замовлення» Cloud Hub.",
-                        "buttons": []}, f"order:{order['id']}:delivered:customer")
+                        "text": "🎉 Нова пошта підтвердила отримання посилки! Залиште оцінку — це допоможе нам стати кращими. Якщо оплату вже підтверджено, бонуси доступні у вашій картці.",
+                        "buttons": [["⭐ Залишити відгук", f"orderreview:start:{int(order['id'])}"]]},
+                        f"order:{order['id']}:delivered:customer")
             if delivered:
                 cur.execute("""UPDATE support_tickets SET status='closed',updated_at=NOW()
                                WHERE customer_telegram_id=%s AND order_id=%s AND status<>'closed'""",(user.id,order["id"]))
@@ -15340,11 +15508,19 @@ def process_np_tracking_updates(limit: int = 100) -> int:
         status = " ".join(str((record or {}).get("Status") or "").split())[:300]
         if not status:
             continue
+        status_code = (record or {}).get("StatusCode")
         delivered = _np_status_is_received(status)
+        arrived = _np_status_is_arrived(status, status_code)
+        previously_arrived = _np_status_is_arrived(str(order.get("nova_poshta_tracking_status") or ""))
         with db_cursor() as cur:
             cur.execute("""UPDATE orders SET nova_poshta_tracking_status=%s,
                            nova_poshta_updated_at=NOW(),updated_at=NOW() WHERE id=%s""",
                         (status, order["id"]))
+            customer_tid = order.get("telegram_id_snapshot")
+            if arrived and not delivered and not previously_arrived and customer_tid:
+                enqueue_notification(cur, int(customer_tid), "delivery", {
+                    "text": f"📦 Ваша посилка Cloud Hub прибула у відділення Нової пошти.\nТТН: <code>{html.escape(str(order['ttn']))}</code>\nКоли заберете — бот повідомить і запропонує оцінити замовлення.",
+                    "customer_menu": True}, f"order:{order['id']}:arrived:customer")
             if delivered and order["status"] == "shipped":
                 cur.execute("UPDATE orders SET status='delivered' WHERE id=%s AND status='shipped' RETURNING id",
                             (order["id"],))
@@ -15360,11 +15536,11 @@ def process_np_tracking_updates(limit: int = 100) -> int:
                     if order.get("payment_status") == "paid" and order.get("customer_id"):
                         _activate_pending_order_bonus_tx(cur, int(order["id"]), int(order["customer_id"]))
                         _award_referral_rewards_tx(cur, int(order["customer_id"]), int(order["id"]))
-                    customer_tid = order.get("telegram_id_snapshot")
                     if customer_tid:
                         enqueue_notification(cur, int(customer_tid), "delivery", {
-                            "text": "🎉 Нова пошта підтвердила отримання посилки! Відкрийте «Замовлення», щоб оцінити покупку. Бонуси за оплачене замовлення вже доступні або очікують підтвердження оплати.",
-                            "buttons": []}, f"order:{order['id']}:delivered:customer")
+                            "text": "🎉 Нова пошта підтвердила отримання посилки! Залиште оцінку — це допоможе нам стати кращими. Якщо оплату вже підтверджено, бонуси доступні у вашій картці.",
+                            "buttons": [["⭐ Залишити відгук", f"orderreview:start:{int(order['id'])}"]]},
+                            f"order:{order['id']}:delivered:customer")
                     cur.execute("""UPDATE support_tickets SET status='closed',updated_at=NOW()
                                    WHERE customer_telegram_id=%s AND order_id=%s AND status<>'closed'""",
                                 (customer_tid, order["id"]))
