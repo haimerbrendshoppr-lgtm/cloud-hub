@@ -102,7 +102,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable, Optional
 from types import SimpleNamespace as _NS
@@ -703,6 +703,18 @@ CREATE TABLE IF NOT EXISTS loyalty_lots (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_loyalty_lots_fifo ON loyalty_lots(customer_id,state,expires_at,id);
+CREATE TABLE IF NOT EXISTS bonus_gift_campaigns (
+    id BIGSERIAL PRIMARY KEY,
+    created_by BIGINT NOT NULL,
+    recipient_mode TEXT NOT NULL CHECK (recipient_mode IN ('customer','all')),
+    recipient_lookup TEXT NOT NULL DEFAULT '',
+    amount NUMERIC(12,2) NOT NULL CHECK (amount>0),
+    expires_at TIMESTAMPTZ NOT NULL,
+    custom_message TEXT NOT NULL DEFAULT '',
+    comment TEXT NOT NULL DEFAULT '',
+    recipient_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 CREATE TABLE IF NOT EXISTS miniapp_arcade_profiles (
     customer_telegram_id BIGINT PRIMARY KEY,
     total_score INTEGER NOT NULL DEFAULT 0 CHECK(total_score>=0),
@@ -2459,10 +2471,16 @@ def dispatch_notification_batch(batch_size: int = 25) -> int:
             markup = None
             if isinstance(payload, dict) and payload.get("customer_menu"):
                 markup = customer_menu()
-            elif isinstance(payload, dict) and payload.get("buttons"):
+            elif isinstance(payload, dict) and (payload.get("buttons") or payload.get("web_app_url")):
                 markup = types.InlineKeyboardMarkup(row_width=1)
-                for label, data in payload["buttons"]:
+                for label, data in (payload.get("buttons") or []):
                     markup.add(types.InlineKeyboardButton(label, callback_data=data))
+                web_app_url = str(payload.get("web_app_url") or "").strip()
+                if web_app_url == f"{CONFIG.mini_app_url}/miniapp":
+                    markup.add(types.InlineKeyboardButton(
+                        "🛍 Використати бонуси",
+                        web_app=types.WebAppInfo(url=web_app_url),
+                    ))
             if isinstance(payload, dict) and payload.get("document_base64"):
                 import base64
                 from io import BytesIO
@@ -3046,6 +3064,25 @@ def _activate_pending_order_bonus_tx(cur, order_id: int, customer_id: int) -> De
         cur.execute("""UPDATE loyalty_transactions SET state='available'
                        WHERE order_id=%s AND customer_id=%s AND transaction_type='earn' AND state='pending'""",
                     (order_id, customer_id))
+        # Notify only when pending lots were actually released. The dedupe key
+        # keeps retries/status polling from sending the same award twice.
+        cur.execute("""SELECT c.telegram_id,o.order_number,la.available
+                       FROM customers c JOIN orders o ON o.customer_id=c.id
+                       LEFT JOIN loyalty_accounts la ON la.customer_id=c.id
+                       WHERE c.id=%s AND o.id=%s""", (customer_id, order_id))
+        recipient = cur.fetchone()
+        if recipient and recipient.get("telegram_id"):
+            message = (
+                f"🎁 <b>Бонуси зараховано!</b>\n"
+                f"За отримане замовлення <b>№{html.escape(str(recipient.get('order_number') or order_id))}</b> "
+                f"вам нараховано <b>{money(bonus_total)} бонусів</b>.\n"
+                f"Доступний баланс: <b>{money(recipient.get('available') or 0)}</b>."
+            )
+            enqueue_notification(
+                cur, int(recipient["telegram_id"]), "loyalty",
+                {"text": message, "web_app_url": f"{CONFIG.mini_app_url}/miniapp"},
+                f"loyalty-order-bonus-activated:{order_id}:{customer_id}",
+            )
     return bonus_total
 
 
@@ -10032,7 +10069,7 @@ def delivery_set_courier_status(order_id: int, courier_id: int, new_status: str,
         raise ValueError("Невідомий статус доставки.")
     event_map={"accepted":"accepted","in_progress":"departed","arrived":"arrived","delivered":"delivered","failed":"failed"}
     with db_cursor() as cur:
-        cur.execute("""SELECT ca.*,o.order_number,o.delivery_type,o.delivery_deadline_at,o.customer_id,o.telegram_id_snapshot
+        cur.execute("""SELECT ca.*,o.order_number,o.delivery_type,o.delivery_deadline_at,o.customer_id,o.telegram_id_snapshot,o.payment_status
             FROM courier_assignments ca JOIN orders o ON o.id=ca.order_id
             WHERE ca.order_id=%s AND ca.courier_telegram_id=%s FOR UPDATE OF ca,o""", (order_id,courier_id))
         row=cur.fetchone()
@@ -10074,17 +10111,12 @@ def delivery_set_courier_status(order_id: int, courier_id: int, new_status: str,
                         cur.execute("UPDATE loyalty_accounts SET available=available+%s,updated_at=NOW() WHERE customer_id=%s",(compensation,finished["customer_id"]))
             cur.execute("UPDATE orders SET status='delivered',updated_at=NOW() WHERE id=%s AND status='shipped' RETURNING customer_id",(order_id,))
             delivered_order=cur.fetchone()
-            if delivered_order and delivered_order["customer_id"]:
-                # Release pending purchase bonuses only after successful delivery.
-                cur.execute("""UPDATE loyalty_lots SET state='available',available_at=NOW()
-                    WHERE source_transaction_id IN (SELECT id FROM loyalty_transactions
-                    WHERE order_id=%s AND transaction_type='earn') AND state='pending'
-                    RETURNING remaining_amount""",(order_id,))
-                released=sum((Decimal(str(x["remaining_amount"])) for x in cur.fetchall()),Decimal("0.00"))
-                if released:
-                    cur.execute("UPDATE loyalty_accounts SET pending=GREATEST(0,pending-%s),available=available+%s,updated_at=NOW() WHERE customer_id=%s",
-                                (released,released,delivered_order["customer_id"]))
-                    cur.execute("UPDATE loyalty_transactions SET state='available' WHERE order_id=%s AND transaction_type='earn' AND state='pending'",(order_id,))
+            if (delivered_order and delivered_order["customer_id"]
+                    and row.get("payment_status") == "paid"):
+                # Keep every delivery path behind the same paid + received
+                # gate and send a single idempotent customer notification.
+                _activate_pending_order_bonus_tx(cur, order_id, int(delivered_order["customer_id"]))
+                _award_referral_rewards_tx(cur, int(delivered_order["customer_id"]), order_id)
             cur.execute("INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data) VALUES(%s,'courier','delivery.completed','order',%s,%s::jsonb)",
                         (courier_id,str(order_id),json_dumps({"late_minutes":late_minutes,"compensation":str(compensation)})))
         return {"order_number":row["order_number"],"status":new_status,"late_minutes":late_minutes,"compensation":compensation}
@@ -10101,20 +10133,8 @@ def delivery_update_ttn(order_id: int, ttn: str, actor: Staff) -> None:
         if row["ttn"] and row["ttn"]!=clean: raise ValueError("ТТН уже існує. Заміна потребує окремої процедури виправлення.")
         cur.execute("UPDATE orders SET ttn=%s,updated_at=NOW() WHERE id=%s",(clean,order_id))
         cur.execute("INSERT INTO delivery_events(order_id,event_type,actor_telegram_id,details) VALUES(%s,'ttn_created',%s,%s::jsonb)",(order_id,actor.telegram_id,json_dumps({"ttn":clean})))
-        cur.execute("SELECT customer_id FROM orders WHERE id=%s",(order_id,))
-        customer_row=cur.fetchone()
-        if customer_row and customer_row["customer_id"]:
-            cur.execute("""UPDATE loyalty_lots SET state='available',available_at=NOW()
-                           WHERE source_transaction_id IN (SELECT id FROM loyalty_transactions
-                           WHERE order_id=%s AND transaction_type='earn') AND state='pending'
-                           RETURNING remaining_amount""",(order_id,))
-            released=sum((Decimal(str(x["remaining_amount"])) for x in cur.fetchall()),Decimal("0.00"))
-            if released:
-                cur.execute("""UPDATE loyalty_accounts SET pending=GREATEST(0,pending-%s),
-                               available=available+%s,updated_at=NOW() WHERE customer_id=%s""",
-                            (released,released,customer_row["customer_id"]))
-                cur.execute("""UPDATE loyalty_transactions SET state='available'
-                               WHERE order_id=%s AND transaction_type='earn' AND state='pending'""",(order_id,))
+        # Adding a waybill is not proof of receipt or payment. Bonuses remain
+        # pending until the delivery/payment confirmation path activates them.
         cur.execute("INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data) VALUES(%s,%s,'delivery.ttn.create','order',%s,%s::jsonb)",(actor.telegram_id,actor.role,str(order_id),json_dumps({"ttn":clean})))
 
 
@@ -12190,9 +12210,11 @@ async function openStaffSupport(id){try{let d=await api(`/api/miniapp/staff/supp
 async function replyStaffSupport(id){let message=$('staffSupportReply')?.value?.trim();if(!message){msg('Напишіть відповідь');return}try{await api(`/api/miniapp/staff/support/${id}/reply`,{method:'POST',body:JSON.stringify({message})});msg('Відповідь надіслано клієнту');await openStaffSupport(id)}catch(e){msg(e.message)}}
 async function setStaffSupportStatus(id,status){try{await api(`/api/miniapp/staff/support/${id}/status`,{method:'PUT',body:JSON.stringify({status})});msg('Статус звернення оновлено');await loadStaffSupport()}catch(e){msg(e.message)}}function ownerOrderCard(o){return `<article class="card staff-order-card"><div class="row"><b>#${esc(o.order_number||'Замовлення')}</b><b>${money(o.grand_total)}</b></div><p>${esc(o.customer_name||'Клієнт')} · ${esc(o.phone||'Телефон не вказано')}<br><span class="pill">${esc(o.status_label||o.status||'Прийнято')}</span> · ${esc(o.created_at||'')}<br>ТТН: ${esc(o.ttn||'—')}</p></article>`}
 async function loadOwnerOrders(){let host=$('ownerRecentOrders');if(!host)return;host.innerHTML='<div class="notice">Завантажую замовлення…</div>';try{let d=await api('/api/miniapp/staff/orders?q=',{fresh:true});let rows=Array.isArray(d.items)?d.items:[];host.innerHTML=rows.map(ownerOrderCard).join('')||'<div class="notice">Замовлень ще немає.</div>'}catch(e){host.innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
-async function loadOwnerDashboard(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Панель власника</h2><div class="notice">Завантажую статистику…</div>';try{let d=await api('/api/miniapp/admin/dashboard');let recent=(d.recent_orders||[]).map(ownerOrderCard).join('')||'<div class="notice">Замовлень ще немає.</div>';$('ownerPanel').innerHTML=`<h2>Статистика магазину</h2><div class="grid"><div class="card"><small>Замовлень сьогодні</small><h3>${d.orders_today}</h3></div><div class="card"><small>Сума замовлень сьогодні</small><h3>${money(d.order_value_today)}</h3></div><div class="card"><small>Оплачено сьогодні</small><h3>${money(d.paid_today)}</h3></div><div class="card"><small>Замовлень за місяць</small><h3>${d.orders_month}</h3></div><div class="card"><small>Сума замовлень за місяць</small><h3>${money(d.order_value_month)}</h3></div><div class="card"><small>Оплачено за місяць</small><h3>${money(d.paid_month)}</h3></div><div class="card"><small>Середнє замовлення</small><h3>${money(d.average_order)}</h3></div><div class="card"><small>Отримано замовлень цього місяця</small><h3>${d.delivered_month}</h3></div><div class="card"><small>Клієнтів</small><h3>${d.customers}</h3></div><div class="card"><small>Очікують обробки</small><h3>${d.pending_orders}</h3></div><div class="card"><small>Бонусне зобов’язання</small><h3>${money(d.bonus_liability)}</h3></div><div class="card"><small>Активні сертифікати</small><h3>${d.active_certificates} · ${money(d.active_certificate_value)}</h3></div><div class="card"><small>Запрошено друзів</small><h3>${d.referrals_rewarded} / ${d.referrals}</h3></div></div><section class="ops-group"><div class="row"><h3>Останні замовлення</h3><button onclick="loadOwnerOrders()">Показати всі</button></div><div id="ownerRecentOrders" class="stack">${recent}</div></section><h3>Коригування бонусів</h3><div class="formgrid"><input id="loyaltyLookup" placeholder="Картка, телефон, Telegram ID або @username"><select id="loyaltyOperation"><option value="earn">Нарахувати</option><option value="redeem">Списати</option></select><input id="loyaltyAmount" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума"><input id="loyaltyReason" maxlength="250" placeholder="Обов’язкова причина — її побачить клієнт"><button class="primary" onclick="adjustLoyalty()">Застосувати коригування</button></div><small>Операція записується в бонусний журнал та аудит; клієнту прийде повідомлення з сумою й причиною.</small><h3>Випуск сертифіката</h3><div class="formgrid"><input id="certКлієнт" placeholder="Картка клієнта, телефон або Telegram ID"><input id="certCode" maxlength="40" placeholder="Код або залиште порожнім для генерації"><input id="certValue" type="number" min="0.01" max="100000" step="0.01" placeholder="Номінал, грн"><button onclick="createCertificate()">Створити сертифікат</button></div>`}catch(e){$('ownerPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
+async function loadOwnerDashboard(){hideSections();$('products').classList.add('hidden');$('categories').classList.add('hidden');$('search').classList.add('hidden');$('ownerPanel').classList.remove('hidden');$('ownerPanel').innerHTML='<h2>Панель власника</h2><div class="notice">Завантажую статистику…</div>';try{let d=await api('/api/miniapp/admin/dashboard');let recent=(d.recent_orders||[]).map(ownerOrderCard).join('')||'<div class="notice">Замовлень ще немає.</div>';$('ownerPanel').innerHTML=`<h2>Статистика магазину</h2><div class="grid"><div class="card"><small>Замовлень сьогодні</small><h3>${d.orders_today}</h3></div><div class="card"><small>Сума замовлень сьогодні</small><h3>${money(d.order_value_today)}</h3></div><div class="card"><small>Оплачено сьогодні</small><h3>${money(d.paid_today)}</h3></div><div class="card"><small>Замовлень за місяць</small><h3>${d.orders_month}</h3></div><div class="card"><small>Сума замовлень за місяць</small><h3>${money(d.order_value_month)}</h3></div><div class="card"><small>Оплачено за місяць</small><h3>${money(d.paid_month)}</h3></div><div class="card"><small>Середнє замовлення</small><h3>${money(d.average_order)}</h3></div><div class="card"><small>Отримано замовлень цього місяця</small><h3>${d.delivered_month}</h3></div><div class="card"><small>Клієнтів</small><h3>${d.customers}</h3></div><div class="card"><small>Очікують обробки</small><h3>${d.pending_orders}</h3></div><div class="card"><small>Бонусне зобов’язання</small><h3>${money(d.bonus_liability)}</h3></div><div class="card"><small>Активні сертифікати</small><h3>${d.active_certificates} · ${money(d.active_certificate_value)}</h3></div><div class="card"><small>Запрошено друзів</small><h3>${d.referrals_rewarded} / ${d.referrals}</h3></div></div><section class="ops-group"><div class="row"><h3>Останні замовлення</h3><button onclick="loadOwnerOrders()">Показати всі</button></div><div id="ownerRecentOrders" class="stack">${recent}</div></section><h3>Коригування бонусів</h3><div class="formgrid"><input id="loyaltyLookup" placeholder="Картка, телефон, Telegram ID або @username"><select id="loyaltyOperation"><option value="earn">Нарахувати</option><option value="redeem">Списати</option></select><input id="loyaltyAmount" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума"><input id="loyaltyReason" maxlength="250" placeholder="Обов’язкова причина — її побачить клієнт"><button class="primary" onclick="adjustLoyalty()">Застосувати коригування</button></div><small>Операція записується в бонусний журнал та аудит; клієнту прийде повідомлення з сумою й причиною.</small><section class="ops-group"><h3>Подарункові бонуси</h3><div class="formgrid"><select id="bonusGiftMode" onchange="document.getElementById('bonusGiftLookupWrap').classList.toggle('hidden',this.value==='all')"><option value="customer">Одному клієнту</option><option value="all">Усім клієнтам</option></select><label id="bonusGiftLookupWrap">Телефон або @username<input id="bonusGiftLookup" maxlength="100" placeholder="+380… або @username"></label><input id="bonusGiftAmount" type="number" min="0.01" max="100000" step="0.01" placeholder="Сума бонусів, грн"><label>Термін дії, днів<input id="bonusGiftDays" type="number" min="1" max="3650" value="30"></label><label>Текст клієнту (необов’язково)<textarea id="bonusGiftMessage" maxlength="1200" rows="3" placeholder="Ваш текст для повідомлення"></textarea></label><label>Коментар (необов’язково)<input id="bonusGiftComment" maxlength="500" placeholder="Наприклад: подарунок до свята"></label><button class="primary" onclick="sendBonusGift()">🎁 Нарахувати й надіслати</button></div><small>Бонуси одразу з’являться на рахунку, згорять після вибраного терміну й прийдуть у Telegram з кнопкою «Використати бонуси». Масова розсилка охоплює всіх клієнтів із Telegram-профілем, крім заблокованих.</small></section><h3>Випуск сертифіката</h3><div class="formgrid"><input id="certКлієнт" placeholder="Картка клієнта, телефон або Telegram ID"><input id="certCode" maxlength="40" placeholder="Код або залиште порожнім для генерації"><input id="certValue" type="number" min="0.01" max="100000" step="0.01" placeholder="Номінал, грн"><button onclick="createCertificate()">Створити сертифікат</button></div>`}catch(e){$('ownerPanel').innerHTML=`<div class="notice">${esc(e.message)}</div>`}}
 async function adjustLoyalty(){try{let body={customer_lookup:$('loyaltyLookup').value,operation:$('loyaltyOperation').value,amount:$('loyaltyAmount').value,reason:$('loyaltyReason').value};let d=await api('/api/miniapp/admin/loyalty-adjust',{method:'POST',body:JSON.stringify(body)});msg(`Бонуси оновлено. Баланс: ${money(d.available)}`);loadOwnerDashboard()}catch(e){msg(e.message)}}
 async function createCertificate(){try{let d=await api('/api/miniapp/admin/certificates',{method:'POST',body:JSON.stringify({code:$('certCode').value,face_value:$('certValue').value})});msg(`Сертифікат ${d.code} створено. ${d.notified?"Подарункове повідомлення надіслано":"Повідомлення в Telegram не доставлено"}`);loadOwnerDashboard()}catch(e){msg(e.message)}}
+async function sendBonusGift(){let mode=$('bonusGiftMode').value,amount=$('bonusGiftAmount').value,days=$('bonusGiftDays').value,lookup=$('bonusGiftLookup').value.trim();if(mode==='customer'&&!lookup)return msg('Вкажіть телефон або @username клієнта.');if(!amount||Number(amount)<=0)return msg('Вкажіть суму бонусів.');try{let count=null;if(mode==='all'){let audience=await api('/api/miniapp/admin/bonus-gifts/audience',{fresh:true});count=Number(audience.count||0);if(!count)return msg('Немає доступних клієнтів Telegram для розсилки.')}let target=mode==='all'?`УСІМ ${count} клієнтам із Telegram`:lookup;if(!confirm(`Нарахувати ${money(amount)} бонусів: ${target}?
+Термін дії: ${days} днів. Повідомлення ставиться в чергу.`))return;let d=await api('/api/miniapp/admin/bonus-gifts',{method:'POST',body:JSON.stringify({recipient_mode:mode,customer_lookup:lookup,amount,expires_in_days:days,message:$('bonusGiftMessage').value,comment:$('bonusGiftComment').value})});msg(`Готово: ${d.recipient_count} клієнтам нараховано бонуси. Повідомлення поставлено в чергу.`);loadOwnerDashboard()}catch(e){msg(e.message)}}
 function bannerRow(b={},i=Date.now()){return `<div class="card" data-banner><select data-k="placement"><option value="home_top" ${(!b.placement||b.placement==='home_top')?'selected':''}>Головна: верхній банер</option><option value="catalog_bottom" ${b.placement==='catalog_bottom'?'selected':''}>Каталог: між блоками / внизу</option><option value="cart_top" ${b.placement==='cart_top'?'selected':''}>Кошик: верхній банер</option><option value="website_top" ${b.placement==='website_top'?'selected':''}>Website: top banner</option><option value="website_bottom" ${b.placement==='website_bottom'?'selected':''}>Website: bottom banner</option><option value="bot_welcome" ${b.placement==='bot_welcome'?'selected':''}>Telegram-бот: привітання</option></select><input data-k="title" placeholder="Заголовок" value="${esc(b.title||'')}"><input data-k="body" placeholder="Текст" value="${esc(b.body||'')}"><input data-k="image_url" placeholder="URL зображення (необов’язково)" value="${esc(b.image_url||'')}"><input data-k="link_url" placeholder="Посилання (необов’язково)" value="${esc(b.link_url||'')}"><label class="check"><input data-k="active" type="checkbox" ${b.active?'checked':''}> Активний</label><button onclick="this.parentElement.remove()">Видалити</button></div>`}
 function addBannerRow(){ $('bannerRows').insertAdjacentHTML('beforeend',bannerRow({active:true})) }
 async function saveBanners(){let rows=[...document.querySelectorAll('[data-banner]')].map(el=>{let o={};el.querySelectorAll('[data-k]').forEach(x=>o[x.dataset.k]=x.type==='checkbox'?x.checked:x.value);return o});try{let d=await api('/api/miniapp/admin/banners',{method:'PUT',body:JSON.stringify({banners:rows})});banners=d.banners;renderBanners();msg('Банери збережено')}catch(e){msg(e.message)}}
@@ -15194,6 +15216,143 @@ def miniapp_owner_loyalty_adjust():
     except Exception:
         log.exception("Mini App owner loyalty adjustment failed")
         return jsonify({"error": "Не вдалося виконати коригування бонусів."}), 500
+
+
+@miniapp.get("/api/miniapp/admin/bonus-gifts/audience")
+def miniapp_owner_bonus_gift_audience():
+    try:
+        user = _miniapp_auth_user()
+        _miniapp_require_owner(user)
+        with db_cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS count FROM customers WHERE telegram_id IS NOT NULL AND blocked_at IS NULL")
+            count = int(cur.fetchone()["count"] or 0)
+        return jsonify({"count": count})
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except Exception:
+        log.exception("Mini App bonus gift audience count failed")
+        return jsonify({"error": "Не вдалося порахувати аудиторію розсилки."}), 500
+
+
+@miniapp.post("/api/miniapp/admin/bonus-gifts")
+def miniapp_owner_send_bonus_gift():
+    """Credit expiring bonus lots and queue a Telegram gift notice."""
+    try:
+        user = _miniapp_auth_user()
+        actor = _miniapp_require_owner(user)
+        body = request.get_json(silent=True) or {}
+        mode = str(body.get("recipient_mode") or "customer").strip().lower()
+        lookup = " ".join(str(body.get("customer_lookup") or "").split())[:100]
+        message = str(body.get("message") or "").strip()[:1200]
+        comment = str(body.get("comment") or "").strip()[:500]
+        if mode not in {"customer", "all"}:
+            return jsonify({"error": "Оберіть одного клієнта або всіх клієнтів."}), 400
+        if mode == "customer" and not lookup:
+            return jsonify({"error": "Вкажіть номер телефону або @username клієнта."}), 400
+        amount = Decimal(str(body.get("amount") or "0").replace(",", ".")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if amount <= 0 or amount > Decimal("100000.00"):
+            return jsonify({"error": "Сума бонусів має бути від 0.01 до 100000.00 грн."}), 400
+        try:
+            expires_in_days = int(body.get("expires_in_days") or 30)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Термін дії має бути цілим числом днів."}), 400
+        if not 1 <= expires_in_days <= 3650:
+            return jsonify({"error": "Термін дії має бути від 1 до 3650 днів."}), 400
+
+        with db_cursor() as cur:
+            if mode == "all":
+                cur.execute("""SELECT id,telegram_id,username,first_name,blocked_at FROM customers
+                               WHERE telegram_id IS NOT NULL AND blocked_at IS NULL
+                               ORDER BY id FOR UPDATE""")
+                recipients = list(cur.fetchall())
+            else:
+                normalized_lookup = lookup[1:] if lookup.startswith("@") else lookup
+                customer = None
+                cur.execute("""SELECT id,telegram_id,username,first_name,blocked_at FROM customers
+                               WHERE telegram_id IS NOT NULL AND lower(COALESCE(username,''))=lower(%s)
+                               FOR UPDATE""", (normalized_lookup,))
+                customer = cur.fetchone()
+                digits = normalize_phone(lookup)
+                if not customer and 10 <= len(digits) <= 15:
+                    cur.execute("""SELECT id,telegram_id,username,first_name,blocked_at FROM customers
+                                   WHERE regexp_replace(COALESCE(phone,''),'[^0-9]','','g')=%s
+                                     AND telegram_id IS NOT NULL FOR UPDATE""", (digits,))
+                    matches = list(cur.fetchall())
+                    if len(matches) > 1:
+                        return jsonify({"error": "За цим номером знайдено кілька профілів. Вкажіть @username."}), 409
+                    customer = matches[0] if matches else None
+                if not customer and lookup.isdigit():
+                    cur.execute("""SELECT id,telegram_id,username,first_name,blocked_at FROM customers
+                                   WHERE telegram_id=%s FOR UPDATE""", (int(lookup),))
+                    customer = cur.fetchone()
+                if not customer:
+                    return jsonify({"error": "Клієнта з таким телефоном або username не знайдено."}), 404
+                if customer.get("blocked_at"):
+                    return jsonify({"error": "Клієнт заблокований і не може отримувати повідомлення."}), 409
+                recipients = [customer]
+
+            recipients = [r for r in recipients if r.get("telegram_id") and not r.get("blocked_at")]
+            if not recipients:
+                return jsonify({"error": "Немає доступних Telegram-отримувачів для цієї розсилки."}), 404
+            expires_at = datetime.now(timezone.utc) + timedelta(days=expires_in_days)
+            cur.execute("""INSERT INTO bonus_gift_campaigns
+                           (created_by,recipient_mode,recipient_lookup,amount,expires_at,custom_message,comment,recipient_count)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                        (actor.telegram_id, mode, lookup if mode == "customer" else "", amount,
+                         expires_at, message, comment, len(recipients)))
+            campaign_id = int(cur.fetchone()["id"])
+            expires_label = expires_at.astimezone(ZoneInfo(CONFIG.timezone)).strftime("%d.%m.%Y")
+            queued = 0
+            for recipient in recipients:
+                customer_id = int(recipient["id"])
+                telegram_id = int(recipient["telegram_id"])
+                cur.execute("INSERT INTO loyalty_accounts(customer_id) VALUES(%s) ON CONFLICT DO NOTHING", (customer_id,))
+                cur.execute("""INSERT INTO loyalty_transactions
+                               (customer_id,transaction_type,amount,state,reason,actor_telegram_id,idempotency_key)
+                               VALUES(%s,'bonus_gift',%s,'available',%s,%s,%s) RETURNING id""",
+                            (customer_id, amount, f"Подарунок Cloud Hub · кампанія #{campaign_id}",
+                             actor.telegram_id, f"bonus-gift:{campaign_id}:{customer_id}"))
+                tx_id = int(cur.fetchone()["id"])
+                cur.execute("""INSERT INTO loyalty_lots
+                               (customer_id,source_transaction_id,original_amount,remaining_amount,state,available_at,expires_at)
+                               VALUES(%s,%s,%s,%s,'available',NOW(),%s)""",
+                            (customer_id, tx_id, amount, amount, expires_at))
+                cur.execute("""UPDATE loyalty_accounts SET available=available+%s,updated_at=NOW()
+                               WHERE customer_id=%s""", (amount, customer_id))
+                cur.execute("SELECT available FROM loyalty_accounts WHERE customer_id=%s", (customer_id,))
+                balance = cur.fetchone()["available"]
+                name = " ".join(str(recipient.get("first_name") or "").split())
+                lines = [f"🎁 <b>{html.escape(name + ', ' if name else '')}вам подарунок від Cloud Hub!</b>",
+                         f"На бонусний рахунок зараховано <b>{money(amount)} бонусів</b>."]
+                if message:
+                    lines.extend(["", html.escape(message)])
+                if comment:
+                    lines.extend(["", f"💬 {html.escape(comment)}"])
+                lines.extend(["", f"Доступно на рахунку: <b>{money(balance)}</b>.",
+                              f"Бонуси діють до <b>{expires_label}</b> включно."])
+                enqueue_notification(
+                    cur, telegram_id, "loyalty",
+                    {"text": "\n".join(lines), "web_app_url": f"{CONFIG.mini_app_url}/miniapp"},
+                    f"bonus-gift:{campaign_id}:{customer_id}",
+                )
+                queued += 1
+            cur.execute("""INSERT INTO audit_log(actor_telegram_id,actor_role,action,entity_type,entity_id,after_data,reason)
+                           VALUES(%s,'owner','loyalty.bonus_gift_sent','bonus_gift_campaign',%s,%s::jsonb,%s)""",
+                        (actor.telegram_id, str(campaign_id), json_dumps({
+                            "recipient_mode": mode, "recipient_count": queued, "amount": str(amount),
+                            "expires_at": expires_at.isoformat(),
+                        }), f"Бонусний подарунок: кампанія #{campaign_id}"))
+        return jsonify({"campaign_id": campaign_id, "recipient_count": queued,
+                        "notifications_queued": queued, "amount": _miniapp_json_value(amount),
+                        "expires_at": expires_at.isoformat()}), 201
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        log.exception("Mini App owner bonus gift campaign failed")
+        return jsonify({"error": "Не вдалося видати бонусний подарунок."}), 500
 
 
 @miniapp.post("/api/miniapp/admin/certificates")
