@@ -15302,7 +15302,7 @@ def miniapp_owner_send_bonus_gift():
                         (actor.telegram_id, mode, lookup if mode == "customer" else "", amount,
                          expires_at, message, comment, len(recipients)))
             campaign_id = int(cur.fetchone()["id"])
-            expires_label = expires_at.astimezone(ZoneInfo(CONFIG.timezone)).strftime("%d.%m.%Y")
+            expires_label = expires_at.astimezone(ZoneInfo(CONFIG.timezone)).strftime("%d.%m.%Y о %H:%M")
             queued = 0
             for recipient in recipients:
                 customer_id = int(recipient["id"])
@@ -15330,7 +15330,7 @@ def miniapp_owner_send_bonus_gift():
                 if comment:
                     lines.extend(["", f"💬 {html.escape(comment)}"])
                 lines.extend(["", f"Доступно на рахунку: <b>{money(balance)}</b>.",
-                              f"Бонуси діють до <b>{expires_label}</b> включно."])
+                              f"Бонуси діють до <b>{expires_label}</b>."])
                 enqueue_notification(
                     cur, telegram_id, "loyalty",
                     {"text": "\n".join(lines), "web_app_url": f"{CONFIG.mini_app_url}/miniapp"},
